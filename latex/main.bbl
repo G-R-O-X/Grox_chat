@@ -1,0 +1,27 @@
+\begin{thebibliography}{1}
+
+\bibitem{liu2023lost}
+Nelson~F Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua,
+  Fabio Petroni, and Percy Liang.
+\newblock Lost in the middle: How language models use long contexts.
+\newblock {\em arXiv preprint arXiv:2307.03172}, 2023.
+
+\bibitem{nii1986blackboard}
+H~Penny Nii.
+\newblock Blackboard systems: The blackboard model of problem solving and the
+  evolution of blackboard architectures.
+\newblock {\em AI magazine}, 7(2):38--53, 1986.
+
+\bibitem{yao2022react}
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan,
+  and Yuan Cao.
+\newblock React: Synergizing reasoning and acting in language models.
+\newblock {\em arXiv preprint arXiv:2210.03629}, 2022.
+
+\bibitem{zheng2023chateval}
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Shiyang Hao, Zhanghao Wu, Senhao Ba,
+  Victor Zhuang, Yonghao Cheng, Zhuohan Zhu, Ya~Xie, et~al.
+\newblock Judging llm-as-a-judge with mt-bench and chatbot arena.
+\newblock {\em arXiv preprint arXiv:2306.05685}, 2023.
+
+\end{thebibliography}

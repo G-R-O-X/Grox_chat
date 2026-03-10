@@ -1,0 +1,9 @@
+.env
+chatroom.db
+chatroom.db*
+test_chatroom.db*
+AGENTS.md
+*.log
+__pycache__/
+**/__pycache__/
+*.pyc

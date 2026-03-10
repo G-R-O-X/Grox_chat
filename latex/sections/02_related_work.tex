@@ -1,0 +1,13 @@
+\section{相关工作}
+\label{sec:related}
+
+\subsection{多智能体系统与 ReAct 范式的幻灭}
+自 2022 年 ReAct（Reasoning and Acting）范式 \cite{yao2022react} 提出以来，将思维链（CoT）与工具调用结合已成为智能体设计的标准动作。在单体、高智商模型（如 GPT-4）上，这一范式运作良好。然而，当业界试图将其复制到廉价模型群组中时，却遭遇了惨烈的“格式雪崩”。次级模型极难在激烈的辩论上下文中保持 JSON 结构的完整性，经常在 \texttt{<tool\_call>} 标签里胡言乱语导致系统抛出 HTTP 400 错误。Grox\_chat 的设计哲学是对 ReAct 的一种反叛：既然廉价模型写不对代码，那就剥夺它们的执行权。我们通过系统层的正则与自然语言意图截获，将复杂的环境交互转化为模型最擅长的纯文本表达，实现了核心推理与底层执行通道的绝对隔离。
+
+\subsection{从记忆黑板到查重判官 (Blackboard Architectures)}
+黑板模式 (Blackboard Pattern) 最初广泛应用于早期的传统专家系统中，允许多个独立模块在一个共享的知识库上读写 \cite{nii1986blackboard}。但在大模型时代，开发者往往偷懒地将整个黑板状态强行塞入 Prompt 的上下文窗口中。这在短记忆模型中不可避免地导致了严重的“中间注意力丢失 (Lost in the Middle)” \cite{liu2023lost} 现象。
+为了让记性不好的廉价模型能够长久地辩论下去，Grox\_chat 采用了彻底的“外部脑皮层”策略：不仅将每一句话存入 SQLite，还将每阶段的“Summary（总结）”也全部进行 Embedding 向量化。这使得系统中的上帝节点（Audience）能够在决定是否结束话题前，利用历史 Summary 进行 RAG 查重，一旦发现专家们陷入了“车轱辘话”的死循环，便立刻拉闸，避免了无效的 API Token 燃烧。
+
+\subsection{异步对抗性验证 (Adversarial Validation)}
+目前已有如 ChatEval \cite{zheng2023chateval} 等研究证明了使用大语言模型作为裁判 (LLM-as-a-Judge) 来评估输出的实用性。然而，这些机制通常是事后 (post-hoc) 评估，即等大家聊完了再来打分。
+Grox\_chat 引入了一套极具侵略性的 DAPA 路由机制，将对抗性验证以“物理插队”的形式无缝集成到了推理循环中。在这个机制下，“气氛组”智能体（如到处咬人的护卫犬 Dot，和动辄执行论坛封杀法则的 Tron）并不在正常的发言队列中。当它们嗅到幻觉的味道时，它们会直接修改 LangGraph 的状态图，强行把那个造假的智能体抓回聚光灯下，逼迫其在额外的“惩罚回合”里进行基于硬事实的公开处刑与自我纠错。

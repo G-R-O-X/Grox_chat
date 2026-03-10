@@ -1,0 +1,42 @@
+\documentclass[12pt,a4paper]{article}
+
+% UTF-8 encoding and fonts
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+% Packages for CTeX (Chinese support via pdflatex or xelatex)
+\usepackage{ctex}
+
+% Layout and graphics
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+% Hyperlinks
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+% Document Info
+\title{\textbf{Grox\_chat: 基于黑板模型与状态机驱动的异构多智能体科研推理框架}}
+\author{Anonymous Authors}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\input{sections/abstract}
+\end{abstract}
+
+\input{sections/01_introduction}
+\input{sections/02_related_work}
+\input{sections/03_methodology}
+\input{sections/04_experiments}
+\input{sections/05_conclusion}
+
+\bibliographystyle{plain}
+\bibliography{papers}
+
+\end{document}

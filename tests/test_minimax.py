@@ -1,3 +1,4 @@
+import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -6,7 +7,9 @@ from grox_chat.minimax_client import (
     ENGLISH_ONLY_INSTRUCTION,
     _extract_pseudo_tool_markup,
     _extract_text_and_tools,
+    _get_minimax_api_host,
     query_minimax,
+    minimax_search,
 )
 
 def test_extract_text_and_tools():
@@ -105,7 +108,7 @@ async def test_query_minimax_ignores_tools_payload_for_messages_api():
 
     fake_client = type("FakeClient", (), {"post": fake_post})()
 
-    with patch("grox_chat.minimax_client.API_KEY", "test-key"):
+    with patch.dict(os.environ, {"MINIMAX_API_KEY": "test-key", "MINIMAX_EN": "1"}, clear=True):
         with patch("grox_chat.minimax_client.wait_for_slot", new=AsyncMock()):
             with patch("grox_chat.minimax_client._get_http_client", return_value=fake_client):
                 text, tools = await query_minimax(
@@ -116,6 +119,7 @@ async def test_query_minimax_ignores_tools_payload_for_messages_api():
 
     assert text == "ok"
     assert tools == []
+    assert captured["url"] == "https://api.minimax.io/anthropic/v1/messages"
     assert "tools" not in captured["json"]
     assert captured["json"]["system"].startswith("system")
     assert ENGLISH_ONLY_INSTRUCTION in captured["json"]["system"]
@@ -152,7 +156,7 @@ async def test_query_minimax_rejects_pseudo_tool_markup_by_default():
 
     fake_client = type("FakeClient", (), {"post": fake_post})()
 
-    with patch("grox_chat.minimax_client.API_KEY", "test-key"):
+    with patch.dict(os.environ, {"MINIMAX_API_KEY": "test-key", "MINIMAX_EN": "0"}, clear=True):
         with patch("grox_chat.minimax_client.wait_for_slot", new=AsyncMock()):
             with patch("grox_chat.minimax_client._get_http_client", return_value=fake_client):
                 text, tools = await query_minimax(
@@ -194,7 +198,7 @@ async def test_query_minimax_recovers_pseudo_tool_query_when_opted_in():
 
     fake_client = type("FakeClient", (), {"post": fake_post})()
 
-    with patch("grox_chat.minimax_client.API_KEY", "test-key"):
+    with patch.dict(os.environ, {"MINIMAX_API_KEY": "test-key", "MINIMAX_EN": "0"}, clear=True):
         with patch("grox_chat.minimax_client.wait_for_slot", new=AsyncMock()):
             with patch("grox_chat.minimax_client._get_http_client", return_value=fake_client):
                 text, tools = await query_minimax(
@@ -206,3 +210,43 @@ async def test_query_minimax_recovers_pseudo_tool_query_when_opted_in():
     assert text == "thin slicing first impression workplace"
     assert len(tools) == 1
     assert tools[0]["name"] == "ddg-search_search"
+
+
+def test_minimax_defaults_to_domestic_host():
+    with patch.dict(os.environ, {}, clear=True):
+        assert _get_minimax_api_host() == "https://api.minimaxi.com"
+
+
+def test_minimax_international_host_enabled_with_env_flag():
+    with patch.dict(os.environ, {"MINIMAX_EN": "1"}, clear=True):
+        assert _get_minimax_api_host() == "https://api.minimax.io"
+
+
+@pytest.mark.asyncio
+async def test_minimax_search_uses_domestic_host_by_default():
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+    async def fake_post(self, url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return FakeResponse()
+
+    fake_client = type("FakeClient", (), {"post": fake_post})()
+
+    with patch.dict(os.environ, {"MINIMAX_API_KEY": "test-key", "MINIMAX_EN": "0"}, clear=True):
+        with patch("grox_chat.minimax_client.wait_for_slot", new=AsyncMock()):
+            with patch("grox_chat.minimax_client._get_http_client", return_value=fake_client):
+                result = await minimax_search("left foot or right foot")
+
+    assert result == {"ok": True}
+    assert captured["url"] == "https://api.minimaxi.com/v1/coding_plan/search"
+    assert captured["headers"]["Authorization"] == "Bearer test-key"

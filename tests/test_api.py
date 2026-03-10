@@ -12,7 +12,18 @@ async def test_persist_message_embeds_standard_messages():
                 result = await api.persist_message(1, 2, "dreamer", "historical message", "standard")
 
     assert result == 42
-    insert_message.assert_called_once_with(1, 2, "dreamer", "historical message", "standard", [0.1] * 384, None)
+    insert_message.assert_called_once()
+    assert insert_message.call_args.args == (
+        1,
+        2,
+        "dreamer",
+        "historical message",
+        "standard",
+        [0.1] * 384,
+        None,
+        None,
+        None,
+    )
     post_message.assert_not_called()
 
 
@@ -25,7 +36,17 @@ async def test_persist_message_falls_back_when_embedding_fails():
 
     assert result == 11
     insert_message.assert_not_called()
-    post_message.assert_called_once_with(1, 2, "writer", "fallback message", "standard", None)
+    post_message.assert_called_once()
+    assert post_message.call_args.args == (
+        1,
+        2,
+        "writer",
+        "fallback message",
+        "standard",
+        None,
+        None,
+        None,
+    )
 
 
 def test_search_messages_hybrid_merges_dense_and_lexical_results():

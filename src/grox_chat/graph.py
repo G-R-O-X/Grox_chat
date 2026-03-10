@@ -29,6 +29,9 @@ class ChatState(TypedDict):
     round_number: int
     latest_summary_msg_id: NotRequired[Optional[int]]
     last_writer_round: NotRequired[Optional[int]]
+    last_fact_proposer_round: NotRequired[Optional[int]]
+    last_final_fact_proposer_round: NotRequired[Optional[int]]
+    pending_fact_reviews_remaining: NotRequired[bool]
 
 def dispatcher_node(state: ChatState) -> dict:
     """

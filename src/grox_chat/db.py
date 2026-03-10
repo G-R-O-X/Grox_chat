@@ -1,9 +1,12 @@
 import contextlib
+import logging
 import os
 import re
 import sqlite3
 import struct
 from typing import Any, Dict, Iterable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 def get_db_path() -> str:
     base_dir = os.path.join(os.path.dirname(__file__), "..", "..")
@@ -76,20 +79,34 @@ def _insert_message_fts(
 
 
 def _backfill_fts(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO facts_fts(rowid, content, topic_id, source)
-        SELECT Fact.id, Fact.content, CAST(Fact.topic_id AS TEXT), Fact.source
-        FROM Fact
-        """
-    )
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO messages_fts(rowid, content, topic_id, msg_type, sender)
-        SELECT Message.id, Message.content, CAST(Message.topic_id AS TEXT), Message.msg_type, Message.sender
-        FROM Message
-        """
-    )
+    fact_count = conn.execute("SELECT COUNT(*) FROM Fact").fetchone()[0]
+    if fact_count:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO facts_fts(rowid, content, topic_id, source)
+            SELECT Fact.id, Fact.content, CAST(Fact.topic_id AS TEXT), Fact.source
+            FROM Fact
+            """
+        )
+
+    message_count = conn.execute("SELECT COUNT(*) FROM Message").fetchone()[0]
+    if not message_count:
+        return
+
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO messages_fts(rowid, content, topic_id, msg_type, sender)
+            SELECT Message.id, Message.content, CAST(Message.topic_id AS TEXT), Message.msg_type, Message.sender
+            FROM Message
+            """
+        )
+    except sqlite3.OperationalError as exc:
+        logger.warning("messages_fts backfill failed; attempting FTS rebuild fallback: %s", exc)
+        try:
+            conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+        except sqlite3.OperationalError as rebuild_exc:
+            logger.warning("messages_fts rebuild fallback also failed; continuing without legacy backfill: %s", rebuild_exc)
 
 
 def _build_fts_query(query_text: str) -> Optional[str]:
@@ -138,9 +155,32 @@ def init_db():
                 content TEXT NOT NULL,
                 msg_type TEXT NOT NULL DEFAULT 'standard', -- standard, summary
                 confidence_score REAL,
+                round_number INTEGER,
+                turn_kind TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(topic_id) REFERENCES Topic(id),
                 FOREIGN KEY(subtopic_id) REFERENCES Subtopic(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS FactCandidate (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER NOT NULL,
+                subtopic_id INTEGER,
+                writer_msg_id INTEGER,
+                candidate_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reviewed_text TEXT,
+                review_note TEXT,
+                evidence_note TEXT,
+                confidence_score REAL,
+                reviewer TEXT,
+                accepted_fact_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at DATETIME,
+                FOREIGN KEY(topic_id) REFERENCES Topic(id),
+                FOREIGN KEY(subtopic_id) REFERENCES Subtopic(id),
+                FOREIGN KEY(writer_msg_id) REFERENCES Message(id),
+                FOREIGN KEY(accepted_fact_id) REFERENCES Fact(id)
             );
             
             CREATE TABLE IF NOT EXISTS Fact (
@@ -148,8 +188,13 @@ def init_db():
                 topic_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 source TEXT NOT NULL,
+                candidate_id INTEGER,
+                review_status TEXT,
+                evidence_note TEXT,
+                confidence_score REAL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(topic_id) REFERENCES Topic(id)
+                FOREIGN KEY(topic_id) REFERENCES Topic(id),
+                FOREIGN KEY(candidate_id) REFERENCES FactCandidate(id)
             );
             
             -- Virtual table for storing embeddings of Facts using sqlite-vec
@@ -182,37 +227,207 @@ def init_db():
         _ensure_column(conn, "Subtopic", "conclusion", "TEXT")
         _ensure_column(conn, "Subtopic", "status", "TEXT NOT NULL DEFAULT 'Open'")
         _ensure_column(conn, "Message", "confidence_score", "REAL")
+        _ensure_column(conn, "Message", "round_number", "INTEGER")
+        _ensure_column(conn, "Message", "turn_kind", "TEXT")
+        _ensure_column(conn, "Fact", "candidate_id", "INTEGER")
+        _ensure_column(conn, "Fact", "review_status", "TEXT")
+        _ensure_column(conn, "Fact", "evidence_note", "TEXT")
+        _ensure_column(conn, "Fact", "confidence_score", "REAL")
         _backfill_fts(conn)
 
-def insert_fact_with_embedding(topic_id: int, content: str, source: str, embedding: List[float]) -> int:
+def _insert_fact_row(
+    conn: sqlite3.Connection,
+    topic_id: int,
+    content: str,
+    source: str,
+    candidate_id: Optional[int] = None,
+    review_status: Optional[str] = None,
+    evidence_note: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO Fact (topic_id, content, source, candidate_id, review_status, evidence_note, confidence_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (topic_id, content, source, candidate_id, review_status, evidence_note, confidence_score),
+    )
+    fact_id = cursor.lastrowid
+    _insert_fact_fts(conn, fact_id, topic_id, content, source)
+    return fact_id
+
+
+def insert_fact(
+    topic_id: int,
+    content: str,
+    source: str,
+    candidate_id: Optional[int] = None,
+    review_status: Optional[str] = None,
+    evidence_note: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+) -> int:
+    with get_db() as conn:
+        return _insert_fact_row(
+            conn,
+            topic_id,
+            content,
+            source,
+            candidate_id=candidate_id,
+            review_status=review_status,
+            evidence_note=evidence_note,
+            confidence_score=confidence_score,
+        )
+
+
+def insert_fact_with_embedding(
+    topic_id: int,
+    content: str,
+    source: str,
+    embedding: List[float],
+    candidate_id: Optional[int] = None,
+    review_status: Optional[str] = None,
+    evidence_note: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+) -> int:
     """Insert a fact and its corresponding embedding into the database."""
     with get_db() as conn:
-        cursor = conn.execute(
-            "INSERT INTO Fact (topic_id, content, source) VALUES (?, ?, ?)",
-            (topic_id, content, source)
+        fact_id = _insert_fact_row(
+            conn,
+            topic_id,
+            content,
+            source,
+            candidate_id=candidate_id,
+            review_status=review_status,
+            evidence_note=evidence_note,
+            confidence_score=confidence_score,
         )
-        fact_id = cursor.lastrowid
-        _insert_fact_fts(conn, fact_id, topic_id, content, source)
-        
         conn.execute(
             "INSERT INTO vec_facts(fact_id, embedding) VALUES (?, ?)",
             (fact_id, serialize_f32(embedding))
         )
         return fact_id
 
+def create_fact_candidate(topic_id: int, subtopic_id: int, writer_msg_id: Optional[int], candidate_text: str) -> int:
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO FactCandidate (topic_id, subtopic_id, writer_msg_id, candidate_text)
+            VALUES (?, ?, ?, ?)
+            """,
+            (topic_id, subtopic_id, writer_msg_id, candidate_text),
+        )
+        return cursor.lastrowid
 
-def fact_exists(topic_id: int, content: str, source: str) -> bool:
+
+def get_fact_candidates(
+    topic_id: int,
+    subtopic_id: Optional[int] = None,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        clauses = ["topic_id = ?"]
+        params: list[Any] = [topic_id]
+        if subtopic_id is not None:
+            clauses.append("subtopic_id = ?")
+            params.append(subtopic_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        rows = conn.execute(
+            f"SELECT * FROM FactCandidate WHERE {' AND '.join(clauses)} ORDER BY id ASC",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def fact_candidate_exists(
+    topic_id: int,
+    candidate_text: str,
+    statuses: Optional[Iterable[str]] = None,
+) -> bool:
+    with get_db() as conn:
+        params: list[Any] = [topic_id, candidate_text]
+        query = """
+            SELECT 1
+            FROM FactCandidate
+            WHERE topic_id = ? AND candidate_text = ?
+        """
+        status_list = [status for status in (statuses or []) if status]
+        if status_list:
+            placeholders = ", ".join("?" for _ in status_list)
+            query += f" AND status IN ({placeholders})"
+            params.extend(status_list)
+        query += " LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        return row is not None
+
+
+def update_fact_candidate_review(
+    candidate_id: int,
+    status: str,
+    reviewed_text: Optional[str] = None,
+    review_note: Optional[str] = None,
+    evidence_note: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+    reviewer: Optional[str] = None,
+    accepted_fact_id: Optional[int] = None,
+) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE FactCandidate
+            SET status = ?,
+                reviewed_text = ?,
+                review_note = ?,
+                evidence_note = ?,
+                confidence_score = ?,
+                reviewer = ?,
+                accepted_fact_id = ?,
+                reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                status,
+                reviewed_text,
+                review_note,
+                evidence_note,
+                confidence_score,
+                reviewer,
+                accepted_fact_id,
+                candidate_id,
+            ),
+        )
+
+
+def fact_exists(topic_id: int, content: str, source: Optional[str] = None) -> bool:
+    with get_db() as conn:
+        params: list[Any] = [topic_id, content]
+        query = """
+            SELECT 1
+            FROM Fact
+            WHERE topic_id = ? AND content = ?
+        """
+        if source is not None:
+            query += " AND source = ?"
+            params.append(source)
+        query += " LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        return row is not None
+
+
+def get_fact_by_content(topic_id: int, content: str) -> Optional[Dict[str, Any]]:
     with get_db() as conn:
         row = conn.execute(
             """
-            SELECT 1
+            SELECT *
             FROM Fact
-            WHERE topic_id = ? AND content = ? AND source = ?
+            WHERE topic_id = ? AND content = ?
+            ORDER BY id DESC
             LIMIT 1
             """,
-            (topic_id, content, source),
+            (topic_id, content),
         ).fetchone()
-        return row is not None
+        return dict(row) if row else None
 
 def search_facts(topic_id: int, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
     """Search for the most semantically similar facts using sqlite-vec."""
@@ -257,12 +472,17 @@ def insert_message_with_embedding(
     msg_type: str,
     embedding: List[float] = None,
     confidence_score: Optional[float] = None,
+    round_number: Optional[int] = None,
+    turn_kind: Optional[str] = None,
 ) -> int:
     """Insert a message and its embedding."""
     with get_db() as conn:
         cursor = conn.execute(
-            "INSERT INTO Message (topic_id, subtopic_id, sender, content, msg_type, confidence_score) VALUES (?, ?, ?, ?, ?, ?)",
-            (topic_id, subtopic_id, sender, content, msg_type, confidence_score)
+            """
+            INSERT INTO Message (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
         )
         msg_id = cursor.lastrowid
         _insert_message_fts(conn, msg_id, topic_id, sender, content, msg_type)

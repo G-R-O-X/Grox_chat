@@ -46,6 +46,26 @@ def _parse_plan_content(plan: Dict[str, Any] | None) -> List[Dict[str, str]]:
     return []
 
 
+def _sanitize_subtopics(raw_subtopics: Any, limit: int) -> List[Dict[str, str]]:
+    cleaned: List[Dict[str, str]] = []
+    if not isinstance(raw_subtopics, list):
+        return cleaned
+
+    for item in raw_subtopics:
+        if not isinstance(item, dict):
+            continue
+        summary = item.get("summary")
+        detail = item.get("detail")
+        if not isinstance(summary, str) or not summary.strip():
+            continue
+        if not isinstance(detail, str) or not detail.strip():
+            continue
+        cleaned.append({"summary": summary.strip(), "detail": detail.strip()})
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
 async def ask_gemini_cli(system_prompt: str, context: str, role: str, model: str = "gemini-3.1-pro-preview") -> Dict[str, Any]:
     prompt = f"{system_prompt}\n\nHere is the context of the chatroom:\n{context}"
     logger.info(f"[{role}] Asking Gemini CLI ({model})...")
@@ -103,6 +123,7 @@ async def node_plan_generation(state: TopicState) -> TopicState:
 
     system_prompt = (
         "You are the Audience. Break the topic into an ordered list of subtopics. "
+        "Return at most 3 subtopics. "
         "All JSON string values must be written in English only. "
         "Output strictly JSON using this schema: "
         "{\"action\":\"create_plan\",\"subtopics\":[{\"summary\":\"...\",\"detail\":\"...\"}]}"
@@ -110,7 +131,7 @@ async def node_plan_generation(state: TopicState) -> TopicState:
     context = f"Topic: {topic['summary']}\nDetail: {topic['detail']}"
     data = await ask_gemini_cli(system_prompt, context, "audience")
 
-    subtopics = data.get("subtopics", []) if isinstance(data, dict) else []
+    subtopics = _sanitize_subtopics(data.get("subtopics", []) if isinstance(data, dict) else [], limit=3)
     if not subtopics:
         subtopics = [{"summary": topic["summary"], "detail": topic["detail"]}]
 
@@ -222,6 +243,8 @@ async def node_topic_replan_or_close(state: TopicState) -> TopicState:
 
     system_prompt = (
         "You are the Audience. Decide whether the topic needs more subtopics or should be closed. "
+        "You are only called after all currently planned subtopics are completed. "
+        "If more work is needed, return at most 2 NEW subtopics. "
         "All JSON string values must be written in English only. "
         "Output strictly JSON using one of these schemas: "
         "{\"action\":\"create_plan\",\"subtopics\":[{\"summary\":\"...\",\"detail\":\"...\"}]}"
@@ -236,7 +259,11 @@ async def node_topic_replan_or_close(state: TopicState) -> TopicState:
         return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
 
     if action == "create_plan" and data.get("subtopics"):
-        plan_id = api.create_plan(state["topic_id"], json.dumps(data["subtopics"]), current_index=0)
+        subtopics = _sanitize_subtopics(data.get("subtopics"), limit=2)
+        if not subtopics:
+            logger.warning("[audience] Replan returned no valid subtopics after sanitation; deferring topic.")
+            return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
+        plan_id = api.create_plan(state["topic_id"], json.dumps(subtopics), current_index=0)
         return {"plan_id": plan_id, "topic_complete": False, "next_action": "open_next_subtopic"}
 
     if action != "close_topic":

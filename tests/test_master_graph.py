@@ -1,7 +1,9 @@
+import json
 import pytest
 from unittest.mock import AsyncMock, patch
 
 from grox_chat.master_graph import (
+    node_inspect_topic_state,
     node_open_next_subtopic,
     node_plan_generation,
     node_topic_replan_or_close,
@@ -34,6 +36,30 @@ async def test_node_plan_generation():
 
     assert new_state["plan_id"] == 7
     assert new_state["next_action"] == "open_next_subtopic"
+
+
+@pytest.mark.asyncio
+async def test_node_plan_generation_truncates_to_three_subtopics():
+    state = {"topic_id": 1}
+    model_subtopics = [
+        {"summary": f"Subtopic {idx}", "detail": f"Detail {idx}"}
+        for idx in range(1, 6)
+    ]
+
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph.ask_gemini_cli",
+            new=AsyncMock(return_value={"action": "create_plan", "subtopics": model_subtopics}),
+        ):
+            with patch("grox_chat.master_graph.api.create_plan", return_value=7) as create_plan:
+                new_state = await node_plan_generation(state)
+
+    stored_subtopics = json.loads(create_plan.call_args.args[1])
+    assert len(stored_subtopics) == 3
+    assert new_state["plan_id"] == 7
 
 
 @pytest.mark.asyncio
@@ -96,6 +122,60 @@ async def test_node_topic_replan_or_close_defers_on_error():
     assert route_after_replan(result) == "defer_topic"
     post_message.assert_not_called()
     set_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_node_topic_replan_or_close_truncates_new_subtopics_to_two():
+    state = {"topic_id": 1}
+    replanned = [
+        {"summary": "A", "detail": "Detail A"},
+        {"summary": "B", "detail": "Detail B"},
+        {"summary": "C", "detail": "Detail C"},
+    ]
+
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph.api.get_current_subtopics",
+            return_value=[{"summary": "Done 1", "conclusion": "Conclusion 1"}],
+        ):
+            with patch(
+                "grox_chat.master_graph.ask_gemini_cli",
+                new=AsyncMock(return_value={"action": "create_plan", "subtopics": replanned}),
+            ):
+                with patch("grox_chat.master_graph.api.create_plan", return_value=9) as create_plan:
+                    result = await node_topic_replan_or_close(state)
+
+    stored_subtopics = json.loads(create_plan.call_args.args[1])
+    assert len(stored_subtopics) == 2
+    assert result["plan_id"] == 9
+    assert result["next_action"] == "open_next_subtopic"
+
+
+def test_inspect_topic_state_opens_next_subtopic_before_replanning():
+    active_plan = {
+        "id": 3,
+        "current_index": 1,
+        "content": json.dumps(
+            [
+                {"summary": "Done", "detail": "Done detail"},
+                {"summary": "Next", "detail": "Next detail"},
+            ]
+        ),
+    }
+
+    with patch("grox_chat.master_graph.api.get_active_plan", return_value=active_plan):
+        with patch("grox_chat.master_graph.api.get_open_subtopic", return_value=None):
+            with patch(
+                "grox_chat.master_graph.api.get_current_subtopics",
+                return_value=[{"id": 1, "summary": "Done"}],
+            ):
+                result = node_inspect_topic_state({"topic_id": 1})
+
+    assert result["next_action"] == "open_next_subtopic"
+    assert result["plan_id"] == 3
 
 
 def test_route_after_open_next_subtopic_replans_when_no_subtopic_was_opened():

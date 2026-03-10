@@ -9,9 +9,6 @@ from .api_throttle import wait_for_slot
 
 load_dotenv()
 
-API_KEY = os.getenv("MINIMAX_API_KEY")
-BASE_URL = "https://api.minimax.io/anthropic/v1/messages"
-CODING_PLAN_BASE = "https://api.minimax.io"
 TIMEOUT = 120.0
 
 logger = logging.getLogger(__name__)
@@ -23,6 +20,26 @@ MINIMAX_TOOL_BLOCK_RE = re.compile(r"<minimax:tool_call>(.*?)</minimax:tool_call
 MINIMAX_INVOKE_RE = re.compile(r'<invoke name="([^"]+)">(.*?)</invoke>', re.DOTALL)
 MINIMAX_PARAM_RE = re.compile(r'<parameter name="([^"]+)">(.*?)</parameter>', re.DOTALL)
 ENGLISH_ONLY_INSTRUCTION = "Respond in English only."
+
+
+def _get_minimax_api_key() -> Optional[str]:
+    return os.getenv("MINIMAX_API_KEY")
+
+
+def _use_international_minimax() -> bool:
+    return os.getenv("MINIMAX_EN", "0") == "1"
+
+
+def _get_minimax_api_host() -> str:
+    return "https://api.minimax.io" if _use_international_minimax() else "https://api.minimaxi.com"
+
+
+def _get_minimax_message_url() -> str:
+    return f"{_get_minimax_api_host()}/anthropic/v1/messages"
+
+
+def _get_minimax_coding_plan_base() -> str:
+    return _get_minimax_api_host()
 
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client
@@ -118,7 +135,8 @@ async def query_minimax(
     The Anthropic-compatible MiniMax endpoint is used as text generation only;
     the separate Coding Plan APIs handle search/VLM capabilities.
     """
-    if not API_KEY:
+    api_key = _get_minimax_api_key()
+    if not api_key:
         logger.error("No MiniMax API key found in .env")
         return "Error: No API key.", []
 
@@ -126,7 +144,7 @@ async def query_minimax(
 
     headers = {
         "Content-Type": "application/json",
-        "x-api-key": API_KEY,
+        "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
     }
 
@@ -142,7 +160,7 @@ async def query_minimax(
         await wait_for_slot()
         try:
             client = _get_http_client()
-            resp = await client.post(BASE_URL, headers=headers, json=payload)
+            resp = await client.post(_get_minimax_message_url(), headers=headers, json=payload)
             
             if resp.status_code == 429:
                 logger.warning(f"[MiniMax] Rate limited (429). Retrying {attempt+1}/{max_retries}...")
@@ -180,11 +198,12 @@ async def query_minimax(
 
 async def minimax_search(query: str, timeout: float = 60.0, max_retries: int = 3) -> dict:
     """Call MiniMax Coding Plan web search API."""
-    if not API_KEY:
+    api_key = _get_minimax_api_key()
+    if not api_key:
         return {"error": "No MiniMax API key."}
 
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "MM-API-Source": "custom-chatroom",
         "Content-Type": "application/json",
     }
@@ -194,7 +213,7 @@ async def minimax_search(query: str, timeout: float = 60.0, max_retries: int = 3
         try:
             client = _get_http_client()
             resp = await client.post(
-                f"{CODING_PLAN_BASE}/v1/coding_plan/search",
+                f"{_get_minimax_coding_plan_base()}/v1/coding_plan/search",
                 headers=headers,
                 json={"q": query},
                 timeout=timeout

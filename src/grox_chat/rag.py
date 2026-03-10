@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import api
 from .embedding import aget_embedding
@@ -94,52 +94,72 @@ async def assemble_rag_context(
         
     logger.info(f"[RAG] Generated Query: {query_ch}")
     
-    # Step 2: Embedding
-    query_emb = await aget_embedding(query_ch)
+    recent_message_ids = [m["id"] for m in recent_messages if "id" in m]
+    rag_text, retrieval_degraded = await build_query_rag_context(
+        topic_id,
+        query_ch,
+        exclude_ids=recent_message_ids,
+    )
+    return rag_text, degraded or retrieval_degraded
+
+
+async def build_query_rag_context(
+    topic_id: int,
+    query_text: str,
+    *,
+    exclude_ids: Optional[Sequence[int]] = None,
+    fact_top_k: int = 12,
+    summary_top_k: int = 8,
+    message_top_k: int = 8,
+    selected_fact_top_k: int = 3,
+    selected_summary_top_k: int = 2,
+    selected_message_top_k: int = 2,
+) -> Tuple[str, bool]:
+    query = (query_text or "").strip()
+    if not query:
+        return "", True
+
+    query_emb = await aget_embedding(query)
     if not query_emb:
         logger.warning("[RAG] Embedding failed.")
         return "", True
-        
-    # Step 3: Retrieval (KNN)
+
     try:
-        recent_message_ids = [m["id"] for m in recent_messages if "id" in m]
-        candidate_facts = api.search_facts_hybrid(topic_id, query_ch, query_emb, top_k=12)
+        candidate_facts = api.search_facts_hybrid(topic_id, query, query_emb, top_k=fact_top_k)
         candidate_summaries = api.search_messages_hybrid(
             topic_id,
-            query_ch,
+            query,
             query_emb,
             msg_type="summary",
-            top_k=8,
-            exclude_ids=recent_message_ids,
+            top_k=summary_top_k,
+            exclude_ids=exclude_ids,
         )
         candidate_messages = api.search_messages_hybrid(
             topic_id,
-            query_ch,
+            query,
             query_emb,
             msg_type="standard",
-            top_k=8,
-            exclude_ids=recent_message_ids,
+            top_k=message_top_k,
+            exclude_ids=exclude_ids,
         )
     except Exception as exc:
         logger.warning("[RAG] Retrieval failed: %s", exc)
         return "", True
 
     if not candidate_facts and not candidate_summaries and not candidate_messages:
-        return "", degraded
+        return "", False
 
-    # Step 4: Reranking
     try:
-        selected_facts = await _select_relevant_records(query_ch, candidate_facts, top_k=3)
-        selected_summaries = await _select_relevant_records(query_ch, candidate_summaries, top_k=2)
-        selected_messages = await _select_relevant_records(query_ch, candidate_messages, top_k=2)
+        selected_facts = await _select_relevant_records(query, candidate_facts, top_k=selected_fact_top_k)
+        selected_summaries = await _select_relevant_records(query, candidate_summaries, top_k=selected_summary_top_k)
+        selected_messages = await _select_relevant_records(query, candidate_messages, top_k=selected_message_top_k)
     except Exception as exc:
         logger.warning("[RAG] Reranking failed: %s", exc)
         return "", True
 
     if not selected_facts and not selected_summaries and not selected_messages:
-        return "", degraded
+        return "", False
 
-    # Step 5: Assembly
     sections = [
         "=== RAG KNOWLEDGE INJECTION ===",
         _render_section("[Related Verified Facts]", selected_facts, "Fact").rstrip(),
@@ -147,4 +167,4 @@ async def assemble_rag_context(
         _render_section("[Relevant Historical Messages]", selected_messages, "Message").rstrip(),
     ]
     rag_text = "\n".join(section for section in sections if section)
-    return rag_text + "\n\n", degraded
+    return rag_text + "\n\n", False

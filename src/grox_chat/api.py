@@ -1,15 +1,21 @@
 from .db import (
     close_subtopic as db_close_subtopic,
+    create_fact_candidate as db_create_fact_candidate,
     fact_exists as db_fact_exists,
+    fact_candidate_exists as db_fact_candidate_exists,
     get_db,
     get_open_subtopic as db_get_open_subtopic,
     get_db_path,
+    get_fact_by_content as db_get_fact_by_content,
+    get_fact_candidates as db_get_fact_candidates,
+    insert_fact,
     insert_fact_with_embedding,
     insert_message_with_embedding,
     search_facts,
     search_facts_lexical,
     search_messages,
     search_messages_lexical,
+    update_fact_candidate_review as db_update_fact_candidate_review,
     update_plan_cursor,
     update_subtopic_start_msg,
 )
@@ -19,11 +25,13 @@ from .embedding import aget_embedding
 __all__ = [
     'get_current_topic', 'get_topic', 'create_plan', 'get_plan', 'get_current_subtopics',
     'get_latest_subtopic', 'get_subtopic', 'get_messages', 'create_topic', 'set_topic_status',
-    'create_subtopic', 'post_message', 'search_facts', 'insert_fact_with_embedding',
+    'create_subtopic', 'post_message', 'search_facts', 'insert_fact', 'insert_fact_with_embedding',
     'insert_message_with_embedding', 'search_messages', 'search_facts_lexical',
     'search_messages_lexical', 'search_facts_hybrid', 'search_messages_hybrid', 'get_active_plan',
     'advance_plan_cursor', 'update_subtopic_start_msg', 'close_subtopic',
-    'get_open_subtopic', 'get_db_path', 'persist_message', 'fact_exists'
+    'get_open_subtopic', 'get_db_path', 'persist_message', 'fact_exists', 'get_fact_by_content',
+    'create_fact_candidate', 'get_pending_fact_candidates', 'fact_candidate_exists',
+    'update_fact_candidate_review'
 ]
 
 def _dict(row):
@@ -135,11 +143,23 @@ def create_subtopic(topic_id, summary, detail, start_msg_id=None):
         )
         return cursor.lastrowid
 
-def post_message(topic_id, subtopic_id, sender, content, msg_type='standard', confidence_score=None):
+def post_message(
+    topic_id,
+    subtopic_id,
+    sender,
+    content,
+    msg_type='standard',
+    confidence_score=None,
+    round_number=None,
+    turn_kind=None,
+):
     with get_db() as conn:
         cursor = conn.execute(
-            "INSERT INTO Message (topic_id, subtopic_id, sender, content, msg_type, confidence_score) VALUES (?, ?, ?, ?, ?, ?)",
-            (topic_id, subtopic_id, sender, content, msg_type, confidence_score)
+            """
+            INSERT INTO Message (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
         )
         conn.execute(
             "INSERT OR REPLACE INTO messages_fts(rowid, content, topic_id, msg_type, sender) VALUES (?, ?, ?, ?, ?)",
@@ -148,7 +168,16 @@ def post_message(topic_id, subtopic_id, sender, content, msg_type='standard', co
         return cursor.lastrowid
 
 
-async def persist_message(topic_id, subtopic_id, sender, content, msg_type='standard', confidence_score=None):
+async def persist_message(
+    topic_id,
+    subtopic_id,
+    sender,
+    content,
+    msg_type='standard',
+    confidence_score=None,
+    round_number=None,
+    turn_kind=None,
+):
     if msg_type == 'standard':
         embedding = await aget_embedding(content)
         if embedding:
@@ -160,8 +189,19 @@ async def persist_message(topic_id, subtopic_id, sender, content, msg_type='stan
                 msg_type,
                 embedding,
                 confidence_score,
+                round_number,
+                turn_kind,
             )
-    return post_message(topic_id, subtopic_id, sender, content, msg_type, confidence_score)
+    return post_message(
+        topic_id,
+        subtopic_id,
+        sender,
+        content,
+        msg_type,
+        confidence_score,
+        round_number,
+        turn_kind,
+    )
 
 
 def advance_plan_cursor(plan_id: int):
@@ -181,8 +221,46 @@ def get_open_subtopic(topic_id: int):
     return db_get_open_subtopic(topic_id)
 
 
-def fact_exists(topic_id: int, content: str, source: str = "Writer"):
+def fact_exists(topic_id: int, content: str, source: str | None = None):
     return db_fact_exists(topic_id, content, source)
+
+
+def get_fact_by_content(topic_id: int, content: str):
+    return db_get_fact_by_content(topic_id, content)
+
+
+def create_fact_candidate(topic_id: int, subtopic_id: int, writer_msg_id: int | None, candidate_text: str) -> int:
+    return db_create_fact_candidate(topic_id, subtopic_id, writer_msg_id, candidate_text)
+
+
+def get_pending_fact_candidates(topic_id: int, subtopic_id: int):
+    return db_get_fact_candidates(topic_id, subtopic_id=subtopic_id, status="pending")
+
+
+def fact_candidate_exists(topic_id: int, candidate_text: str, statuses=None):
+    return db_fact_candidate_exists(topic_id, candidate_text, statuses=statuses)
+
+
+def update_fact_candidate_review(
+    candidate_id: int,
+    status: str,
+    reviewed_text: str | None = None,
+    review_note: str | None = None,
+    evidence_note: str | None = None,
+    confidence_score: float | None = None,
+    reviewer: str | None = None,
+    accepted_fact_id: int | None = None,
+):
+    db_update_fact_candidate_review(
+        candidate_id,
+        status,
+        reviewed_text=reviewed_text,
+        review_note=review_note,
+        evidence_note=evidence_note,
+        confidence_score=confidence_score,
+        reviewer=reviewer,
+        accepted_fact_id=accepted_fact_id,
+    )
 
 
 def search_facts_hybrid(topic_id: int, query_text: str, query_embedding, top_k: int = 12):

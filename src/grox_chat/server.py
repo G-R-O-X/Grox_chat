@@ -9,12 +9,18 @@ from langgraph.graph import END, START, StateGraph
 from .graph import ChatState, TurnSpec, dispatcher_node, route_from_dispatcher
 from . import api
 from . import db
-from .rag import assemble_rag_context
+from .rag import assemble_rag_context, build_query_rag_context
 from .tools import react_search_loop
 from .minimax_client import query_minimax
 from .llm_router import query_with_fallback
+from .external.gemini_cli_client import query_gemini_cli
 from .prompts import PROMPTS
 from .writer_processor import process_writer_output
+from .librarian_processor import (
+    apply_librarian_review,
+    build_librarian_audit_message,
+    parse_librarian_review,
+)
 from .embedding import aget_embedding
 
 logger = logging.getLogger(__name__)
@@ -23,6 +29,8 @@ AGENTS = ['dreamer', 'scientist', 'engineer', 'analyst', 'critic', 'contrarian',
 PARSER_FAILURE_CONFIDENCE = 2.5
 DEGRADED_OPERATION_CONFIDENCE = 3.0
 LOOP_WARNING_DISTANCE = 0.25
+WRITER_FACT_LIMIT = 2
+FINAL_WRITER_FACT_LIMIT = 3
 
 OPENING_PHASE = "opening"
 EVIDENCE_PHASE = "evidence"
@@ -32,6 +40,10 @@ BASE_TURN = "base"
 TRON_REMEDIATION_TURN = "tron_remediation"
 DOG_CORRECTION_TURN = "dog_correction"
 CAT_EXPANSION_TURN = "cat_expansion"
+WRITER_CRITIQUE_TURN = "writer_critique"
+LIBRARIAN_AUDIT_TURN = "librarian_audit"
+AUDIENCE_SUMMARY_TURN = "audience_summary"
+AUDIENCE_WARNING_TURN = "audience_warning"
 
 OPENING_ROSTER = ['dreamer', 'scientist', 'engineer', 'analyst', 'critic', 'tron']
 FULL_ROSTER = ['dreamer', 'scientist', 'engineer', 'analyst', 'critic', 'contrarian', 'dog', 'cat', 'tron']
@@ -114,6 +126,24 @@ def _normalize_message_contract(
     }
 
 
+def _normalize_fact_proposal_contract(raw_text: str) -> dict:
+    parsed = extract_json(raw_text)
+    if isinstance(parsed, dict):
+        action = parsed.get("action")
+        raw_facts = parsed.get("facts")
+        if action == "propose_facts" and isinstance(raw_facts, list):
+            facts = [fact.strip() for fact in raw_facts if isinstance(fact, str) and fact.strip()]
+            return {
+                "parsed_ok": True,
+                "facts": facts,
+            }
+
+    return {
+        "parsed_ok": False,
+        "facts": [],
+    }
+
+
 def _format_message_for_prompt(message: dict) -> str:
     parts = [message["sender"]]
     if message.get("msg_type") and message.get("msg_type") != "standard":
@@ -164,9 +194,59 @@ def build_extra_turns(state: ChatState) -> list[TurnSpec]:
 def build_turn_queue_for_round(state: ChatState, round_number: int) -> tuple[str, list[TurnSpec]]:
     phase = get_phase_for_round(round_number)
     turns = build_base_turns_for_phase(phase)
-    if phase == DEBATE_PHASE:
-        turns.extend(build_extra_turns(state))
     return phase, turns
+
+
+def _replace_extra_turns(pending_turns: list[TurnSpec], extra_turns: list[TurnSpec]) -> list[TurnSpec]:
+    base_turns = [turn for turn in pending_turns if turn.get("turn_kind", BASE_TURN) == BASE_TURN]
+    return base_turns + extra_turns
+
+
+def _refresh_pending_turns_with_extras(state: ChatState, updates: dict) -> None:
+    phase = updates.get("phase") or state.get("phase", get_phase_for_round(state.get("round_number", 1)))
+    if phase == OPENING_PHASE:
+        return
+
+    merged_state = dict(state)
+    merged_state.update(updates)
+    pending_turns = list(updates.get("pending_turns", state.get("pending_turns", [])))
+    updates["pending_turns"] = _replace_extra_turns(pending_turns, build_extra_turns(merged_state))
+
+
+def _clear_consumed_extra_target(turn_kind: str, updates: dict) -> None:
+    if turn_kind == TRON_REMEDIATION_TURN:
+        updates["tron_target"] = None
+    elif turn_kind == DOG_CORRECTION_TURN:
+        updates["dog_target"] = None
+    elif turn_kind == CAT_EXPANSION_TURN:
+        updates["cat_target"] = None
+
+
+def _pending_extra_turns(state: ChatState) -> list[TurnSpec]:
+    return [
+        turn
+        for turn in state.get("pending_turns", [])
+        if turn.get("turn_kind", BASE_TURN) != BASE_TURN
+    ]
+
+
+def _termination_policy_for_round(round_number: int) -> tuple[str, str]:
+    if round_number <= 3:
+        return (
+            "weak",
+            "Use a weak close threshold. Bias toward continuing unless the core subtopic is clearly resolved and no concrete unresolved branch remains.",
+        )
+    if round_number <= 6:
+        return (
+            "medium",
+            "Use a balanced close threshold. Close if another round is unlikely to add materially new evidence, a sharper claim, or a narrower unresolved branch.",
+        )
+    if round_number <= 9:
+        return (
+            "strong",
+            "Use a strong close threshold. Bias toward closing unless you can name a specific unresolved branch or evidence gap worth another round.",
+        )
+    return ("forced", "Round 10 is a forced close.")
 
 
 def _normalize_target_name(name: str) -> Optional[str]:
@@ -387,13 +467,77 @@ def build_writer_prompt(
     for message in messages:
         prompt += f"{_format_message_for_prompt(message)}\n"
     prompt += (
-        "\nTASK: Post a verification message based on the claims in the recent debate. "
-        "Perform web search if necessary to verify claims. "
+        "\nTASK: Post a critique message based on the claims in the recent debate. "
+        "Focus on weak reasoning, hallucination risk, overclaiming, missing evidence, or conceptual drift. "
+        "Do not propose facts in this step. "
         "Reply with JSON using this schema: "
-        "{\"action\": \"post_message\", \"content\": \"...\", \"facts\": [\"verified fact 1\", \"verified fact 2\"]}. "
-        "Use an empty facts array when nothing should be stored."
+        "{\"action\": \"post_message\", \"content\": \"...\"}."
     )
     return f"{PROMPTS['writer']}\n\nContext:\n{prompt}"
+
+
+def build_fact_proposer_prompt(
+    state: ChatState,
+    topic: dict,
+    messages: list[dict],
+    rag_context: str,
+    max_facts: int,
+) -> str:
+    prompt = (
+        f"Round: {state.get('round_number', 1)}\n"
+        f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
+        f"Topic: {topic['summary']}\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += "=== RECENT DEBATE ===\n"
+    for message in messages:
+        prompt += f"{_format_message_for_prompt(message)}\n"
+    prompt += (
+        "\nTASK: Propose candidate facts for long-term memory using local context plus web research. "
+        f"Return at most {max_facts} candidate facts. "
+        "Only include specific, reusable, evidence-worthy factual claims. "
+        "Do not include opinions, interpretations, or broad summaries. "
+        "Reply with JSON using this schema: "
+        "{\"action\": \"propose_facts\", \"facts\": [\"candidate fact 1\", \"candidate fact 2\"]}. "
+        "Use an empty facts array when nothing should be proposed."
+    )
+    return f"{PROMPTS['fact_proposer']}\n\nContext:\n{prompt}"
+
+
+def build_librarian_prompt(
+    state: ChatState,
+    topic: dict,
+    subtopic: dict | None,
+    candidate: dict,
+    messages: list[dict],
+    rag_context: str,
+) -> str:
+    prompt = (
+        f"Round: {state.get('round_number', 1)}\n"
+        f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
+        f"Topic: {topic['summary']}\n"
+    )
+    if subtopic:
+        prompt += f"Subtopic: {subtopic['summary']}\n"
+    prompt += (
+        f"Candidate ID: {candidate['id']}\n"
+        f"Candidate Fact: {candidate['candidate_text']}\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += "=== RECENT TRANSCRIPT ===\n"
+    for message in messages:
+        prompt += f"{_format_message_for_prompt(message)}\n"
+    prompt += (
+        "\nTASK: Verify whether this candidate fact should enter permanent memory. "
+        "You MUST rely on both the local context above and web-grounded verification. "
+        "Decision rules: accept if the claim is specific and supported; soften if the core idea is supportable but the wording is too broad, too absolute, or too strong; reject if unsupported, speculative, or merely interpretive. "
+        "Absolute formulations such as `no evidence`, `always`, `never`, `proves`, or `definitively` must be softened or rejected unless the evidence explicitly supports them. "
+        "Reply with STRICT JSON using this schema: "
+        "{\"action\": \"review_fact\", \"decision\": \"accept|soften|reject\", \"reviewed_text\": \"...\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"confidence_score\": 8}."
+    )
+    return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
 
 
 def build_audience_summary_prompt(state: ChatState, topic: dict, messages: list[dict]) -> str:
@@ -464,12 +608,12 @@ def _build_degraded_audience_summary(state: ChatState, messages: list[dict]) -> 
     )
 
 
-async def _run_writer_pass(state: ChatState, force: bool = False) -> dict:
+async def _run_writer_critique_pass(state: ChatState) -> dict:
     current_round = state.get("round_number", 1)
     if state.get("last_writer_round") == current_round:
         return {}
 
-    logger.info("[writer] Writer analyzing round for fact verification...")
+    logger.info("[writer] Writer analyzing round for critique...")
     topic, subtopic = _load_context_entities(state)
     if not topic:
         return {}
@@ -488,25 +632,185 @@ async def _run_writer_pass(state: ChatState, force: bool = False) -> dict:
     )
     prompt = build_writer_prompt(state, topic, standard_messages, rag_context)
     try:
-        resp_text = await query_with_fallback(
+        resp_text = await query_gemini_cli(
             prompt,
-            model="gemini-3.1-pro-preview",
+            model="gemini-3.0-flash",
+            temperature=0.7,
+            max_tokens=8192,
             system_instruction=PROMPTS["writer"],
-            use_google_search=True,
+            use_google_search=False,
             enable_fallback=True,
-            fallback_role="writer",
         )
     except Exception as exc:
-        logger.warning("[writer] All writer model fallbacks failed: %s", exc)
+        logger.warning("[writer] All writer critique model fallbacks failed: %s", exc)
         return {"last_writer_round": current_round}
 
     parsed = _normalize_message_contract(resp_text)
     content = parsed["content"]
-    structured_facts = parsed["facts"]
-
-    await api.persist_message(state["topic_id"], state["subtopic_id"], 'writer', content)
-    await process_writer_output(state["topic_id"], content, structured_facts=structured_facts)
+    await api.persist_message(
+        state["topic_id"],
+        state["subtopic_id"],
+        'writer',
+        content,
+        round_number=current_round,
+        turn_kind=WRITER_CRITIQUE_TURN,
+    )
     return {"last_writer_round": current_round}
+
+
+async def _run_fact_proposer_pass(state: ChatState, force: bool = False) -> dict:
+    current_round = state.get("round_number", 1)
+    if force:
+        if state.get("last_final_fact_proposer_round") == current_round:
+            return {}
+    elif state.get("last_fact_proposer_round") == current_round:
+        return {}
+
+    logger.info("[fact_proposer] Proposing candidate facts from the round...")
+    topic, subtopic = _load_context_entities(state)
+    if not topic:
+        return {}
+
+    messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=12)
+    standard_messages = [message for message in messages if message.get("msg_type", "standard") == "standard"]
+    if not standard_messages:
+        return {}
+
+    rag_messages = _seed_messages_for_rag(topic, subtopic, standard_messages)
+    rag_context, _ = await assemble_rag_context(
+        state["topic_id"],
+        state["subtopic_id"],
+        rag_messages,
+        "writer",
+    )
+    max_facts = FINAL_WRITER_FACT_LIMIT if force else WRITER_FACT_LIMIT
+    prompt = build_fact_proposer_prompt(state, topic, standard_messages, rag_context, max_facts=max_facts)
+    try:
+        resp_text, _ = await react_search_loop(
+            "fact_proposer",
+            prompt,
+            max_iter=2,
+            system_prompt=PROMPTS["fact_proposer"],
+        )
+    except Exception as exc:
+        logger.warning("[fact_proposer] MiniMax fact proposal failed: %s", exc)
+        marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
+        return {marker_key: current_round}
+
+    if (resp_text or "").strip().startswith("Error:"):
+        logger.warning("[fact_proposer] MiniMax fact proposal returned an error sentinel: %s", resp_text)
+        marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
+        return {marker_key: current_round}
+
+    parsed = _normalize_fact_proposal_contract(resp_text)
+    if not parsed["parsed_ok"]:
+        logger.warning("[fact_proposer] Invalid fact proposal contract; skipping candidate creation.")
+        marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
+        return {marker_key: current_round}
+
+    await process_writer_output(
+        state["topic_id"],
+        state["subtopic_id"],
+        None,
+        "",
+        structured_facts=parsed["facts"],
+        max_candidates=max_facts,
+    )
+    marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
+    return {marker_key: current_round}
+
+
+async def _query_librarian_review_text(prompt: str) -> tuple[str, str]:
+    try:
+        resp_text, _ = await react_search_loop(
+            "librarian",
+            prompt,
+            max_iter=2,
+            system_prompt=PROMPTS["librarian"],
+        )
+        if (resp_text or "").strip().startswith("Error:"):
+            raise RuntimeError(resp_text.strip())
+        return resp_text, "minimax"
+    except Exception as exc:
+        logger.warning("[librarian] MiniMax review failed, escalating to Gemini Flash + Google: %s", exc)
+
+    resp_text = await query_gemini_cli(
+        prompt,
+        model="gemini-3.0-flash",
+        temperature=0.7,
+        max_tokens=8192,
+        system_instruction=PROMPTS["librarian"],
+        use_google_search=True,
+        enable_fallback=True,
+    )
+    return resp_text, "gemini"
+
+
+async def _run_librarian_pass(state: ChatState) -> dict:
+    logger.info("[librarian] Reviewing pending fact candidates...")
+    topic, subtopic = _load_context_entities(state)
+    if not topic or not subtopic:
+        return {}
+
+    pending_candidates = api.get_pending_fact_candidates(state["topic_id"], state["subtopic_id"])
+    if not pending_candidates:
+        return {}
+
+    messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=12)
+    recent_message_ids = [message["id"] for message in messages if "id" in message]
+    review_results = []
+
+    for candidate in pending_candidates:
+        rag_context, _ = await build_query_rag_context(
+            state["topic_id"],
+            candidate["candidate_text"],
+            exclude_ids=recent_message_ids,
+        )
+        prompt = build_librarian_prompt(state, topic, subtopic, candidate, messages, rag_context)
+        try:
+            resp_text, provider = await _query_librarian_review_text(prompt)
+            try:
+                review = parse_librarian_review(resp_text, candidate["candidate_text"])
+            except Exception:
+                if provider != "minimax":
+                    raise
+                logger.warning(
+                    "[librarian] MiniMax review for candidate %s was not valid JSON/schema; retrying with Gemini Flash.",
+                    candidate["id"],
+                )
+                resp_text = await query_gemini_cli(
+                    prompt,
+                    model="gemini-3.0-flash",
+                    temperature=0.7,
+                    max_tokens=8192,
+                    system_instruction=PROMPTS["librarian"],
+                    use_google_search=True,
+                    enable_fallback=True,
+                )
+                review = parse_librarian_review(resp_text, candidate["candidate_text"])
+            review_results.append(
+                await apply_librarian_review(state["topic_id"], candidate, review)
+            )
+        except Exception as exc:
+            logger.warning(
+                "[librarian] Failed to review candidate %s; leaving pending: %s",
+                candidate["id"],
+                exc,
+            )
+
+    if not review_results:
+        return {}
+
+    audit_message = build_librarian_audit_message(review_results)
+    await api.persist_message(
+        state["topic_id"],
+        state["subtopic_id"],
+        "librarian",
+        audit_message,
+        round_number=state.get("round_number", 1),
+        turn_kind=LIBRARIAN_AUDIT_TURN,
+    )
+    return {}
 
 async def expert_node(state: ChatState) -> dict:
     actor = state["current_actor"]
@@ -549,22 +853,29 @@ async def expert_node(state: ChatState) -> dict:
         actor,
         content,
         confidence_score=confidence_score,
+        round_number=state.get("round_number", 1),
+        turn_kind=turn_kind,
     )
 
     # Peanut gallery targeting logic
     updates = {"current_actor": "", "current_turn_kind": ""}
-    if actor == 'dog':
+    _clear_consumed_extra_target(turn_kind, updates)
+
+    if turn_kind == BASE_TURN and actor == 'dog':
         target = _extract_target_from_content(content, actor)
         if target:
             updates['dog_target'] = target
-    elif actor == 'cat':
+    elif turn_kind == BASE_TURN and actor == 'cat':
         target = _extract_target_from_content(content, actor)
         if target:
             updates['cat_target'] = target
-    elif actor == 'tron':
+    elif turn_kind == BASE_TURN and actor == 'tron':
         target = _extract_target_from_content(content, actor)
         if target:
             updates['tron_target'] = target
+
+    if any(key in updates for key in {"dog_target", "cat_target", "tron_target"}):
+        _refresh_pending_turns_with_extras(state, updates)
 
     return updates
 
@@ -573,6 +884,7 @@ async def audience_summary_node(state: ChatState) -> dict:
     topic, _ = _load_context_entities(state)
     if not topic:
         return {}
+    current_round = state.get("round_number", 1)
     messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=20)
 
     prompt = build_audience_summary_prompt(state, topic, messages)
@@ -605,9 +917,19 @@ async def audience_summary_node(state: ChatState) -> dict:
             content,
             msg_type='summary',
             embedding=emb,
+            round_number=current_round,
+            turn_kind=AUDIENCE_SUMMARY_TURN,
         )
     else:
-        msg_id = api.post_message(state["topic_id"], state["subtopic_id"], 'audience', content, msg_type='summary')
+        msg_id = api.post_message(
+            state["topic_id"],
+            state["subtopic_id"],
+            'audience',
+            content,
+            msg_type='summary',
+            round_number=current_round,
+            turn_kind=AUDIENCE_SUMMARY_TURN,
+        )
         
     return {"latest_summary_msg_id": msg_id}
 
@@ -616,6 +938,12 @@ async def audience_termination_check_node(state: ChatState) -> dict:
     current_round = state.get("round_number", 1)
     if current_round < 3:
         logger.info("[audience] Exit check suppressed before round 3 (current round: %s).", current_round)
+        return {"subtopic_exhausted": False}
+    if current_round >= 10:
+        logger.info("[audience] Forcing subtopic close at round %s.", current_round)
+        return {"subtopic_exhausted": True}
+    if _pending_extra_turns(state):
+        logger.info("[audience] Deferring close because extra turns are still pending.")
         return {"subtopic_exhausted": False}
 
     topic, _ = _load_context_entities(state)
@@ -655,14 +983,27 @@ async def audience_termination_check_node(state: ChatState) -> dict:
                     # Skip if it's the exact same recent summary (distance ~ 0)
                     if ps.get('distance', 1.0) > 0.05:
                         historical_context += f"Past Conclusion: {ps['content'][:300]}...\n"
-                    if ps.get('distance', 1.0) <= LOOP_WARNING_DISTANCE or "lexical_score" in ps:
+                    if ps.get('distance', 1.0) <= LOOP_WARNING_DISTANCE:
                         loop_detected = True
+
+    stage, stage_guidance = _termination_policy_for_round(current_round)
+    outstanding_extras = _pending_extra_turns(state)
+    if outstanding_extras:
+        outstanding_summary = ", ".join(
+            f"{turn['actor']}:{turn['turn_kind']}" for turn in outstanding_extras
+        )
+    else:
+        outstanding_summary = "none"
 
     prompt = (
         f"Context:\n{ctx}\n{historical_context}\n\n"
+        f"Termination stage: {stage}\n"
+        f"Outstanding extra turns: {outstanding_summary}\n"
         "TASK: Analyze the context and historical summaries. The room has already completed the mandatory opening "
-        "and evidence rounds. Only vote to close if another debate round is unlikely to produce materially new insight, "
-        "new evidence, or a narrower unresolved claim. If the debate is cyclical and no one is yielding, you MUST vote to close. "
+        "and evidence rounds. "
+        f"{stage_guidance} "
+        "Do not vote to close if there is still a concrete unresolved branch, a meaningful evidence gap, or an unredeemed extra-turn obligation. "
+        "If the debate is clearly cyclical and no one is adding materially new evidence, you should vote to close. "
         "Reply STRICTLY with JSON using one of these schemas: "
         "{\"is_done\": true} or {\"is_done\": false, \"warning\": \"single-sentence system warning\"}."
     )
@@ -694,6 +1035,8 @@ async def audience_termination_check_node(state: ChatState) -> dict:
             "audience",
             warning_text,
             msg_type="warning",
+            round_number=current_round,
+            turn_kind=AUDIENCE_WARNING_TURN,
         )
     
     return {"subtopic_exhausted": is_done}
@@ -715,6 +1058,7 @@ def setup_next_round_node(state: ChatState) -> dict:
         "dog_target": None,
         "cat_target": None,
         "tron_target": None,
+        "pending_fact_reviews_remaining": False,
     }
 
 def close_subtopic_node(state: ChatState) -> dict:
@@ -722,11 +1066,41 @@ def close_subtopic_node(state: ChatState) -> dict:
     return {}
 
 async def writer_node(state: ChatState) -> dict:
-    return await _run_writer_pass(state, force=False)
+    return await _run_writer_critique_pass(state)
 
 
 async def final_writer_node(state: ChatState) -> dict:
-    return await _run_writer_pass(state, force=True)
+    return await _run_writer_critique_pass(state)
+
+
+async def fact_proposer_node(state: ChatState) -> dict:
+    return await _run_fact_proposer_pass(state, force=False)
+
+
+async def final_fact_proposer_node(state: ChatState) -> dict:
+    return await _run_fact_proposer_pass(state, force=True)
+
+
+async def librarian_node(state: ChatState) -> dict:
+    return await _run_librarian_pass(state)
+
+
+async def final_librarian_node(state: ChatState) -> dict:
+    await _run_librarian_pass(state)
+    pending_candidates = api.get_pending_fact_candidates(state["topic_id"], state["subtopic_id"])
+    if pending_candidates:
+        logger.warning(
+            "[librarian] %s fact candidates remain pending; delaying subtopic close for another round.",
+            len(pending_candidates),
+        )
+        return {"pending_fact_reviews_remaining": True, "subtopic_exhausted": False}
+    return {"pending_fact_reviews_remaining": False}
+
+
+def route_after_final_librarian(state: ChatState) -> str:
+    if state.get("pending_fact_reviews_remaining"):
+        return "setup_next_round"
+    return "close_subtopic"
 
 def build_graph():
     builder = StateGraph(ChatState)
@@ -747,13 +1121,19 @@ def build_graph():
         
     # 2. End of Round Logic
     builder.add_node("writer_node", writer_node)
+    builder.add_node("fact_proposer_node", fact_proposer_node)
+    builder.add_node("librarian_node", librarian_node)
     builder.add_node("audience_summary_node", audience_summary_node)
     builder.add_node("audience_termination_check_node", audience_termination_check_node)
     builder.add_node("setup_next_round_node", setup_next_round_node)
     builder.add_node("final_writer_node", final_writer_node)
+    builder.add_node("final_fact_proposer_node", final_fact_proposer_node)
+    builder.add_node("final_librarian_node", final_librarian_node)
     builder.add_node("close_subtopic_node", close_subtopic_node)
     
-    builder.add_edge("writer_node", "audience_summary_node")
+    builder.add_edge("writer_node", "fact_proposer_node")
+    builder.add_edge("fact_proposer_node", "librarian_node")
+    builder.add_edge("librarian_node", "audience_summary_node")
     builder.add_edge("audience_summary_node", "audience_termination_check_node")
     
     builder.add_conditional_edges(
@@ -763,7 +1143,16 @@ def build_graph():
     )
     
     builder.add_edge("setup_next_round_node", "dispatcher")
-    builder.add_edge("final_writer_node", "close_subtopic_node")
+    builder.add_edge("final_writer_node", "final_fact_proposer_node")
+    builder.add_edge("final_fact_proposer_node", "final_librarian_node")
+    builder.add_conditional_edges(
+        "final_librarian_node",
+        route_after_final_librarian,
+        {
+            "setup_next_round": "setup_next_round_node",
+            "close_subtopic": "close_subtopic_node",
+        },
+    )
     builder.add_edge("close_subtopic_node", END)
     
     # Entry point
@@ -790,6 +1179,9 @@ async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
         "subtopic_exhausted": False,
         "round_number": 1,
         "last_writer_round": None,
+        "last_fact_proposer_round": None,
+        "last_final_fact_proposer_round": None,
+        "pending_fact_reviews_remaining": False,
     }
     return await graph.ainvoke(initial_state)
 

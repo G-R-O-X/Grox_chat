@@ -1,8 +1,7 @@
 import logging
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from . import api
-from .embedding import aget_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +19,15 @@ def _extract_fact_lines(writer_text: str) -> List[str]:
     return fact_lines
 
 
-async def _store_facts(topic_id: int, facts: Iterable[str]) -> None:
+async def _store_fact_candidates(
+    topic_id: int,
+    subtopic_id: int,
+    writer_msg_id: Optional[int],
+    facts: Iterable[str],
+    max_candidates: int | None = None,
+) -> list[int]:
     seen: set[str] = set()
+    created_ids: list[int] = []
     for fact_content in facts:
         if not isinstance(fact_content, str):
             continue
@@ -29,24 +35,37 @@ async def _store_facts(topic_id: int, facts: Iterable[str]) -> None:
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
-        if api.fact_exists(topic_id, normalized, source="Writer"):
-            logger.info(f"[Writer Processor] Skipping duplicate fact: {normalized[:50]}...")
+        if api.fact_exists(topic_id, normalized):
+            logger.info("[Writer Processor] Skipping final fact duplicate: %s...", normalized[:50])
             continue
-        logger.info(f"[Writer Processor] Extracting and embedding fact: {normalized[:50]}...")
-        emb = await aget_embedding(normalized)
-        if emb:
-            fact_id = api.insert_fact_with_embedding(topic_id, normalized, source="Writer", embedding=emb)
-            logger.info(f"[Writer Processor] Inserted Fact ID: {fact_id}")
-        else:
-            logger.warning("[Writer Processor] Failed to embed fact.")
+        if api.fact_candidate_exists(topic_id, normalized, statuses=("pending",)):
+            logger.info("[Writer Processor] Skipping pending fact candidate duplicate: %s...", normalized[:50])
+            continue
+        candidate_id = api.create_fact_candidate(topic_id, subtopic_id, writer_msg_id, normalized)
+        created_ids.append(candidate_id)
+        logger.info("[Writer Processor] Created FactCandidate ID: %s", candidate_id)
+        if max_candidates is not None and len(created_ids) >= max_candidates:
+            break
+    return created_ids
 
 
-async def process_writer_output(topic_id: int, writer_text: str, structured_facts: List[str] | None = None):
+async def process_writer_output(
+    topic_id: int,
+    subtopic_id: int,
+    writer_msg_id: Optional[int],
+    writer_text: str,
+    structured_facts: List[str] | None = None,
+    max_candidates: int | None = None,
+) -> list[int]:
     """
-    Parses the writer's output to extract specific verified facts.
-    If facts are found, embeds them and inserts them into the Fact table.
-    We expect the Writer to output facts in a structured way, or we use regex to extract them.
-    For simplicity, let's assume the Writer lists verified facts starting with 'FACT:' or 'VERIFIED:'.
+    Stores structured candidate facts in FactCandidate after normalization and deduplication.
+    Permanent Fact insertion is delegated to the Librarian review stage.
     """
     facts = structured_facts if structured_facts is not None else _extract_fact_lines(writer_text)
-    await _store_facts(topic_id, facts)
+    return await _store_fact_candidates(
+        topic_id,
+        subtopic_id,
+        writer_msg_id,
+        facts,
+        max_candidates=max_candidates,
+    )

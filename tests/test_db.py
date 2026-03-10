@@ -35,6 +35,8 @@ def test_db_schema_upgrades():
         # Check if Fact table exists
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Fact'")
         assert cursor.fetchone() is not None
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='FactCandidate'")
+        assert cursor.fetchone() is not None
 
         # Check Subtopic updates
         cursor = conn.execute("PRAGMA table_info(Subtopic)")
@@ -49,6 +51,15 @@ def test_db_schema_upgrades():
 
         cursor = conn.execute("PRAGMA table_info(Message)")
         columns = [row['name'] for row in cursor.fetchall()]
+        assert 'confidence_score' in columns
+        assert 'round_number' in columns
+        assert 'turn_kind' in columns
+
+        cursor = conn.execute("PRAGMA table_info(Fact)")
+        columns = [row['name'] for row in cursor.fetchall()]
+        assert 'candidate_id' in columns
+        assert 'review_status' in columns
+        assert 'evidence_note' in columns
         assert 'confidence_score' in columns
         
         # Check vector tables
@@ -170,3 +181,26 @@ def test_message_lexical_search_indexes_plain_post_message():
     assert len(results) == 1
     assert results[0]["id"] == msg_id
     assert results[0]["confidence_score"] == 2.5
+
+
+def test_message_round_and_turn_metadata_persist():
+    with get_db() as conn:
+        cursor = conn.execute("INSERT INTO Topic (summary, detail) VALUES ('Topic A', 'Detail A')")
+        topic_id = cursor.lastrowid
+
+    msg_id = api.post_message(
+        topic_id,
+        None,
+        "dreamer",
+        "Structured turn metadata",
+        "standard",
+        confidence_score=7.5,
+        round_number=3,
+        turn_kind="cat_expansion",
+    )
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM Message WHERE id = ?", (msg_id,)).fetchone()
+
+    assert row["round_number"] == 3
+    assert row["turn_kind"] == "cat_expansion"

@@ -8,22 +8,28 @@ A database-first, graph-orchestrated reasoning system for long-running technical
 
 ### Overview
 
-GROX Chat is not a free-form group chat. It is a structured reasoning arena built around a persistent SQLite blackboard, with Gemini-led orchestration and MiniMax-driven debate turns.
+GROX Chat is not a free-form group chat. It is a structured reasoning arena built around a persistent SQLite blackboard, with Gemini-led orchestration, Gemini Flash round-end critique, and MiniMax-driven debate and fact research turns.
 
 - `Audience` plans the topic, opens each subtopic with a grounding brief, summarizes progress, and decides when to stop.
 - The expert panel drives the actual reasoning: `Dreamer`, `Scientist`, `Engineer`, `Analyst`, `Critic`, and `Contrarian`.
 - `Cat`, `Dog`, and `Tron` form the asynchronous validation layer.
-- `Writer` verifies hard claims and turns stable findings into reusable facts.
+- `Writer` produces round-end critique and correction.
+- A hidden `Fact Proposer` node uses MiniMax research to draft candidate facts.
+- `Librarian` verifies candidate facts before they enter permanent memory.
 - Retrieval is explicit: agents decide what to query, then run embedding, search, rerank, and injection before speaking.
 
 ### Execution Model
 
 - Every speaking role performs local RAG before generating a message.
 - `Round 1 / opening`: `Dreamer -> Scientist -> Engineer -> Analyst -> Critic -> Tron`
-- `Round 2 / evidence`: `Dreamer -> Scientist -> Engineer -> Analyst -> Critic -> Contrarian -> Dog -> Cat -> Tron`
-- `Round 3+ / debate`: same base roster, plus extra turns in fixed order `Tron -> Dog -> Cat`
+- `Round 2 / evidence`: `Dreamer -> Scientist -> Engineer -> Analyst -> Critic -> Contrarian -> Dog -> Cat -> Tron`, with same-round extra turns redeemed at the tail if `Dog` / `Cat` / `Tron` nominate a target
+- `Round 3+ / debate`: same base roster, and same-round extra turns remain enabled in fixed order `Tron -> Dog -> Cat`
 - External web search is phase-gated: disabled in round 1, open to all speakers in round 2, and narrowed again in round 3+
-- `Writer` runs at the end of every round and can persist verified facts into the fact store
+- `Writer` runs at the end of every round as a critique node
+- A hidden `Fact Proposer` runs immediately after `Writer` and drafts up to `2` candidates (`3` on the final pass)
+- `Librarian` runs after that and only reviewed facts enter the fact store
+- Subtopic termination is graduated: rounds `1-2` cannot close, round `3` uses a weak close check, rounds `4-6` use a medium check, rounds `7-9` use a strong check, and round `10` forces closure
+- Initial planning is capped at `3` subtopics; replanning only happens after the current plan is exhausted and may add at most `2` new subtopics
 
 ### Architecture
 
@@ -31,14 +37,18 @@ GROX Chat is not a free-form group chat. It is a structured reasoning arena buil
 flowchart LR
     User[User / Topic Input] --> Audience[Audience<br/>planning, grounding brief,<br/>summary, termination]
     Audience --> Arena[Subtopic Arena]
-    Arena --> Writer[Writer<br/>fact verification]
-    Writer --> Audience
+    Arena --> Writer[Writer<br/>critique pass]
+    Writer --> Proposer[Hidden Fact Proposer<br/>MiniMax research]
+    Proposer --> Librarian[Librarian<br/>fact review gate]
+    Librarian --> Audience
 
-    Memory[(SQLite Blackboard<br/>Topic / Plan / Subtopic / Message / Fact<br/>vec_facts / vec_messages)]
+    Memory[(SQLite Blackboard<br/>Topic / Plan / Subtopic / Message / FactCandidate / Fact<br/>vec_facts / vec_messages)]
 
     Audience <--> Memory
     Arena <--> Memory
     Writer <--> Memory
+    Proposer <--> Memory
+    Librarian <--> Memory
 ```
 
 ### Subtopic Round Pipeline
@@ -46,11 +56,14 @@ flowchart LR
 ```mermaid
 flowchart TD
     Grounding[Audience grounding brief] --> Opening[Round 1 / opening<br/>Dreamer -> Scientist -> Engineer -> Analyst -> Critic -> Tron<br/>local RAG only]
-    Opening --> Evidence[Round 2 / evidence<br/>Dreamer -> Scientist -> Engineer -> Analyst -> Critic -> Contrarian -> Dog -> Cat -> Tron<br/>local RAG + optional web search]
-    Evidence --> Debate[Round 3+ / debate<br/>same base roster<br/>local RAG always on]
-    Debate --> Extra[Extra turns if targeted<br/>Tron remediation -> Dog correction -> Cat expansion]
-    Extra --> Writer[Writer fact pass<br/>every round]
-    Writer --> Summary[Audience summary]
+    Opening --> RoundEnd1[Writer critique -> Fact Proposer -> Librarian -> Audience summary]
+    RoundEnd1 --> Evidence[Round 2 / evidence<br/>Dreamer -> Scientist -> Engineer -> Analyst -> Critic -> Contrarian -> Dog -> Cat -> Tron<br/>local RAG + optional web search]
+    Evidence --> Extra[Same-round extra turns if targeted from Round 2 onward<br/>Tron remediation -> Dog correction -> Cat expansion]
+    Debate[Round 3+ / debate<br/>same base roster<br/>local RAG always on] --> Extra
+    Extra --> Writer[Writer critique pass<br/>every round]
+    Writer --> Proposer[Hidden Fact Proposer<br/>MiniMax research]
+    Proposer --> Librarian[Librarian review gate]
+    Librarian --> Summary[Audience summary]
     Summary --> Eval[Audience termination check<br/>with summary-memory lookup]
     Eval -->|Continue| Next[Setup next round]
     Next --> PhaseShift{Next phase}
@@ -62,7 +75,9 @@ flowchart TD
 ### Roles
 
 - `Audience`: moderator, planner, summarizer, and topic-level controller.
-- `Writer`: fact verifier and knowledge distiller; feeds the fact store.
+- `Writer`: round-end critic and correction layer.
+- `Fact Proposer`: hidden MiniMax research node that drafts candidate facts without posting to the room.
+- `Librarian`: permanent-memory gatekeeper; accepts, softens, or rejects candidate facts.
 - `Dreamer`: proposes new directions and hypotheses.
 - `Scientist`: checks mechanism, theory, and internal validity.
 - `Engineer`: converts ideas into buildable systems and concrete tactics.
@@ -75,9 +90,10 @@ flowchart TD
 
 ### Retrieval and Memory
 
-The system maintains two long-term memory lanes:
+The system maintains a gated long-term memory stack:
 
-- `Fact RAG`: reusable, verified knowledge extracted by `Writer`.
+- `FactCandidate`: hidden fact-proposer claims waiting for Librarian review.
+- `Fact RAG`: reusable, verified knowledge admitted by `Librarian`.
 - `Summary RAG`: historical summaries used by `Audience` to detect repetition, stalling, and semantic loops.
 
 The intended retrieval path runs before every speaking turn:
@@ -102,6 +118,17 @@ cp .env.example .env
 uv run python -c "from grox_chat.db import init_db; init_db()"
 uv run python -m grox_chat.server
 ```
+
+### MiniMax Endpoint Selection
+
+- Default MiniMax API host is the mainland endpoint: `https://api.minimaxi.com`
+- Set `MINIMAX_EN=1` in `.env` to use the international endpoint: `https://api.minimax.io`
+- This applies to both:
+  - Anthropic-compatible Messages API
+  - Coding Plan search API
+- For MiniMax MCP / IDE integrations, the documented domestic bases are:
+  - Anthropic-compatible: `https://api.minimaxi.com/anthropic/v1`
+  - OpenAI-compatible: `https://api.minimaxi.com/v1`
 
 Create a topic from another shell:
 

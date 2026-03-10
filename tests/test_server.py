@@ -742,6 +742,25 @@ def test_normalize_message_contract_filters_non_string_facts():
     assert parsed["facts"] == ["Verified fact"]
 
 
+def test_normalize_message_contract_extracts_single_wrapped_content():
+    parsed = _normalize_message_contract(
+        '{"action":"post_message","content":"Scientist correction","confidence_score":7.5}'
+    )
+
+    assert parsed["parsed_ok"] is True
+    assert parsed["content"] == "Scientist correction"
+    assert parsed["confidence_score"] == 7.5
+
+
+def test_normalize_message_contract_extracts_fenced_single_wrapped_content_without_recursing():
+    parsed = _normalize_message_contract(
+        '```json\n{"action":"post_message","content":"{\\"nested\\":true}"}\n```'
+    )
+
+    assert parsed["parsed_ok"] is True
+    assert parsed["content"] == '{"nested":true}'
+
+
 def test_build_audience_summary_prompt_requires_per_agent_positions_first():
     state = {"round_number": 2, "phase": EVIDENCE_PHASE}
     topic = {"summary": "topic"}

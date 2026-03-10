@@ -30,8 +30,8 @@ __all__ = [
     'search_messages_lexical', 'search_facts_hybrid', 'search_messages_hybrid', 'get_active_plan',
     'advance_plan_cursor', 'update_subtopic_start_msg', 'close_subtopic',
     'get_open_subtopic', 'get_db_path', 'persist_message', 'fact_exists', 'get_fact_by_content',
-    'create_fact_candidate', 'get_pending_fact_candidates', 'fact_candidate_exists',
-    'update_fact_candidate_review'
+    'create_fact_candidate', 'get_pending_fact_candidates', 'get_fact_candidates', 'get_facts',
+    'fact_candidate_exists', 'update_fact_candidate_review'
 ]
 
 def _dict(row):
@@ -235,6 +235,24 @@ def create_fact_candidate(topic_id: int, subtopic_id: int, writer_msg_id: int | 
 
 def get_pending_fact_candidates(topic_id: int, subtopic_id: int):
     return db_get_fact_candidates(topic_id, subtopic_id=subtopic_id, status="pending")
+
+
+def get_fact_candidates(topic_id: int, subtopic_id: int | None = None, status: str | None = None, limit: int | None = None):
+    candidates = db_get_fact_candidates(topic_id, subtopic_id=subtopic_id, status=status)
+    if limit is not None:
+        return candidates[:limit]
+    return candidates
+
+
+def get_facts(topic_id: int, limit: int | None = None):
+    with get_db() as conn:
+        params = [topic_id]
+        query = "SELECT * FROM Fact WHERE topic_id = ? ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [_dict(row) for row in rows]
 
 
 def fact_candidate_exists(topic_id: int, candidate_text: str, statuses=None):

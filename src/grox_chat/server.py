@@ -82,6 +82,19 @@ def extract_json(text: str) -> dict:
         return None
 
 
+def _parse_single_json_wrapper(text: str) -> Optional[dict]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _clamp_confidence(value) -> Optional[float]:
     if value is None:
         return None
@@ -96,7 +109,7 @@ def _normalize_message_contract(
     accepted_actions: Sequence[str] = ("post_message",),
     fallback_confidence: Optional[float] = None,
 ) -> dict:
-    parsed = extract_json(raw_text)
+    parsed = _parse_single_json_wrapper(raw_text) or extract_json(raw_text)
     if isinstance(parsed, dict):
         action = parsed.get("action")
         content = parsed.get("content")

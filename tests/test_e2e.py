@@ -1,4 +1,4 @@
-from agent_chatroom.graph import dispatcher_node, route_from_dispatcher
+from grox_chat.graph import dispatcher_node, route_from_dispatcher
 
 
 def test_dispatcher_routes_to_next_agent_then_end_of_round():

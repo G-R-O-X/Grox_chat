@@ -1,5 +1,5 @@
 import pytest
-from agent_chatroom.external.gemini_cli_client import _extract_text
+from grox_chat.external.gemini_cli_client import _extract_text
 
 def test_extract_text_gemini():
     mock_response = {

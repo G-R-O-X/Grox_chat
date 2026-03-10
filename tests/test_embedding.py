@@ -1,4 +1,4 @@
-from agent_chatroom.embedding import get_embedding, get_embeddings_batch
+from grox_chat.embedding import get_embedding, get_embeddings_batch
 
 def test_single_embedding():
     text = "This is a test sentence."

@@ -1,4 +1,4 @@
-from agent_chatroom.reranker import rerank
+from grox_chat.reranker import rerank
 
 def test_rerank_basic():
     query = "What is the capital of France?"

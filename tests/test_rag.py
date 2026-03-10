@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch, AsyncMock
-from agent_chatroom.rag import assemble_rag_context
+from grox_chat.rag import assemble_rag_context
 
 @pytest.mark.asyncio
 async def test_assemble_rag_context_empty():
@@ -35,11 +35,11 @@ async def test_assemble_rag_context():
         [(0, 0.7), (1, 0.1)],
     ])
     
-    with patch("agent_chatroom.rag.query_minimax", new=mock_query_minimax):
-        with patch("agent_chatroom.rag.aget_embedding", new=mock_embedding):
-            with patch("agent_chatroom.rag.api.search_facts_hybrid", return_value=mock_facts):
-                with patch("agent_chatroom.rag.api.search_messages_hybrid", side_effect=[mock_summaries, mock_messages]):
-                    with patch("agent_chatroom.rag.arerank", new=mock_rerank):
+    with patch("grox_chat.rag.query_minimax", new=mock_query_minimax):
+        with patch("grox_chat.rag.aget_embedding", new=mock_embedding):
+            with patch("grox_chat.rag.api.search_facts_hybrid", return_value=mock_facts):
+                with patch("grox_chat.rag.api.search_messages_hybrid", side_effect=[mock_summaries, mock_messages]):
+                    with patch("grox_chat.rag.arerank", new=mock_rerank):
                         res, degraded = await assemble_rag_context(1, 1, recent_messages, "dreamer")
 
                         assert "RAG KNOWLEDGE INJECTION" in res

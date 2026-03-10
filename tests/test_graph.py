@@ -1,4 +1,4 @@
-from agent_chatroom.graph import ChatState, dispatcher_node, route_from_dispatcher
+from grox_chat.graph import ChatState, dispatcher_node, route_from_dispatcher
 
 def test_dispatcher_node():
     state: ChatState = {

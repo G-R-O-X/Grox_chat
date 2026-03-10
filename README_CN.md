@@ -1,12 +1,14 @@
-# Agent Chatroom (多智能体科研推理系统)
+# GROX Chat
+
+Gemini Research Orchestration with minimaX -- Chat Only
 
 [English](README.md)
 
-一个以数据库为中心、由图状态机调度的多代理推理系统，面向长时间、多阶段的技术讨论与知识沉淀。
+一个以数据库为中心、由图状态机调度的推理系统，面向长时间、多阶段的技术讨论与知识沉淀。
 
 ### 系统简介
 
-Agent Chatroom 不是普通的多人闲聊，而是一个围绕 SQLite 持久化黑板运行的结构化推理竞技场。
+GROX Chat 不是普通的多人闲聊，而是一个围绕 SQLite 持久化黑板运行的结构化推理竞技场；Gemini 负责高层调度，MiniMax 负责高吞吐讨论。
 
 - `观众 (Audience)` 负责总体规划、为每个子题撰写背景简报、总结进度，并决定何时终止。
 - 专家组负责推动核心推理：`空想家 (Dreamer)`、`科学家 (Scientist)`、`工程师 (Engineer)`、`分析师 (Analyst)`、`批评家 (Critic)` 和 `少数派 (Contrarian)`。
@@ -88,7 +90,7 @@ flowchart TD
 
 ### 项目结构
 
-- `src/agent_chatroom/`: 调度、模型客户端、检索、持久化、prompt
+- `src/grox_chat/`: 调度、模型客户端、检索、持久化、prompt
 - `tests/`: 单元测试与集成测试
 - `DESIGN.md`: 完整设计文档
 
@@ -97,14 +99,14 @@ flowchart TD
 ```bash
 uv sync
 cp .env.example .env
-uv run python -c "from agent_chatroom.db import init_db; init_db()"
-uv run python -m agent_chatroom.server
+uv run python -c "from grox_chat.db import init_db; init_db()"
+uv run python -m grox_chat.server
 ```
 
 另开一个终端创建 topic：
 
 ```bash
-uv run python -c "from agent_chatroom.api import create_topic; create_topic('主题摘要', '更详细的主题描述')"
+uv run python -c "from grox_chat.api import create_topic; create_topic('主题摘要', '更详细的主题描述')"
 ```
 
 ### 快速冒烟测试
@@ -112,7 +114,7 @@ uv run python -c "from agent_chatroom.api import create_topic; create_topic('主
 你可以用一个故意荒谬但中性的题目做快速检查：
 
 ```bash
-uv run python -c "from agent_chatroom.api import create_topic; create_topic('从职场实践角度出发，早上进门应该先左脚还是先右脚？', '从职场实践角度出发，早上进门应该先左脚还是先右脚？')"
+uv run python -c "from grox_chat.api import create_topic; create_topic('从职场实践角度出发，早上进门应该先左脚还是先右脚？', '从职场实践角度出发，早上进门应该先左脚还是先右脚？')"
 ```
 
 另开一个终端查看数据库状态：

@@ -1,7 +1,7 @@
 import os
 import pytest
 
-from agent_chatroom.db import (
+from grox_chat.db import (
     get_db,
     get_db_path,
     init_db,
@@ -12,7 +12,7 @@ from agent_chatroom.db import (
     search_messages,
     search_messages_lexical,
 )
-from agent_chatroom import api
+from grox_chat import api
 
 @pytest.fixture(autouse=True)
 def setup_teardown():

@@ -1,12 +1,14 @@
-# Agent Chatroom
+# GROX Chat
+
+Gemini Research Orchestration with minimaX -- Chat Only
 
 [中文说明](README_CN.md)
 
-A database-first, graph-orchestrated multi-agent reasoning system for long-running technical discussion.
+A database-first, graph-orchestrated reasoning system for long-running technical discussion.
 
 ### Overview
 
-Agent Chatroom is not a free-form group chat. It is a structured reasoning arena built around a persistent SQLite blackboard.
+GROX Chat is not a free-form group chat. It is a structured reasoning arena built around a persistent SQLite blackboard, with Gemini-led orchestration and MiniMax-driven debate turns.
 
 - `Audience` plans the topic, opens each subtopic with a grounding brief, summarizes progress, and decides when to stop.
 - The expert panel drives the actual reasoning: `Dreamer`, `Scientist`, `Engineer`, `Analyst`, `Critic`, and `Contrarian`.
@@ -88,7 +90,7 @@ The intended retrieval path runs before every speaking turn:
 
 ### Repository Layout
 
-- `src/agent_chatroom/`: orchestration, LLM clients, retrieval, persistence, prompts
+- `src/grox_chat/`: orchestration, LLM clients, retrieval, persistence, prompts
 - `tests/`: unit and integration tests
 - `DESIGN.md`: full design description
 
@@ -97,14 +99,14 @@ The intended retrieval path runs before every speaking turn:
 ```bash
 uv sync
 cp .env.example .env
-uv run python -c "from agent_chatroom.db import init_db; init_db()"
-uv run python -m agent_chatroom.server
+uv run python -c "from grox_chat.db import init_db; init_db()"
+uv run python -m grox_chat.server
 ```
 
 Create a topic from another shell:
 
 ```bash
-uv run python -c "from agent_chatroom.api import create_topic; create_topic('Topic summary', 'Detailed topic prompt')"
+uv run python -c "from grox_chat.api import create_topic; create_topic('Topic summary', 'Detailed topic prompt')"
 ```
 
 ### Smoke Test
@@ -112,7 +114,7 @@ uv run python -c "from agent_chatroom.api import create_topic; create_topic('Top
 Use a deliberately absurd but neutral topic:
 
 ```bash
-uv run python -c "from agent_chatroom.api import create_topic; create_topic('From a workplace-practice perspective, should an employee enter with the left foot or the right foot?', 'From a workplace-practice perspective, should an employee enter with the left foot or the right foot?')"
+uv run python -c "from grox_chat.api import create_topic; create_topic('From a workplace-practice perspective, should an employee enter with the left foot or the right foot?', 'From a workplace-practice perspective, should an employee enter with the left foot or the right foot?')"
 ```
 
 Inspect the live state from another shell:

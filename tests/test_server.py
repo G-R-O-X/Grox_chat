@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from agent_chatroom.server import (
+from grox_chat.server import (
     CAT_EXPANSION_TURN,
     DEBATE_PHASE,
     DOG_CORRECTION_TURN,
@@ -42,7 +42,7 @@ async def test_final_writer_node_skips_same_round_duplicate_pass():
         "last_writer_round": 3,
     }
 
-    with patch("agent_chatroom.server.query_with_fallback", new=AsyncMock()) as writer_query:
+    with patch("grox_chat.server.query_with_fallback", new=AsyncMock()) as writer_query:
         result = await final_writer_node(state)
 
     assert result == {}
@@ -68,8 +68,8 @@ async def test_audience_termination_is_suppressed_before_round_three():
         "round_number": 2,
     }
 
-    with patch("agent_chatroom.server.query_with_fallback", new=AsyncMock()) as query_gemini_cli:
-        with patch("agent_chatroom.server.api.post_message") as post_message:
+    with patch("grox_chat.server.query_with_fallback", new=AsyncMock()) as query_gemini_cli:
+        with patch("grox_chat.server.api.post_message") as post_message:
             result = await audience_termination_check_node(state)
 
     assert result["subtopic_exhausted"] is False
@@ -100,19 +100,19 @@ async def test_audience_termination_posts_warning_when_loop_detected_but_continu
         {"id": 9, "sender": "audience", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
     ]
 
-    with patch("agent_chatroom.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
-        with patch("agent_chatroom.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
-            with patch("agent_chatroom.server.api.get_messages", return_value=messages):
-                with patch("agent_chatroom.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
                     with patch(
-                        "agent_chatroom.server.api.search_messages_hybrid",
+                        "grox_chat.server.api.search_messages_hybrid",
                         return_value=[{"id": 3, "content": "Past summary", "distance": 0.2}],
                     ):
                         with patch(
-                            "agent_chatroom.server.query_with_fallback",
+                            "grox_chat.server.query_with_fallback",
                             new=AsyncMock(return_value='{"is_done": false, "warning": "Move to new evidence."}'),
                         ):
-                            with patch("agent_chatroom.server.api.post_message") as post_message:
+                            with patch("grox_chat.server.api.post_message") as post_message:
                                 result = await audience_termination_check_node(state)
 
     assert result["subtopic_exhausted"] is False
@@ -141,13 +141,13 @@ async def test_audience_termination_degrades_open_when_all_model_fallbacks_fail(
         {"id": 9, "sender": "audience", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
     ]
 
-    with patch("agent_chatroom.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
-        with patch("agent_chatroom.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
-            with patch("agent_chatroom.server.api.get_messages", return_value=messages):
-                with patch("agent_chatroom.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
-                    with patch("agent_chatroom.server.api.search_messages_hybrid", return_value=[]):
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
+                    with patch("grox_chat.server.api.search_messages_hybrid", return_value=[]):
                         with patch(
-                            "agent_chatroom.server.query_with_fallback",
+                            "grox_chat.server.query_with_fallback",
                             new=AsyncMock(side_effect=RuntimeError("all fallbacks failed")),
                         ):
                             result = await audience_termination_check_node(state)
@@ -177,12 +177,12 @@ async def test_expert_node_lowers_confidence_on_parse_failure():
         {"id": 1, "sender": "critic", "content": "Need stronger grounding.", "msg_type": "standard", "confidence_score": 7.0},
     ]
 
-    with patch("agent_chatroom.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
-        with patch("agent_chatroom.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
-            with patch("agent_chatroom.server.api.get_messages", return_value=messages):
-                with patch("agent_chatroom.server.assemble_rag_context", new=AsyncMock(return_value=("", True))):
-                    with patch("agent_chatroom.server.react_search_loop", new=AsyncMock(return_value=("plain text response", False))):
-                        with patch("agent_chatroom.server.api.persist_message", new=AsyncMock()) as persist_message:
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("", True))):
+                    with patch("grox_chat.server.react_search_loop", new=AsyncMock(return_value=("plain text response", False))):
+                        with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
                             await expert_node(state)
 
     persist_message.assert_awaited_once()
@@ -211,13 +211,13 @@ async def test_opening_round_expert_node_skips_web_search():
         {"id": 1, "sender": "audience", "content": "Grounding brief", "msg_type": "standard", "confidence_score": None},
     ]
 
-    with patch("agent_chatroom.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
-        with patch("agent_chatroom.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
-            with patch("agent_chatroom.server.api.get_messages", return_value=messages):
-                with patch("agent_chatroom.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("agent_chatroom.server.query_minimax", new=AsyncMock(return_value=('{"action":"post_message","content":"Initial stance","confidence_score":7}', []))) as query_minimax:
-                        with patch("agent_chatroom.server.react_search_loop", new=AsyncMock()) as react_search_loop:
-                            with patch("agent_chatroom.server.api.persist_message", new=AsyncMock()) as persist_message:
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
+                    with patch("grox_chat.server.query_minimax", new=AsyncMock(return_value=('{"action":"post_message","content":"Initial stance","confidence_score":7}', []))) as query_minimax:
+                        with patch("grox_chat.server.react_search_loop", new=AsyncMock()) as react_search_loop:
+                            with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
                                 await expert_node(state)
 
     react_search_loop.assert_not_awaited()
@@ -249,12 +249,12 @@ async def test_contrarian_expert_node_uses_search_loop_response_instead_of_http_
 
     contrarian_reply = '{"action":"post_message","content":"The group is overconfident about soft-skill universals.","confidence_score":6}'
 
-    with patch("agent_chatroom.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
-        with patch("agent_chatroom.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
-            with patch("agent_chatroom.server.api.get_messages", return_value=messages):
-                with patch("agent_chatroom.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("agent_chatroom.server.react_search_loop", new=AsyncMock(return_value=(contrarian_reply, False))):
-                        with patch("agent_chatroom.server.api.persist_message", new=AsyncMock()) as persist_message:
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
+                    with patch("grox_chat.server.react_search_loop", new=AsyncMock(return_value=(contrarian_reply, False))):
+                        with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
                             await expert_node(state)
 
     persist_message.assert_awaited_once()
@@ -341,15 +341,15 @@ async def test_audience_summary_node_uses_degraded_summary_when_all_model_fallba
         {"sender": "scientist", "content": "check", "msg_type": "standard", "confidence_score": 6.0},
     ]
 
-    with patch("agent_chatroom.server.api.get_topic", return_value=topic):
-        with patch("agent_chatroom.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
-            with patch("agent_chatroom.server.api.get_messages", return_value=messages):
+    with patch("grox_chat.server.api.get_topic", return_value=topic):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch(
-                    "agent_chatroom.server.query_with_fallback",
+                    "grox_chat.server.query_with_fallback",
                     new=AsyncMock(side_effect=RuntimeError("all fallbacks failed")),
                 ):
-                    with patch("agent_chatroom.server.aget_embedding", new=AsyncMock(return_value=None)):
-                        with patch("agent_chatroom.server.api.post_message", return_value=77) as post_message:
+                    with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=None)):
+                        with patch("grox_chat.server.api.post_message", return_value=77) as post_message:
                             result = await audience_summary_node(state)
 
     assert result["latest_summary_msg_id"] == 77

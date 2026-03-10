@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from agent_chatroom.master_graph import (
+from grox_chat.master_graph import (
     node_open_next_subtopic,
     node_plan_generation,
     node_topic_replan_or_close,
@@ -24,10 +24,10 @@ async def test_node_plan_generation():
         }
     )
 
-    with patch("agent_chatroom.master_graph.ask_gemini_cli", new=mock_gemini):
-        with patch("agent_chatroom.master_graph.api.create_plan", return_value=7):
+    with patch("grox_chat.master_graph.ask_gemini_cli", new=mock_gemini):
+        with patch("grox_chat.master_graph.api.create_plan", return_value=7):
             with patch(
-                "agent_chatroom.master_graph.api.get_topic",
+                "grox_chat.master_graph.api.get_topic",
                 return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
             ):
                 new_state = await node_plan_generation(state)
@@ -53,16 +53,16 @@ async def test_node_open_next_subtopic():
     )
 
     with patch(
-        "agent_chatroom.master_graph.api.get_topic",
+        "grox_chat.master_graph.api.get_topic",
         return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
     ):
-        with patch("agent_chatroom.master_graph.api.get_active_plan", return_value=plan):
-            with patch("agent_chatroom.master_graph.ask_gemini_cli", new=mock_gemini):
-                with patch("agent_chatroom.master_graph.api.create_subtopic", return_value=10):
-                    with patch("agent_chatroom.master_graph.api.persist_message", new=AsyncMock(return_value=99)):
-                        with patch("agent_chatroom.master_graph.api.update_subtopic_start_msg"):
-                            with patch("agent_chatroom.master_graph.api.advance_plan_cursor"):
-                                with patch("agent_chatroom.master_graph.api.set_topic_status"):
+        with patch("grox_chat.master_graph.api.get_active_plan", return_value=plan):
+            with patch("grox_chat.master_graph.ask_gemini_cli", new=mock_gemini):
+                with patch("grox_chat.master_graph.api.create_subtopic", return_value=10):
+                    with patch("grox_chat.master_graph.api.persist_message", new=AsyncMock(return_value=99)):
+                        with patch("grox_chat.master_graph.api.update_subtopic_start_msg"):
+                            with patch("grox_chat.master_graph.api.advance_plan_cursor"):
+                                with patch("grox_chat.master_graph.api.set_topic_status"):
                                     new_state = await node_open_next_subtopic(state)
 
     assert new_state["current_subtopic_id"] == 10
@@ -75,19 +75,19 @@ async def test_node_topic_replan_or_close_defers_on_error():
     state = {"topic_id": 1}
 
     with patch(
-        "agent_chatroom.master_graph.api.get_topic",
+        "grox_chat.master_graph.api.get_topic",
         return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
     ):
         with patch(
-            "agent_chatroom.master_graph.api.get_current_subtopics",
+            "grox_chat.master_graph.api.get_current_subtopics",
             return_value=[{"summary": "Subtopic 1", "conclusion": "Conclusion 1"}],
         ):
             with patch(
-                "agent_chatroom.master_graph.ask_gemini_cli",
+                "grox_chat.master_graph.ask_gemini_cli",
                 new=AsyncMock(return_value={"error": "timeout"}),
             ):
-                with patch("agent_chatroom.master_graph.api.post_message") as post_message:
-                    with patch("agent_chatroom.master_graph.api.set_topic_status") as set_status:
+                with patch("grox_chat.master_graph.api.post_message") as post_message:
+                    with patch("grox_chat.master_graph.api.set_topic_status") as set_status:
                         result = await node_topic_replan_or_close(state)
 
     assert result["deferred"] is True

@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent_chatroom.minimax_client import (
+from grox_chat.minimax_client import (
     ENGLISH_ONLY_INSTRUCTION,
     _extract_pseudo_tool_markup,
     _extract_text_and_tools,
@@ -105,9 +105,9 @@ async def test_query_minimax_ignores_tools_payload_for_messages_api():
 
     fake_client = type("FakeClient", (), {"post": fake_post})()
 
-    with patch("agent_chatroom.minimax_client.API_KEY", "test-key"):
-        with patch("agent_chatroom.minimax_client.wait_for_slot", new=AsyncMock()):
-            with patch("agent_chatroom.minimax_client._get_http_client", return_value=fake_client):
+    with patch("grox_chat.minimax_client.API_KEY", "test-key"):
+        with patch("grox_chat.minimax_client.wait_for_slot", new=AsyncMock()):
+            with patch("grox_chat.minimax_client._get_http_client", return_value=fake_client):
                 text, tools = await query_minimax(
                     system_prompt="system",
                     question="question",
@@ -152,9 +152,9 @@ async def test_query_minimax_rejects_pseudo_tool_markup_by_default():
 
     fake_client = type("FakeClient", (), {"post": fake_post})()
 
-    with patch("agent_chatroom.minimax_client.API_KEY", "test-key"):
-        with patch("agent_chatroom.minimax_client.wait_for_slot", new=AsyncMock()):
-            with patch("agent_chatroom.minimax_client._get_http_client", return_value=fake_client):
+    with patch("grox_chat.minimax_client.API_KEY", "test-key"):
+        with patch("grox_chat.minimax_client.wait_for_slot", new=AsyncMock()):
+            with patch("grox_chat.minimax_client._get_http_client", return_value=fake_client):
                 text, tools = await query_minimax(
                     system_prompt="system",
                     question="question",
@@ -194,9 +194,9 @@ async def test_query_minimax_recovers_pseudo_tool_query_when_opted_in():
 
     fake_client = type("FakeClient", (), {"post": fake_post})()
 
-    with patch("agent_chatroom.minimax_client.API_KEY", "test-key"):
-        with patch("agent_chatroom.minimax_client.wait_for_slot", new=AsyncMock()):
-            with patch("agent_chatroom.minimax_client._get_http_client", return_value=fake_client):
+    with patch("grox_chat.minimax_client.API_KEY", "test-key"):
+        with patch("grox_chat.minimax_client.wait_for_slot", new=AsyncMock()):
+            with patch("grox_chat.minimax_client._get_http_client", return_value=fake_client):
                 text, tools = await query_minimax(
                     system_prompt="system",
                     question="question",

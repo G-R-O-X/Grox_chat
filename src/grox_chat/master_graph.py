@@ -7,8 +7,8 @@ from typing_extensions import TypedDict
 
 from . import api
 from .agents import SKYNET, get_agent, voting_agents
+from .broker import call_text
 from .embedding import aget_embedding
-from .llm_router import query_with_fallback
 from .server import run_subtopic_graph
 
 logger = logging.getLogger(__name__)
@@ -81,13 +81,14 @@ async def ask_gemini_cli(system_prompt: str, context: str, role: str, model: str
     logger.info(f"[{role}] Asking Gemini CLI ({model})...")
 
     try:
-        output = await query_with_fallback(
-            prompt=prompt,
+        output = await call_text(
+            prompt,
+            provider="gemini",
+            strategy="direct",
+            allow_web=True,
             model=model,
             temperature=0.7,
             system_instruction=system_prompt,
-            use_google_search=True,
-            enable_fallback=True,
             fallback_role=role,
         )
         return _parse_json_object(output)
@@ -133,20 +134,6 @@ def _build_vote_prompt(
     return "\n".join(lines)
 
 
-def _parse_vote(output: str) -> bool:
-    try:
-        parsed = _parse_json_object(output)
-    except Exception:
-        parsed = None
-    if isinstance(parsed, dict):
-        vote = parsed.get("vote")
-        if isinstance(vote, bool):
-            return vote
-        if isinstance(vote, str):
-            return vote.strip().lower() in {"yes", "true", "approve", "select", "continue", "close", "replan"}
-    return False
-
-
 async def _collect_votes(prompt: str) -> VoteTally:
     yes_votes = 0
     successful_votes = 0
@@ -157,6 +144,10 @@ async def _collect_votes(prompt: str) -> VoteTally:
             decision = await agent.vote(prompt, allow_web=False)
         except Exception as exc:
             logger.warning("[skynet] Vote execution failed for %s: %s", voter, exc)
+            failed_votes += 1
+            continue
+        if decision is None:
+            logger.warning("[skynet] Vote from %s was invalid or malformed.", voter)
             failed_votes += 1
             continue
         successful_votes += 1

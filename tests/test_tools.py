@@ -1,5 +1,6 @@
-import pytest
 from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from grox_chat.tools import react_search_loop
 
@@ -11,8 +12,8 @@ async def test_react_search_loop_skips_search_when_not_needed():
         ("final answer", []),
     ])
 
-    with patch("grox_chat.tools.query_minimax", new=mock_query):
-        with patch("grox_chat.tools.minimax_search", new=AsyncMock()) as mock_search:
+    with patch("grox_chat.broker.query_minimax", new=mock_query):
+        with patch("grox_chat.broker.minimax_search", new=AsyncMock()) as mock_search:
             result, search_failed = await react_search_loop("agent1", "prompt", max_iter=2)
 
     assert result == "final answer"
@@ -30,8 +31,8 @@ async def test_react_search_loop_runs_one_search_then_answers():
     ])
     mock_search = AsyncMock(return_value={"organic": [{"title": "t", "snippet": "s"}]})
 
-    with patch("grox_chat.tools.query_minimax", new=mock_query):
-        with patch("grox_chat.tools.minimax_search", new=mock_search):
+    with patch("grox_chat.broker.query_minimax", new=mock_query):
+        with patch("grox_chat.broker.minimax_search", new=mock_search):
             result, search_failed = await react_search_loop("agent1", "prompt", max_iter=2)
 
     assert result == "final answer after search"
@@ -49,8 +50,8 @@ async def test_react_search_loop_respects_max_iterations_before_final_answer():
     ])
     mock_search = AsyncMock(return_value={"organic": []})
 
-    with patch("grox_chat.tools.query_minimax", new=mock_query):
-        with patch("grox_chat.tools.minimax_search", new=mock_search):
+    with patch("grox_chat.broker.query_minimax", new=mock_query):
+        with patch("grox_chat.broker.minimax_search", new=mock_search):
             result, search_failed = await react_search_loop("agent1", "prompt", max_iter=2)
 
     assert result == "final answer after max iterations"
@@ -68,8 +69,8 @@ async def test_react_search_loop_marks_failed_search_and_continues():
     ])
     mock_search = AsyncMock(return_value={"error": "search backend unavailable"})
 
-    with patch("grox_chat.tools.query_minimax", new=mock_query):
-        with patch("grox_chat.tools.minimax_search", new=mock_search):
+    with patch("grox_chat.broker.query_minimax", new=mock_query):
+        with patch("grox_chat.broker.minimax_search", new=mock_search):
             result, search_failed = await react_search_loop("agent1", "prompt", max_iter=2)
 
     assert result == "final answer after failed search"
@@ -89,8 +90,8 @@ async def test_react_search_loop_preserves_original_prompt_for_final_answer_afte
 
     mock_search = AsyncMock(return_value={"organic": [{"title": "t", "snippet": "s"}]})
 
-    with patch("grox_chat.tools.query_minimax", new=fake_query_minimax):
-        with patch("grox_chat.tools.minimax_search", new=mock_search):
+    with patch("grox_chat.broker.query_minimax", new=fake_query_minimax):
+        with patch("grox_chat.broker.minimax_search", new=mock_search):
             result, search_failed = await react_search_loop("agent1", "ORIGINAL JSON TASK", max_iter=1)
 
     assert result == "final answer after search"
@@ -108,8 +109,8 @@ async def test_react_search_loop_normalizes_quoted_no_search():
         ("final answer", []),
     ])
 
-    with patch("grox_chat.tools.query_minimax", new=mock_query):
-        with patch("grox_chat.tools.minimax_search", new=AsyncMock()) as mock_search:
+    with patch("grox_chat.broker.query_minimax", new=mock_query):
+        with patch("grox_chat.broker.minimax_search", new=AsyncMock()) as mock_search:
             result, search_failed = await react_search_loop("agent1", "prompt", max_iter=2)
 
     assert result == "final answer"
@@ -124,8 +125,8 @@ async def test_react_search_loop_falls_back_to_final_answer_on_query_decision_er
         ("final answer after fallback", []),
     ])
 
-    with patch("grox_chat.tools.query_minimax", new=mock_query):
-        with patch("grox_chat.tools.minimax_search", new=AsyncMock()) as mock_search:
+    with patch("grox_chat.broker.query_minimax", new=mock_query):
+        with patch("grox_chat.broker.minimax_search", new=AsyncMock()) as mock_search:
             result, search_failed = await react_search_loop("agent1", "prompt", max_iter=2)
 
     assert result == "final answer after fallback"

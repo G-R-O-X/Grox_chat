@@ -10,6 +10,7 @@ from grox_chat.agents import (
     is_deliberator,
     is_npc,
     is_special,
+    parse_vote_response,
     voting_agents,
 )
 from grox_chat.server import BASE_TURN, DEBATE_PHASE, EVIDENCE_PHASE, expert_node, should_enable_web_search
@@ -43,7 +44,7 @@ def test_special_roles_can_target_only_deliberators():
 @pytest.mark.asyncio
 async def test_spectator_vote_uses_strict_json_contract():
     spectator = get_agent(SPECTATOR)
-    with patch("grox_chat.agents.react_search_loop", new=AsyncMock(return_value=('{"vote":"yes"}', False))):
+    with patch("grox_chat.agents.call_text", new=AsyncMock(return_value='{"vote":"yes"}')):
         assert await spectator.vote("Vote on this.", allow_web=True) is True
 
 
@@ -76,8 +77,8 @@ async def test_spectator_turn_sets_next_round_focus_and_web_boost():
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
                     with patch(
-                        "grox_chat.server.react_search_loop",
-                        new=AsyncMock(return_value=('{"action":"focus","target":"Scientist","reason":"best shot","grant_web_search":true}', False)),
+                        "grox_chat.server.call_text",
+                        new=AsyncMock(return_value='{"action":"focus","target":"Scientist","reason":"best shot","grant_web_search":true}'),
                     ):
                         updates = await expert_node(state)
 
@@ -116,12 +117,19 @@ async def test_targeted_spectator_turn_gets_web_boost_and_clears_after_use():
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
                     with patch(
-                        "grox_chat.server.react_search_loop",
-                        new=AsyncMock(return_value=('{"action":"post_message","content":"Focused answer","confidence_score":8}', False)),
-                    ) as react_search_loop:
+                        "grox_chat.server.call_text",
+                        new=AsyncMock(return_value='{"action":"post_message","content":"Focused answer","confidence_score":8}'),
+                    ) as call_text:
                         with patch("grox_chat.server.api.persist_message", new=AsyncMock()):
                             updates = await expert_node(state)
 
-    react_search_loop.assert_awaited_once()
+    call_text.assert_awaited_once()
     assert updates["spectator_target"] is None
     assert updates["spectator_web_boost_target"] is None
+
+
+def test_parse_vote_response_is_tri_state():
+    assert parse_vote_response('{"vote":"yes"}') is True
+    assert parse_vote_response('{"vote":"no"}') is False
+    assert parse_vote_response('{"vote":"maybe"}') is None
+    assert parse_vote_response("plain text drift") is None

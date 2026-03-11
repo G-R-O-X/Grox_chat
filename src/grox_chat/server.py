@@ -20,11 +20,9 @@ from .agents import (
     ordinary_deliberators,
     voting_agents,
 )
+from .broker import call_text, shutdown_broker
 from .rag import assemble_rag_context, build_query_rag_context
-from .tools import react_search_loop
-from .minimax_client import query_minimax
-from .llm_router import query_with_fallback
-from .external.gemini_cli_client import query_gemini_cli, warmup_gemini_cli
+from .external.gemini_cli_client import warmup_gemini_cli
 from .prompts import PROMPTS
 from .writer_processor import process_writer_output
 from .librarian_processor import (
@@ -176,11 +174,16 @@ def _normalize_focus_contract(raw_text: str) -> dict:
         if action == "focus" and isinstance(target, str):
             normalized_target = _normalize_target_name(target)
             if normalized_target and can_special_target(normalized_target):
+                raw_grant = parsed.get("grant_web_search", False)
+                if isinstance(raw_grant, bool):
+                    grant_web_search = raw_grant
+                else:
+                    grant_web_search = False
                 return {
                     "parsed_ok": True,
                     "target": normalized_target,
                     "reason": reason.strip() if isinstance(reason, str) else "",
-                    "grant_web_search": bool(parsed.get("grant_web_search", False)),
+                    "grant_web_search": grant_web_search,
                 }
     return {
         "parsed_ok": False,
@@ -223,11 +226,16 @@ def _build_vote_prompt(
             "",
             "TASK:",
             question,
-            "Vote YES only if the candidate is materially useful for the topic and not redundant with already selected items.",
-            "Vote NO if it is redundant, low-value, or off-topic.",
-            'Reply with strict JSON: {"vote":"yes"} or {"vote":"no"}.',
         ]
     )
+    if candidate_summary:
+        lines.extend(
+            [
+                "Vote YES only if the candidate is materially useful for the topic and not redundant with already selected items.",
+                "Vote NO if it is redundant, low-value, or off-topic.",
+            ]
+        )
+    lines.append('Reply with strict JSON: {"vote":"yes"} or {"vote":"no"}.')
     return "\n".join(lines)
 
 
@@ -236,18 +244,24 @@ async def _run_votes(
     voters: Sequence[str],
     prompt: str,
     allow_web: bool = False,
-) -> tuple[int, int, dict[str, bool]]:
-    decisions: dict[str, bool] = {}
+) -> tuple[int, int, int, dict[str, Optional[bool]]]:
+    decisions: dict[str, Optional[bool]] = {}
     yes_votes = 0
+    successful_votes = 0
+    failed_votes = 0
     for voter in voters:
         agent = get_agent(voter)
         try:
             decision = await agent.vote(prompt, allow_web=allow_web)
         except Exception:
-            decision = False
+            decision = None
         decisions[voter] = decision
+        if decision is None:
+            failed_votes += 1
+            continue
+        successful_votes += 1
         yes_votes += int(decision)
-    return yes_votes, len(voters), decisions
+    return yes_votes, successful_votes, failed_votes, decisions
 
 
 def _format_message_for_prompt(message: dict) -> str:
@@ -754,14 +768,16 @@ async def _run_writer_critique_pass(state: ChatState) -> dict:
     )
     prompt = build_writer_prompt(state, topic, standard_messages, rag_context)
     try:
-        resp_text = await query_gemini_cli(
+        resp_text = await call_text(
             prompt,
+            provider="gemini",
+            strategy="direct",
+            allow_web=False,
+            system_instruction=PROMPTS["writer"],
             model="gemini-3.0-flash",
             temperature=0.7,
             max_tokens=8192,
-            system_instruction=PROMPTS["writer"],
-            use_google_search=False,
-            enable_fallback=True,
+            fallback_role="writer",
         )
     except Exception as exc:
         logger.warning("[writer] All writer critique model fallbacks failed: %s", exc)
@@ -808,11 +824,13 @@ async def _run_fact_proposer_pass(state: ChatState, force: bool = False) -> dict
     max_facts = FINAL_WRITER_FACT_LIMIT if force else WRITER_FACT_LIMIT
     prompt = build_fact_proposer_prompt(state, topic, standard_messages, rag_context, max_facts=max_facts)
     try:
-        resp_text, _ = await react_search_loop(
-            "fact_proposer",
+        resp_text = await call_text(
             prompt,
-            max_iter=2,
-            system_prompt=PROMPTS["fact_proposer"],
+            provider="minimax",
+            strategy="react",
+            allow_web=True,
+            system_instruction=PROMPTS["fact_proposer"],
+            fallback_role="fact_proposer",
         )
     except Exception as exc:
         logger.warning("[fact_proposer] MiniMax fact proposal failed: %s", exc)
@@ -844,26 +862,28 @@ async def _run_fact_proposer_pass(state: ChatState, force: bool = False) -> dict
 
 async def _query_librarian_review_text(prompt: str) -> tuple[str, str]:
     try:
-        resp_text, _ = await react_search_loop(
-            "librarian",
+        resp_text = await call_text(
             prompt,
-            max_iter=2,
-            system_prompt=PROMPTS["librarian"],
+            provider="minimax",
+            strategy="react",
+            allow_web=True,
+            system_instruction=PROMPTS["librarian"],
+            fallback_role="librarian",
         )
-        if (resp_text or "").strip().startswith("Error:"):
-            raise RuntimeError(resp_text.strip())
         return resp_text, "minimax"
     except Exception as exc:
         logger.warning("[librarian] MiniMax review failed, escalating to Gemini Flash + Google: %s", exc)
 
-    resp_text = await query_gemini_cli(
+    resp_text = await call_text(
         prompt,
+        provider="gemini",
+        strategy="direct",
+        allow_web=True,
+        system_instruction=PROMPTS["librarian"],
         model="gemini-3.0-flash",
         temperature=0.7,
         max_tokens=8192,
-        system_instruction=PROMPTS["librarian"],
-        use_google_search=True,
-        enable_fallback=True,
+        fallback_role="librarian",
     )
     return resp_text, "gemini"
 
@@ -900,14 +920,16 @@ async def _run_librarian_pass(state: ChatState) -> dict:
                     "[librarian] MiniMax review for candidate %s was not valid JSON/schema; retrying with Gemini Flash.",
                     candidate["id"],
                 )
-                resp_text = await query_gemini_cli(
+                resp_text = await call_text(
                     prompt,
+                    provider="gemini",
+                    strategy="direct",
+                    allow_web=True,
+                    system_instruction=PROMPTS["librarian"],
                     model="gemini-3.0-flash",
                     temperature=0.7,
                     max_tokens=8192,
-                    system_instruction=PROMPTS["librarian"],
-                    use_google_search=True,
-                    enable_fallback=True,
+                    fallback_role="librarian",
                 )
                 review = parse_librarian_review(resp_text, candidate["candidate_text"])
             review_results.append(
@@ -958,9 +980,32 @@ async def expert_node(state: ChatState) -> dict:
     search_failed = False
     if should_enable_web_search(state, actor, turn_kind):
         logger.info(f"[{actor}] Entering ReAct search loop...")
-        resp_text, search_failed = await react_search_loop(actor, prompt, max_iter=2, system_prompt=system_prompt)
+        try:
+            resp_text = await call_text(
+                prompt,
+                provider="minimax",
+                strategy="react",
+                allow_web=True,
+                system_instruction=system_prompt,
+                fallback_role=actor,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Web-enhanced broker call failed: %s", actor, exc)
+            resp_text = str(exc)
+            search_failed = True
     else:
-        resp_text, _ = await query_minimax(system_prompt, prompt)
+        try:
+            resp_text = await call_text(
+                prompt,
+                provider=get_agent_spec(actor).default_provider,
+                strategy="direct",
+                allow_web=False,
+                system_instruction=system_prompt,
+                fallback_role=actor,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Direct broker call failed: %s", actor, exc)
+            resp_text = str(exc)
 
     updates = {"current_actor": "", "current_turn_kind": ""}
 
@@ -1024,12 +1069,13 @@ async def audience_summary_node(state: ChatState) -> dict:
 
     prompt = build_audience_summary_prompt(state, topic, messages)
     try:
-        resp_text = await query_with_fallback(
+        resp_text = await call_text(
             prompt,
-            model="gemini-3.0-flash",
+            provider="gemini",
+            strategy="direct",
+            allow_web=False,
             system_instruction=PROMPTS["skynet"],
-            use_google_search=False,
-            enable_fallback=True,
+            model="gemini-3.0-flash",
             fallback_role=SKYNET,
         )
     except Exception as exc:
@@ -1130,15 +1176,21 @@ async def audience_termination_check_node(state: ChatState) -> dict:
         rejected=None,
     )
     try:
-        yes_votes, total_votes, _ = await _run_votes(
+        yes_votes, total_votes, failed_votes, _ = await _run_votes(
             voters=voting_agents(),
             prompt=decision_prompt,
             allow_web=False,
         )
-        is_done = _decision_passes(yes_votes, total_votes)
+        if failed_votes:
+            logger.warning(
+                "[skynet] Termination vote deferred because %s votes failed or were invalid.",
+                failed_votes,
+            )
+            is_done = False
+        else:
+            is_done = _decision_passes(yes_votes, total_votes)
     except Exception as exc:
         logger.warning("[skynet] Termination vote degraded open after vote failure: %s", exc)
-        yes_votes, total_votes = 0, 0
         is_done = False
     warning_text = None
 
@@ -1319,19 +1371,21 @@ async def run_server_loop():
         logger.warning("[GeminiCLI] Warmup failed; continuing with lazy fallback: %s", exc)
 
     master_graph = build_master_graph()
+    try:
+        while True:
+            topic = api.get_current_topic()
+            if not topic or topic['status'] == 'Closed':
+                logger.info("Room is Closed. Sleeping.")
+                await asyncio.sleep(10)
+                continue
 
-    while True:
-        topic = api.get_current_topic()
-        if not topic or topic['status'] == 'Closed':
-            logger.info("Room is Closed. Sleeping.")
-            await asyncio.sleep(10)
-            continue
-
-        logger.info("Triggering topic-level orchestration graph...")
-        result = await master_graph.ainvoke({"topic_id": topic["id"], "topic_complete": False})
-        if result.get("deferred"):
-            logger.info("Topic orchestration deferred; backing off before retry.")
-            await asyncio.sleep(10)
+            logger.info("Triggering topic-level orchestration graph...")
+            result = await master_graph.ainvoke({"topic_id": topic["id"], "topic_complete": False})
+            if result.get("deferred"):
+                logger.info("Topic orchestration deferred; backing off before retry.")
+                await asyncio.sleep(10)
+    finally:
+        await shutdown_broker()
 
 if __name__ == "__main__":
     asyncio.run(run_server_loop())

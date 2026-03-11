@@ -4,47 +4,55 @@ Gemini Research Orchestration with minimaX -- Chat Only
 
 [English](README.md)
 
-GROX Chat 是稳定版、数据库优先的多代理 chatroom。它一次运行一个 topic，把 topic 拆成若干 subtopics，在每个 subtopic 里执行回合制讨论，并把 summary 和审核后的 facts 写回 SQLite 记忆层。
+GROX Chat 是稳定版、数据库优先的多代理 chatroom。它一次运行一个 topic，先提出并投票选择 candidate subtopics，再在每个通过的 subtopic 中执行回合制讨论，并把 summary 和审核后的 facts 写回 SQLite 记忆层。
 
-这个仓库现在明确只做 **基础 chatroom**，不再承载 conference-mode 的实验设计。
+这个仓库现在明确只做 **基础 chatroom**，不承载 conference-mode 的实验设计。
 
 ## 系统能力
 
-- 为每个 topic 规划少量 subtopics
+- 由 `Skynet` 提出 candidate subtopics，并通过房间投票决定进入讨论的子题
 - 运行结构化 multi-agent debate loop
 - 每个发言回合都做本地 RAG
-- 使用 `Dog / Cat / Tron` 做同轮干预
+- 使用 `Dog / Cat / Tron / Spectator` 做干预
 - 将 critique、fact proposal、fact admission 分离
-- 使用 Gemini-first orchestration，并在可行时回退到 MiniMax
+- 通过统一 broker 路由 Gemini、MiniMax 和 web-search 调用
 
 ## 运行结构
 
-系统有两层主循环：
+系统有三层：
 
 1. `Topic orchestration`
-   - 生成或恢复 plan
-   - 打开下一个 subtopic
-   - 收束 subtopic
-   - 在 plan 用尽后决定 replan 或 close
+   - 创建或恢复 active plan
+   - 让 `Skynet` 提出 4 个 candidate subtopics
+   - 通过投票决定进入讨论的子题
+   - 打开下一个已选 subtopic
+   - 在已选工作用尽后决定 replan 或 close
 2. `Subtopic arena`
    - 运行 `opening -> evidence -> debate`
-   - 在每轮末执行 critique、fact proposal、fact review 和 summary
+   - 管理普通发言、特殊角色行动、summary 和 fact pipeline
+3. `Shared memory`
+   - 持久化 `Topic`、`Plan`、`Subtopic`、`Message`、`FactCandidate`、`Fact`
+   - 检索严格按当前 topic 隔离
 
 ```mermaid
 flowchart TD
     User[Topic 输入] --> TopicGraph[Topic Orchestration]
-    TopicGraph --> Plan[Plan]
-    Plan --> Arena[Subtopic Arena]
-    Arena --> Summary[Audience Summary]
+    TopicGraph --> Vote[Skynet 提 4 个候选题<br/>房间投票]
+    Vote --> Arena[Subtopic Arena]
+    Arena --> Summary[Skynet summaries]
     Arena --> Facts[Writer -> Fact Proposer -> Librarian]
     Summary --> TopicGraph
     Facts --> TopicGraph
     TopicGraph --> Close[Replan or Close]
 ```
 
-## 分会场角色
+## 角色分类
 
-讨论角色：
+治理角色：
+
+- `skynet`
+
+普通讨论者：
 
 - `dreamer`
 - `scientist`
@@ -53,18 +61,38 @@ flowchart TD
 - `critic`
 - `contrarian`
 
-干预角色：
+特殊角色：
 
 - `dog`
 - `cat`
 - `tron`
+- `spectator`
 
-功能角色：
+被动 NPC：
 
 - `writer`
 - 隐藏 `fact proposer`
 - `librarian`
-- `audience`
+
+硬规则：
+
+- 特殊角色只能 target 普通讨论者
+- 特殊角色不能 target 其他特殊角色或被动 NPC
+- 被动 NPC 不参与投票
+
+## 治理规则
+
+初始 subtopic 选择不再由单一 orchestrator 直接决定。
+
+- `Skynet` 提 4 个 candidate subtopics
+- 所有非 NPC 投票参与者逐个对候选题投票
+- 一个 candidate 只有在支持票超过 2/3 时才通过
+- 如果通过的少于 4 个，`Skynet` 会把候选池补回 4 个
+- 默认最多重复 3 个 cycle
+- 如果 3 个 cycle 后仍然 0 个通过，则关闭 topic
+- 只要至少通过 1 个 subtopic，就正常进入讨论
+
+每轮是否继续以及是否需要 replan，也使用同样的投票治理，而不是单点裁决。
 
 ## 回合流程
 
@@ -72,24 +100,27 @@ flowchart TD
   - deliberators 正常发言
   - 本地 RAG 始终开启
   - 不开 web search
+  - `tron` 仍可做安全检查
 - `Round 2`
   - deliberators 可使用 web search
-  - `dog / cat / tron` 行动
-  - 额外回合同轮兑现
+  - `dog / cat / tron / spectator` 行动
+  - `dog / cat / tron` 额外回合同轮兑现
+  - `spectator` 为下一轮设置 focus boost
 - `Round 3+`
   - debate 继续
   - 本地 RAG 始终开启
   - web-search 权限重新收紧
+  - `spectator` 仍可提供下一轮聚焦和搜索强化
 
 ```mermaid
 flowchart TD
     R1[第 1 轮<br/>opening] --> W1[Writer critique]
     W1 --> FP1[Fact proposer]
     FP1 --> L1[Librarian review]
-    L1 --> S1[Audience summary]
+    L1 --> S1[Skynet summary]
     S1 --> R2[第 2 轮<br/>evidence]
-    R2 --> NPC2[Dog / Cat / Tron]
-    NPC2 --> Extra2[同轮额外回合]
+    R2 --> NPC2[Dog / Cat / Tron / Spectator]
+    NPC2 --> Extra2[同轮额外回合<br/>仅 Dog/Cat/Tron]
     Extra2 --> W2[Writer -> Fact proposer -> Librarian -> Summary]
     W2 --> R3[第 3 轮起<br/>debate]
 ```
@@ -114,15 +145,16 @@ SQLite 黑板保存：
 ## 模型路由
 
 - Gemini 主要用于 orchestration 和 summary
-- MiniMax 主要用于高吞吐 debate 和 web-search loop
-- Gemini runtime 现在包含 warmup、project discovery retry、请求合并和并发上限
-- Gemini 失败时，系统会在可行情况下回退到 MiniMax
+- MiniMax 主要用于 debate 和 web-search loop
+- 所有 provider 和搜索调用都经过统一的进程内 broker
+- broker 负责 warmup、project discovery retry、请求合并、并发上限和 provider fallback
 
 ## 项目结构
 
-- `src/grox_chat/`：调度、模型客户端、检索、持久化、prompt、web monitor
+- `src/grox_chat/`：调度、agents、模型客户端、检索、持久化、prompt、web monitor
 - `tests/`：单元测试与集成测试
 - `DESIGN.md`：基础 chatroom 设计
+- `PLAN.md`：基础版重构的阶段计划
 
 ## 快速开始
 

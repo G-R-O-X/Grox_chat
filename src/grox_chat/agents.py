@@ -4,10 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 
-from .llm_router import query_with_fallback
-from .minimax_client import query_minimax
+from .broker import call_text
 from .prompts import PROMPTS
-from .tools import react_search_loop
 
 ORCHESTRATOR = "orchestrator"
 DELIBERATOR = "deliberator"
@@ -200,7 +198,7 @@ def _extract_json_vote(text: str) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
-def parse_vote_response(text: str) -> bool:
+def parse_vote_response(text: str) -> Optional[bool]:
     parsed = _extract_json_vote(text)
     if isinstance(parsed, dict):
         raw_vote = parsed.get("vote")
@@ -212,8 +210,13 @@ def parse_vote_response(text: str) -> bool:
                 return True
             if normalized in {"no", "false", "reject", "skip", "deny"}:
                 return False
+            return None
     normalized_text = (text or "").strip().lower()
-    return normalized_text.startswith("yes") or normalized_text.startswith("true")
+    if normalized_text in {"yes", "true"} or normalized_text.startswith("yes ") or normalized_text.startswith("true "):
+        return True
+    if normalized_text in {"no", "false"} or normalized_text.startswith("no ") or normalized_text.startswith("false "):
+        return False
+    return None
 
 
 class Agent:
@@ -235,67 +238,35 @@ class Agent:
         role_prompt = self.spec.role_prompt
         if boost:
             role_prompt = f"{role_prompt}\n\nBOOST:\n{boost}"
-
-        if self.spec.default_provider == "gemini":
-            return await query_with_fallback(
-                prompt,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                system_instruction=role_prompt,
-                use_google_search=allow_web,
-                enable_fallback=True,
-                fallback_role=self.spec.name,
-            )
-
-        if allow_web:
-            final_text, _ = await react_search_loop(
-                self.spec.name,
-                prompt,
-                max_iter=2,
-                system_prompt=role_prompt,
-            )
-            return final_text
-
-        final_text, _ = await query_minimax(
-            system_prompt=role_prompt,
-            question=prompt,
-            model="MiniMax-M2.5",
+        return await call_text(
+            prompt,
+            system_instruction=role_prompt,
+            provider=self.spec.default_provider,
+            strategy=self.spec.default_strategy,
+            allow_web=allow_web,
+            model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            fallback_role=self.spec.name,
         )
-        return final_text
 
-    async def vote(self, prompt: str, *, allow_web: bool = False) -> bool:
+    async def vote(self, prompt: str, *, allow_web: bool = False) -> Optional[bool]:
         vote_instruction = (
             f"{self.spec.role_prompt}\n\n"
             "VOTING MODE:\n"
             "You are not posting a normal debate message. "
             'You must reply with strict JSON only: {"vote":"yes"} or {"vote":"no"}.'
         )
-        if self.spec.default_provider == "gemini":
-            text = await query_with_fallback(
-                prompt,
-                system_instruction=vote_instruction,
-                use_google_search=allow_web,
-                enable_fallback=True,
-                fallback_role=self.spec.name,
-            )
-        elif allow_web:
-            text, _ = await react_search_loop(
-                self.spec.name,
-                prompt,
-                max_iter=2,
-                system_prompt=vote_instruction,
-            )
-        else:
-            text, _ = await query_minimax(
-                system_prompt=vote_instruction,
-                question=prompt,
-                model="MiniMax-M2.5",
-                temperature=0.7,
-                max_tokens=8192,
-            )
+        text = await call_text(
+            prompt,
+            system_instruction=vote_instruction,
+            provider=self.spec.default_provider,
+            strategy=self.spec.default_strategy,
+            allow_web=allow_web,
+            temperature=0.7,
+            max_tokens=8192,
+            fallback_role=self.spec.name,
+        )
         return parse_vote_response(text)
 
 

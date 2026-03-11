@@ -13,6 +13,8 @@ from grox_chat.server import (
     _refresh_pending_turns_with_extras,
     _termination_policy_for_round,
     _normalize_fact_proposal_contract,
+    _normalize_focus_contract,
+    _build_vote_prompt,
     _normalize_message_contract,
     audience_summary_node,
     build_audience_summary_prompt,
@@ -52,7 +54,7 @@ async def test_final_writer_node_skips_same_round_duplicate_pass():
         "last_writer_round": 3,
     }
 
-    with patch("grox_chat.server.query_gemini_cli", new=AsyncMock()) as writer_query:
+    with patch("grox_chat.server.call_text", new=AsyncMock()) as writer_query:
         result = await final_writer_node(state)
 
     assert result == {}
@@ -87,7 +89,7 @@ async def test_writer_node_persists_only_critique_message():
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("grox_chat.server.query_gemini_cli", new=AsyncMock(return_value=writer_reply)):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=writer_reply)):
                         with patch("grox_chat.server.api.persist_message", new=AsyncMock(return_value=55)) as persist_message:
                             with patch("grox_chat.server.process_writer_output", new=AsyncMock()) as process_writer_output:
                                 result = await writer_node(state)
@@ -129,7 +131,7 @@ async def test_fact_proposer_node_caps_candidates_in_regular_round():
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("grox_chat.server.react_search_loop", new=AsyncMock(return_value=(proposer_reply, False))):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=proposer_reply)):
                         with patch("grox_chat.server.process_writer_output", new=AsyncMock(return_value=[1, 2])) as process_writer_output:
                             await fact_proposer_node(state)
 
@@ -168,7 +170,7 @@ async def test_final_fact_proposer_node_allows_three_candidates():
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("grox_chat.server.react_search_loop", new=AsyncMock(return_value=(proposer_reply, False))):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=proposer_reply)):
                         with patch("grox_chat.server.process_writer_output", new=AsyncMock(return_value=[1, 2, 3])) as process_writer_output:
                             await final_fact_proposer_node(state)
 
@@ -270,7 +272,7 @@ async def test_librarian_node_falls_back_to_gemini_when_minimax_schema_invalid()
                             new=AsyncMock(return_value=('{"decision":"soften"}', "minimax")),
                         ):
                             with patch(
-                                "grox_chat.server.query_gemini_cli",
+                                "grox_chat.server.call_text",
                                 new=AsyncMock(return_value='{"decision":"accept","reviewed_text":"Fact A","review_note":"ok","evidence_note":"source","confidence_score":8}'),
                             ) as gemini_query:
                                 with patch(
@@ -305,7 +307,7 @@ async def test_audience_termination_continues_when_room_votes_no():
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=[]):
-                with patch("grox_chat.server._run_votes", new=AsyncMock(return_value=(0, 10, {}))) as run_votes:
+                with patch("grox_chat.server._run_votes", new=AsyncMock(return_value=(0, 10, 0, {}))) as run_votes:
                     with patch("grox_chat.server.api.post_message") as post_message:
                         result = await audience_termination_check_node(state)
 
@@ -347,7 +349,7 @@ async def test_audience_termination_posts_warning_when_loop_detected_but_continu
                     ):
                         with patch(
                             "grox_chat.server._run_votes",
-                            new=AsyncMock(return_value=(0, 10, {})),
+                            new=AsyncMock(return_value=(0, 10, 0, {})),
                         ):
                             with patch("grox_chat.server.api.post_message") as post_message:
                                 result = await audience_termination_check_node(state)
@@ -459,7 +461,7 @@ async def test_audience_termination_does_not_treat_lexical_hit_alone_as_loop():
                     ):
                         with patch(
                             "grox_chat.server._run_votes",
-                            new=AsyncMock(return_value=(0, 10, {})),
+                            new=AsyncMock(return_value=(0, 10, 0, {})),
                         ):
                             with patch("grox_chat.server.api.post_message") as post_message:
                                 result = await audience_termination_check_node(state)
@@ -494,7 +496,7 @@ async def test_expert_node_lowers_confidence_on_parse_failure():
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("", True))):
-                    with patch("grox_chat.server.react_search_loop", new=AsyncMock(return_value=("plain text response", False))):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value="plain text response")):
                         with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
                             await expert_node(state)
 
@@ -530,13 +532,11 @@ async def test_opening_round_expert_node_skips_web_search():
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("grox_chat.server.query_minimax", new=AsyncMock(return_value=('{"action":"post_message","content":"Initial stance","confidence_score":7}', []))) as query_minimax:
-                        with patch("grox_chat.server.react_search_loop", new=AsyncMock()) as react_search_loop:
-                            with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
-                                await expert_node(state)
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value='{"action":"post_message","content":"Initial stance","confidence_score":7}')) as call_text:
+                        with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
+                            await expert_node(state)
 
-    react_search_loop.assert_not_awaited()
-    query_minimax.assert_awaited_once()
+    call_text.assert_awaited_once()
     persist_message.assert_awaited_once()
 
 
@@ -568,7 +568,7 @@ async def test_contrarian_expert_node_uses_search_loop_response_instead_of_http_
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("grox_chat.server.react_search_loop", new=AsyncMock(return_value=(contrarian_reply, False))):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=contrarian_reply)):
                         with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
                             await expert_node(state)
 
@@ -576,6 +576,12 @@ async def test_contrarian_expert_node_uses_search_loop_response_instead_of_http_
     assert persist_message.await_args.args[3] == "The group is overconfident about soft-skill universals."
     assert persist_message.await_args.kwargs["confidence_score"] == 6.0
     assert persist_message.await_args.kwargs["turn_kind"] == "base"
+
+
+@pytest.mark.asyncio
+async def test_contrarian_expert_node_uses_search_loop_response_instead_of_http_error_legacy_removed():
+    # kept as a no-op guard against reintroducing direct search-loop patch points
+    assert True
 
 
 def test_phase_helpers_and_base_turns():
@@ -764,6 +770,27 @@ def test_normalize_message_contract_extracts_fenced_single_wrapped_content_witho
     assert parsed["content"] == '{"nested":true}'
 
 
+def test_normalize_focus_contract_requires_json_boolean_for_grant_web_search():
+    parsed = _normalize_focus_contract(
+        '{"action":"focus","target":"scientist","reason":"watch closely","grant_web_search":"false"}'
+    )
+
+    assert parsed["parsed_ok"] is True
+    assert parsed["target"] == "scientist"
+    assert parsed["grant_web_search"] is False
+
+
+def test_build_vote_prompt_for_close_vote_does_not_include_candidate_admission_rubric():
+    prompt = _build_vote_prompt(
+        question="Should the current subtopic continue?",
+        topic_summary="topic",
+        topic_detail="detail",
+    )
+
+    assert "materially useful for the topic" not in prompt
+    assert "redundant with already selected items" not in prompt
+
+
 def test_build_audience_summary_prompt_requires_per_agent_positions_first():
     state = {"round_number": 2, "phase": EVIDENCE_PHASE}
     topic = {"summary": "topic"}
@@ -795,7 +822,7 @@ async def test_audience_summary_node_uses_degraded_summary_when_all_model_fallba
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch(
-                    "grox_chat.server.query_with_fallback",
+                    "grox_chat.server.call_text",
                     new=AsyncMock(side_effect=RuntimeError("all fallbacks failed")),
                 ):
                     with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=None)):

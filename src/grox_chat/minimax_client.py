@@ -48,6 +48,13 @@ def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+async def close_minimax_client() -> None:
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
 def _reinforce_minimax_prompt(system_prompt: str, question: str) -> tuple[str, str]:
     base_system_prompt = (system_prompt or "").strip()
     if ENGLISH_ONLY_INSTRUCTION not in base_system_prompt:

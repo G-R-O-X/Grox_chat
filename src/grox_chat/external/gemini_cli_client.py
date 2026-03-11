@@ -225,6 +225,23 @@ async def warmup_gemini_cli() -> None:
     await _discover_project_id()
 
 
+async def close_gemini_cli_client() -> None:
+    global _aio_session
+    if _aio_session is not None and not _aio_session.closed:
+        await _aio_session.close()
+    _aio_session = None
+
+    async with _get_broker_lock():
+        tasks = list(_inflight_requests.values())
+        _inflight_requests.clear()
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _query_gemini_cli_uncached(
     *,
     prompt: str,

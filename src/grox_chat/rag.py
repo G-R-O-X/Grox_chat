@@ -2,9 +2,9 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import api
+from .broker import call_text
 from .embedding import aget_embedding
 from .reranker import arerank
-from .minimax_client import query_minimax
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +79,21 @@ async def assemble_rag_context(
     distill_context = f"Upcoming Speaker: {current_speaker}\nRecent Debate:\n{recent_debate}"
     
     logger.info(f"[RAG] Formulating query for {current_speaker}...")
-    query_ch, _ = await query_minimax(
-        distill_prompt,
-        distill_context,
-        max_tokens=8192,
-        recover_pseudo_tool_query=True,
-    )
-    query_ch = query_ch.strip()
-    
+    try:
+        query_ch = await call_text(
+            distill_context,
+            system_instruction=distill_prompt,
+            provider="minimax",
+            strategy="direct",
+            allow_web=False,
+            max_tokens=8192,
+            fallback_role=current_speaker,
+            recover_pseudo_tool_query=True,
+        )
+        query_ch = query_ch.strip()
+    except Exception:
+        query_ch = ""
+
     if "Error" in query_ch or not query_ch:
         logger.warning("[RAG] Query formulation failed, falling back to raw message.")
         degraded = True

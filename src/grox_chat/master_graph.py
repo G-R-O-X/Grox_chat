@@ -1,16 +1,20 @@
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TypedDict as TypingTypedDict
 
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from . import api
+from .agents import SKYNET, get_agent, voting_agents
 from .embedding import aget_embedding
 from .llm_router import query_with_fallback
 from .server import run_subtopic_graph
 
 logger = logging.getLogger(__name__)
+SUBTOPIC_CANDIDATE_COUNT = 4
+SUBTOPIC_VOTE_CYCLE_LIMIT = 3
+DECISION_PASS_RATIO = 2 / 3
 
 
 class TopicState(TypedDict, total=False):
@@ -20,6 +24,12 @@ class TopicState(TypedDict, total=False):
     next_action: str
     topic_complete: bool
     deferred: bool
+
+
+class VoteTally(TypingTypedDict):
+    yes_votes: int
+    successful_votes: int
+    failed_votes: int
 
 
 def _parse_json_object(output: str) -> Dict[str, Any]:
@@ -86,6 +96,115 @@ async def ask_gemini_cli(system_prompt: str, context: str, role: str, model: str
         return {"error": str(e)}
 
 
+def _decision_passes(yes_votes: int, total_votes: int) -> bool:
+    if total_votes <= 0:
+        return False
+    return (yes_votes / total_votes) > DECISION_PASS_RATIO
+
+
+def _build_vote_prompt(
+    *,
+    topic: dict,
+    question: str,
+    candidate_summary: str = "",
+    candidate_detail: str = "",
+    selected: list[str] | None = None,
+    rejected: list[str] | None = None,
+) -> str:
+    selected_block = ", ".join(selected or []) or "none"
+    rejected_block = ", ".join(rejected or []) or "none"
+    lines = [
+        f"Topic: {topic['summary']}",
+        f"Topic Detail: {topic['detail']}",
+    ]
+    if candidate_summary:
+        lines.append(f"Candidate Subtopic: {candidate_summary}")
+    if candidate_detail:
+        lines.append(f"Candidate Detail: {candidate_detail}")
+    lines.extend(
+        [
+            f"Already selected candidates: {selected_block}",
+            f"Already rejected candidates: {rejected_block}",
+            "",
+            question,
+            'Reply with strict JSON: {"vote":"yes"} or {"vote":"no"}.',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _parse_vote(output: str) -> bool:
+    try:
+        parsed = _parse_json_object(output)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        vote = parsed.get("vote")
+        if isinstance(vote, bool):
+            return vote
+        if isinstance(vote, str):
+            return vote.strip().lower() in {"yes", "true", "approve", "select", "continue", "close", "replan"}
+    return False
+
+
+async def _collect_votes(prompt: str) -> VoteTally:
+    yes_votes = 0
+    successful_votes = 0
+    failed_votes = 0
+    for voter in voting_agents():
+        agent = get_agent(voter)
+        try:
+            decision = await agent.vote(prompt, allow_web=False)
+        except Exception as exc:
+            logger.warning("[skynet] Vote execution failed for %s: %s", voter, exc)
+            failed_votes += 1
+            continue
+        successful_votes += 1
+        yes_votes += int(decision)
+    return {
+        "yes_votes": yes_votes,
+        "successful_votes": successful_votes,
+        "failed_votes": failed_votes,
+    }
+
+
+async def _propose_subtopics(
+    topic: dict,
+    selected: list[str],
+    rejected: list[str],
+    unavailable: list[str] | None = None,
+) -> dict[str, Any]:
+    system_prompt = (
+        "You are Skynet. Propose exactly 4 candidate subtopics for this topic. "
+        "Avoid duplicating already selected, rejected, or completed subtopics. "
+        "All JSON string values must be written in English only. "
+        'Output strictly JSON using this schema: {"action":"create_plan","subtopics":[{"summary":"...","detail":"..."}]}.'
+    )
+    completed = unavailable or []
+    context = (
+        f"Topic: {topic['summary']}\n"
+        f"Topic Detail: {topic['detail']}\n"
+        f"Already selected candidates: {', '.join(selected) or 'none'}\n"
+        f"Already rejected candidates: {', '.join(rejected) or 'none'}\n"
+        f"Already completed subtopics: {', '.join(completed) or 'none'}"
+    )
+    data = await ask_gemini_cli(system_prompt, context, SKYNET)
+    if isinstance(data, dict) and data.get("error"):
+        return {"candidates": [], "error": str(data["error"])}
+    candidates = _sanitize_subtopics(data.get("subtopics", []) if isinstance(data, dict) else [], limit=SUBTOPIC_CANDIDATE_COUNT)
+    seen = set(selected) | set(rejected) | set(completed)
+    deduped: list[dict[str, str]] = []
+    for candidate in candidates:
+        summary = candidate["summary"]
+        if summary in seen:
+            continue
+        seen.add(summary)
+        deduped.append(candidate)
+        if len(deduped) >= SUBTOPIC_CANDIDATE_COUNT:
+            break
+    return {"candidates": deduped, "error": None}
+
+
 def node_inspect_topic_state(state: TopicState) -> TopicState:
     topic_id = state["topic_id"]
     active_plan = api.get_active_plan(topic_id)
@@ -120,22 +239,71 @@ async def node_plan_generation(state: TopicState) -> TopicState:
     topic = api.get_topic(state["topic_id"])
     if not topic:
         return {"topic_complete": True, "next_action": "close_topic"}
+    selected: list[dict[str, str]] = []
+    rejected: list[str] = []
 
-    system_prompt = (
-        "You are the Audience. Break the topic into an ordered list of subtopics. "
-        "Return at most 3 subtopics. "
-        "All JSON string values must be written in English only. "
-        "Output strictly JSON using this schema: "
-        "{\"action\":\"create_plan\",\"subtopics\":[{\"summary\":\"...\",\"detail\":\"...\"}]}"
+    for cycle in range(1, SUBTOPIC_VOTE_CYCLE_LIMIT + 1):
+        proposal = await _propose_subtopics(
+            topic,
+            [item["summary"] for item in selected],
+            rejected,
+        )
+        if proposal.get("error"):
+            logger.warning("[skynet] Deferring topic after proposal-generation failure: %s", proposal["error"])
+            return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
+        candidates = proposal["candidates"]
+        if not candidates:
+            continue
+        for candidate in candidates:
+            prompt = _build_vote_prompt(
+                topic=topic,
+                question=(
+                    "Should this subtopic be admitted to the discussion plan? "
+                    "Vote YES only if it materially helps resolve the topic and is not redundant with already selected subtopics."
+                ),
+                candidate_summary=candidate["summary"],
+                candidate_detail=candidate["detail"],
+                selected=[item["summary"] for item in selected],
+                rejected=rejected,
+            )
+            tally = await _collect_votes(prompt)
+            if tally["failed_votes"] > 0:
+                logger.warning("[skynet] Deferring topic after vote execution failures during plan generation.")
+                return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
+            if _decision_passes(tally["yes_votes"], tally["successful_votes"]):
+                selected.append(candidate)
+                if len(selected) >= SUBTOPIC_CANDIDATE_COUNT:
+                    break
+            else:
+                rejected.append(candidate["summary"])
+        if len(selected) >= SUBTOPIC_CANDIDATE_COUNT:
+            break
+
+    if not selected:
+        final_summary = (
+            f"Topic '{topic['summary']}' is closed because the room could not reach basic consensus on any discussable subtopic after "
+            f"{SUBTOPIC_VOTE_CYCLE_LIMIT} proposal cycles. Please restate or narrow the topic."
+        )
+        emb = await aget_embedding(final_summary)
+        if emb:
+            api.insert_message_with_embedding(
+                state["topic_id"],
+                None,
+                SKYNET,
+                final_summary,
+                msg_type="summary",
+                embedding=emb,
+            )
+        else:
+            api.post_message(state["topic_id"], None, SKYNET, final_summary, msg_type="summary")
+        api.set_topic_status(state["topic_id"], "Closed")
+        return {"topic_complete": True, "next_action": "close_topic"}
+
+    plan_id = api.create_plan(
+        state["topic_id"],
+        json.dumps(selected[:SUBTOPIC_CANDIDATE_COUNT]),
+        current_index=0,
     )
-    context = f"Topic: {topic['summary']}\nDetail: {topic['detail']}"
-    data = await ask_gemini_cli(system_prompt, context, "audience")
-
-    subtopics = _sanitize_subtopics(data.get("subtopics", []) if isinstance(data, dict) else [], limit=3)
-    if not subtopics:
-        subtopics = [{"summary": topic["summary"], "detail": topic["detail"]}]
-
-    plan_id = api.create_plan(state["topic_id"], json.dumps(subtopics), current_index=0)
     return {"plan_id": plan_id, "next_action": "open_next_subtopic"}
 
 
@@ -152,7 +320,7 @@ async def node_open_next_subtopic(state: TopicState) -> TopicState:
 
     next_subtopic = subtopics[plan_index]
     system_prompt = (
-        "You are the Audience. Create a detailed grounding brief for the next subtopic. "
+        "You are Skynet. Create a detailed grounding brief for the next subtopic. "
         "All JSON string values must be written in English only. "
         "Output strictly JSON using this schema: "
         "{\"action\":\"post_message\",\"content\":\"grounding brief text\"}"
@@ -163,13 +331,13 @@ async def node_open_next_subtopic(state: TopicState) -> TopicState:
         f"Subtopic: {next_subtopic['summary']}\n"
         f"Subtopic Detail: {next_subtopic['detail']}"
     )
-    data = await ask_gemini_cli(system_prompt, context, "audience")
+    data = await ask_gemini_cli(system_prompt, context, SKYNET)
     brief_content = data.get("content") if isinstance(data, dict) else None
     if not brief_content:
         brief_content = f"Grounding Brief: {next_subtopic['detail']}"
 
     subtopic_id = api.create_subtopic(state["topic_id"], next_subtopic["summary"], next_subtopic["detail"])
-    start_msg_id = await api.persist_message(state["topic_id"], subtopic_id, "audience", brief_content)
+    start_msg_id = await api.persist_message(state["topic_id"], subtopic_id, SKYNET, brief_content)
     api.update_subtopic_start_msg(subtopic_id, start_msg_id)
     api.advance_plan_cursor(plan["id"])
     api.set_topic_status(state["topic_id"], "Running")
@@ -203,12 +371,12 @@ async def node_conclude_subtopic(state: TopicState) -> TopicState:
         ctx += f"[{message['sender']}]: {message['content'][:300]}\n"
 
     system_prompt = (
-        "You are the Audience. Write the final conclusion for this completed subtopic. "
+        "You are Skynet. Write the final conclusion for this completed subtopic. "
         "All JSON string values must be written in English only. "
         "Output strictly JSON using this schema: "
         "{\"action\":\"close_subtopic\",\"content\":\"final conclusion\"}"
     )
-    data = await ask_gemini_cli(system_prompt, ctx, "audience", model="gemini-3.0-flash")
+    data = await ask_gemini_cli(system_prompt, ctx, SKYNET, model="gemini-3.0-flash")
     conclusion = data.get("content") if isinstance(data, dict) else None
     if not conclusion:
         conclusion = f"Subtopic '{subtopic['summary']}' exhausted."
@@ -218,13 +386,13 @@ async def node_conclude_subtopic(state: TopicState) -> TopicState:
         api.insert_message_with_embedding(
             state["topic_id"],
             state["current_subtopic_id"],
-            "audience",
+            SKYNET,
             conclusion,
             msg_type="summary",
             embedding=emb,
         )
     else:
-        api.post_message(state["topic_id"], state["current_subtopic_id"], "audience", conclusion, msg_type="summary")
+        api.post_message(state["topic_id"], state["current_subtopic_id"], SKYNET, conclusion, msg_type="summary")
 
     api.close_subtopic(state["current_subtopic_id"], conclusion)
     return {"current_subtopic_id": 0}
@@ -235,64 +403,116 @@ async def node_topic_replan_or_close(state: TopicState) -> TopicState:
     subtopics = api.get_current_subtopics(state["topic_id"])
     if not topic:
         return {"topic_complete": True}
-
     ctx = f"Topic: {topic['summary']}\nDetail: {topic['detail']}\n"
     for subtopic in subtopics:
         conclusion = subtopic.get("conclusion") or "(No conclusion recorded)"
         ctx += f"Subtopic: {subtopic['summary']}\nConclusion: {conclusion[:400]}\n"
 
-    system_prompt = (
-        "You are the Audience. Decide whether the topic needs more subtopics or should be closed. "
-        "You are only called after all currently planned subtopics are completed. "
-        "If more work is needed, return at most 2 NEW subtopics. "
-        "All JSON string values must be written in English only. "
-        "Output strictly JSON using one of these schemas: "
-        "{\"action\":\"create_plan\",\"subtopics\":[{\"summary\":\"...\",\"detail\":\"...\"}]}"
-        " or "
-        "{\"action\":\"close_topic\",\"content\":\"final topic summary\"}"
+    replan_vote_prompt = _build_vote_prompt(
+        topic=topic,
+        question=(
+            "Should the room open additional subtopics for this topic? "
+            "Vote YES only if the completed subtopics are still insufficient to support a final answer."
+        ),
+        candidate_summary="",
+        candidate_detail=ctx,
     )
-    data = await ask_gemini_cli(system_prompt, ctx, "audience")
-    action = data.get("action") if isinstance(data, dict) else None
-
-    if isinstance(data, dict) and data.get("error"):
-        logger.warning("[audience] Replan failed transiently: %s", data["error"])
+    tally = await _collect_votes(replan_vote_prompt)
+    if tally["failed_votes"] > 0:
+        logger.warning("[skynet] Deferring topic after vote execution failures during replan gate.")
         return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
-
-    if action == "create_plan" and data.get("subtopics"):
-        subtopics = _sanitize_subtopics(data.get("subtopics"), limit=2)
-        if not subtopics:
-            logger.warning("[audience] Replan returned no valid subtopics after sanitation; deferring topic.")
-            return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
-        plan_id = api.create_plan(state["topic_id"], json.dumps(subtopics), current_index=0)
-        return {"plan_id": plan_id, "topic_complete": False, "next_action": "open_next_subtopic"}
-
-    if action != "close_topic":
-        logger.warning("[audience] Replan returned invalid output; deferring topic.")
-        return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
-
-    final_summary = None
-    if isinstance(data, dict):
-        final_summary = data.get("content")
-    if not final_summary:
+    if not _decision_passes(tally["yes_votes"], tally["successful_votes"]):
         final_summary = f"Topic '{topic['summary']}' is complete."
+        emb = await aget_embedding(final_summary)
+        if emb:
+            api.insert_message_with_embedding(
+                state["topic_id"],
+                None,
+                SKYNET,
+                final_summary,
+                msg_type="summary",
+                embedding=emb,
+            )
+        else:
+            api.post_message(state["topic_id"], None, SKYNET, final_summary, msg_type="summary")
+        api.set_topic_status(state["topic_id"], "Closed")
+        return {"topic_complete": True, "next_action": "close_topic"}
 
-    emb = await aget_embedding(final_summary)
-    if emb:
-        api.insert_message_with_embedding(
-            state["topic_id"],
-            None,
-            "audience",
-            final_summary,
-            msg_type="summary",
-            embedding=emb,
+    selected: list[dict[str, str]] = []
+    rejected: list[str] = []
+    completed_summaries = [item["summary"] for item in subtopics if isinstance(item.get("summary"), str)]
+    for _cycle in range(1, SUBTOPIC_VOTE_CYCLE_LIMIT + 1):
+        proposal = await _propose_subtopics(
+            topic,
+            [item["summary"] for item in selected],
+            rejected,
+            completed_summaries,
         )
-    else:
-        api.post_message(state["topic_id"], None, "audience", final_summary, msg_type="summary")
-    api.set_topic_status(state["topic_id"], "Closed")
-    return {"topic_complete": True, "next_action": "close_topic"}
+        if proposal.get("error"):
+            logger.warning("[skynet] Deferring topic after replanning proposal-generation failure: %s", proposal["error"])
+            return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
+        candidates = proposal["candidates"]
+        if not candidates:
+            continue
+        for candidate in candidates:
+            prompt = _build_vote_prompt(
+                topic=topic,
+                question=(
+                    "Should this newly proposed subtopic be admitted during replanning? "
+                    "Vote YES only if it adds needed coverage beyond what has already been completed."
+                ),
+                candidate_summary=candidate["summary"],
+                candidate_detail=candidate["detail"],
+                selected=[item["summary"] for item in selected],
+                rejected=rejected,
+            )
+            tally = await _collect_votes(prompt)
+            if tally["failed_votes"] > 0:
+                logger.warning("[skynet] Deferring topic after vote execution failures during replanning.")
+                return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
+            if _decision_passes(tally["yes_votes"], tally["successful_votes"]):
+                selected.append(candidate)
+                if len(selected) >= SUBTOPIC_CANDIDATE_COUNT:
+                    break
+            else:
+                rejected.append(candidate["summary"])
+        if len(selected) >= SUBTOPIC_CANDIDATE_COUNT:
+            break
+
+    if not selected:
+        final_summary = f"Topic '{topic['summary']}' is complete."
+        emb = await aget_embedding(final_summary)
+        if emb:
+            api.insert_message_with_embedding(
+                state["topic_id"],
+                None,
+                SKYNET,
+                final_summary,
+                msg_type="summary",
+                embedding=emb,
+            )
+        else:
+            api.post_message(state["topic_id"], None, SKYNET, final_summary, msg_type="summary")
+        api.set_topic_status(state["topic_id"], "Closed")
+        return {"topic_complete": True, "next_action": "close_topic"}
+
+    plan_id = api.create_plan(
+        state["topic_id"],
+        json.dumps(selected[:SUBTOPIC_CANDIDATE_COUNT]),
+        current_index=0,
+    )
+    return {"plan_id": plan_id, "topic_complete": False, "next_action": "open_next_subtopic"}
 
 
 def route_after_replan(state: TopicState) -> str:
+    if state.get("deferred"):
+        return "defer_topic"
+    if state.get("topic_complete"):
+        return "close_topic"
+    return "open_next_subtopic"
+
+
+def route_after_generate_plan(state: TopicState) -> str:
     if state.get("deferred"):
         return "defer_topic"
     if state.get("topic_complete"):
@@ -307,12 +527,12 @@ def route_after_open_next_subtopic(state: TopicState) -> str:
 
 
 def close_topic_node(state: TopicState) -> TopicState:
-    logger.info("[audience] Topic complete.")
+    logger.info("[skynet] Topic complete.")
     return {"topic_complete": True}
 
 
 def defer_topic_node(state: TopicState) -> TopicState:
-    logger.info("[audience] Topic deferred after transient orchestration failure.")
+    logger.info("[skynet] Topic deferred after transient orchestration failure.")
     return {"deferred": True, "topic_complete": False}
 
 
@@ -339,7 +559,15 @@ def build_master_graph():
             "replan_or_close": "replan_or_close",
         },
     )
-    builder.add_edge("generate_plan", "open_next_subtopic")
+    builder.add_conditional_edges(
+        "generate_plan",
+        route_after_generate_plan,
+        {
+            "open_next_subtopic": "open_next_subtopic",
+            "defer_topic": "defer_topic",
+            "close_topic": "close_topic",
+        },
+    )
     builder.add_conditional_edges(
         "open_next_subtopic",
         route_after_open_next_subtopic,

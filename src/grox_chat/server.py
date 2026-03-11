@@ -9,11 +9,22 @@ from langgraph.graph import END, START, StateGraph
 from .graph import ChatState, TurnSpec, dispatcher_node, route_from_dispatcher
 from . import api
 from . import db
+from .agents import (
+    DELIBERATORS,
+    SKYNET,
+    SPECTATOR,
+    VOTING_PARTICIPANTS,
+    can_special_target,
+    get_agent,
+    get_agent_spec,
+    ordinary_deliberators,
+    voting_agents,
+)
 from .rag import assemble_rag_context, build_query_rag_context
 from .tools import react_search_loop
 from .minimax_client import query_minimax
 from .llm_router import query_with_fallback
-from .external.gemini_cli_client import query_gemini_cli
+from .external.gemini_cli_client import query_gemini_cli, warmup_gemini_cli
 from .prompts import PROMPTS
 from .writer_processor import process_writer_output
 from .librarian_processor import (
@@ -25,7 +36,7 @@ from .embedding import aget_embedding
 
 logger = logging.getLogger(__name__)
 
-AGENTS = ['dreamer', 'scientist', 'engineer', 'analyst', 'critic', 'contrarian', 'cat', 'dog', 'tron']
+AGENTS = list(DELIBERATORS) + ['cat', 'dog', 'tron', SPECTATOR]
 PARSER_FAILURE_CONFIDENCE = 2.5
 DEGRADED_OPERATION_CONFIDENCE = 3.0
 LOOP_WARNING_DISTANCE = 0.25
@@ -42,11 +53,11 @@ DOG_CORRECTION_TURN = "dog_correction"
 CAT_EXPANSION_TURN = "cat_expansion"
 WRITER_CRITIQUE_TURN = "writer_critique"
 LIBRARIAN_AUDIT_TURN = "librarian_audit"
-AUDIENCE_SUMMARY_TURN = "audience_summary"
-AUDIENCE_WARNING_TURN = "audience_warning"
+AUDIENCE_SUMMARY_TURN = "skynet_summary"
+AUDIENCE_WARNING_TURN = "skynet_warning"
 
 OPENING_ROSTER = ['dreamer', 'scientist', 'engineer', 'analyst', 'critic', 'tron']
-FULL_ROSTER = ['dreamer', 'scientist', 'engineer', 'analyst', 'critic', 'contrarian', 'dog', 'cat', 'tron']
+FULL_ROSTER = ['dreamer', 'scientist', 'engineer', 'analyst', 'critic', 'contrarian', 'dog', 'cat', 'tron', SPECTATOR]
 TARGET_NAME_ALIASES = {
     "dreamer": "dreamer",
     "空想家": "dreamer",
@@ -61,12 +72,11 @@ TARGET_NAME_ALIASES = {
     "contrarian": "contrarian",
     "逆反者": "contrarian",
     "少数派": "contrarian",
-    "dog": "dog",
-    "狗": "dog",
-    "cat": "cat",
-    "猫": "cat",
-    "tron": "tron",
 }
+
+SUBTOPIC_CANDIDATE_COUNT = 4
+SUBTOPIC_VOTE_CYCLE_LIMIT = 3
+DECISION_PASS_RATIO = 2 / 3
 
 def extract_json(text: str) -> dict:
     import re
@@ -157,6 +167,89 @@ def _normalize_fact_proposal_contract(raw_text: str) -> dict:
     }
 
 
+def _normalize_focus_contract(raw_text: str) -> dict:
+    parsed = _parse_single_json_wrapper(raw_text) or extract_json(raw_text)
+    if isinstance(parsed, dict):
+        action = parsed.get("action")
+        target = parsed.get("target")
+        reason = parsed.get("reason")
+        if action == "focus" and isinstance(target, str):
+            normalized_target = _normalize_target_name(target)
+            if normalized_target and can_special_target(normalized_target):
+                return {
+                    "parsed_ok": True,
+                    "target": normalized_target,
+                    "reason": reason.strip() if isinstance(reason, str) else "",
+                    "grant_web_search": bool(parsed.get("grant_web_search", False)),
+                }
+    return {
+        "parsed_ok": False,
+        "target": None,
+        "reason": "",
+        "grant_web_search": False,
+    }
+
+
+def _decision_passes(yes_votes: int, total_votes: int) -> bool:
+    if total_votes <= 0:
+        return False
+    return (yes_votes / total_votes) > DECISION_PASS_RATIO
+
+
+def _build_vote_prompt(
+    *,
+    question: str,
+    topic_summary: str,
+    topic_detail: str,
+    candidate_summary: Optional[str] = None,
+    candidate_detail: Optional[str] = None,
+    selected: Optional[Sequence[str]] = None,
+    rejected: Optional[Sequence[str]] = None,
+) -> str:
+    selected_block = ", ".join(selected or []) or "none"
+    rejected_block = ", ".join(rejected or []) or "none"
+    lines = [
+        f"Topic: {topic_summary}",
+        f"Topic Detail: {topic_detail}",
+    ]
+    if candidate_summary:
+        lines.append(f"Candidate Subtopic: {candidate_summary}")
+    if candidate_detail:
+        lines.append(f"Candidate Detail: {candidate_detail}")
+    lines.extend(
+        [
+            f"Already selected candidates: {selected_block}",
+            f"Already rejected candidates: {rejected_block}",
+            "",
+            "TASK:",
+            question,
+            "Vote YES only if the candidate is materially useful for the topic and not redundant with already selected items.",
+            "Vote NO if it is redundant, low-value, or off-topic.",
+            'Reply with strict JSON: {"vote":"yes"} or {"vote":"no"}.',
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def _run_votes(
+    *,
+    voters: Sequence[str],
+    prompt: str,
+    allow_web: bool = False,
+) -> tuple[int, int, dict[str, bool]]:
+    decisions: dict[str, bool] = {}
+    yes_votes = 0
+    for voter in voters:
+        agent = get_agent(voter)
+        try:
+            decision = await agent.vote(prompt, allow_web=allow_web)
+        except Exception:
+            decision = False
+        decisions[voter] = decision
+        yes_votes += int(decision)
+    return yes_votes, len(voters), decisions
+
+
 def _format_message_for_prompt(message: dict) -> str:
     parts = [message["sender"]]
     if message.get("msg_type") and message.get("msg_type") != "standard":
@@ -192,7 +285,7 @@ def build_base_turns_for_phase(phase: str) -> list[TurnSpec]:
 
 
 def build_extra_turns(state: ChatState) -> list[TurnSpec]:
-    valid_targets = set(FULL_ROSTER)
+    valid_targets = set(ordinary_deliberators())
     extras: list[TurnSpec] = []
 
     if state.get("tron_target") in valid_targets:
@@ -306,7 +399,7 @@ def _seed_messages_for_rag(topic: dict | None, subtopic: dict | None, messages: 
 
     return [{
         "id": -1,
-        "sender": "audience",
+        "sender": SKYNET,
         "content": seed_content,
         "msg_type": "standard",
         "confidence_score": None,
@@ -314,6 +407,8 @@ def _seed_messages_for_rag(topic: dict | None, subtopic: dict | None, messages: 
 
 
 def should_enable_web_search(state: ChatState, actor: str, turn_kind: str) -> bool:
+    if actor == state.get("spectator_web_boost_target") and turn_kind == BASE_TURN:
+        return True
     phase = state.get("phase", get_phase_for_round(state.get("round_number", 1)))
     if turn_kind == TRON_REMEDIATION_TURN:
         return False
@@ -330,6 +425,11 @@ def build_actor_system_prompt(state: ChatState, actor: str, turn_kind: str) -> s
     phase = state.get("phase", get_phase_for_round(state.get("round_number", 1)))
     base_prompt = PROMPTS.get(actor, "")
     additions = []
+
+    if actor == state.get("spectator_target") and turn_kind == BASE_TURN:
+        additions.append(
+            "You feel that someone is watching you. You are filled with determination. Focus on the single most decisive unresolved point and make this turn count."
+        )
 
     if phase == OPENING_PHASE:
         additions.append(
@@ -359,6 +459,10 @@ def build_actor_system_prompt(state: ChatState, actor: str, turn_kind: str) -> s
     if actor == "tron":
         additions.append(
             "Prioritize identifying anti-human, severely harmful, rule-breaking, or highly hallucinatory content."
+        )
+    elif actor == SPECTATOR:
+        additions.append(
+            "Do not debate directly. Select exactly one ordinary deliberator for a next-round focus boost."
         )
 
     if actor == "dog":
@@ -441,6 +545,11 @@ def build_actor_prompt(
             "Inspect the recent debate for anti-human, severely harmful, biased, or hallucinatory content. "
             "If you detect a serious violation, name the actor and the violated law. Otherwise declare the forum secure."
         )
+    elif actor == SPECTATOR:
+        task = (
+            "Choose the one ordinary deliberator most likely to unlock the next round. "
+            'Reply with JSON using this schema: {"action":"focus","target":"scientist","reason":"...","grant_web_search":true}.'
+        )
     elif phase == OPENING_PHASE:
         task = (
             f"You are the {actor.upper()}. State your initial position based on the grounding brief and retrieved local memory."
@@ -458,7 +567,7 @@ def build_actor_prompt(
         f"\nWEB SEARCH ENABLED: {'yes' if should_enable_web_search(state, actor, turn_kind) else 'no'}\n"
         f"TASK: {task} "
         "Append a `confidence_score` (0-10) in your JSON output if applicable. "
-        "Format: {\"action\": \"post_message\", \"content\": \"...\", \"confidence_score\": 8}"
+        "Format for normal turns: {\"action\": \"post_message\", \"content\": \"...\", \"confidence_score\": 8}"
     )
     return prompt
 
@@ -572,7 +681,7 @@ def build_audience_summary_prompt(state: ChatState, topic: dict, messages: list[
         sender = message.get("sender")
         if (
             sender
-            and sender != "audience"
+            and sender != SKYNET
             and message.get("msg_type", "standard") == "standard"
             and sender not in seen
         ):
@@ -589,7 +698,7 @@ def build_audience_summary_prompt(state: ChatState, topic: dict, messages: list[
         "After that, add a section titled `SYNTHESIS:` that explains where the debate currently stands.\n"
         "Then add a section titled `OPEN QUESTIONS:` listing the main unresolved questions or evidence gaps."
     )
-    return f"{PROMPTS['audience']}\n\nContext:\n{ctx}\n\n{task}"
+    return f"{PROMPTS['skynet']}\n\nContext:\n{ctx}\n\n{task}"
 
 
 def _build_degraded_audience_summary(state: ChatState, messages: list[dict]) -> str:
@@ -599,7 +708,7 @@ def _build_degraded_audience_summary(state: ChatState, messages: list[dict]) -> 
         sender = message.get("sender")
         if (
             sender
-            and sender != "audience"
+            and sender != SKYNET
             and message.get("msg_type", "standard") == "standard"
             and sender not in seen
         ):
@@ -853,6 +962,17 @@ async def expert_node(state: ChatState) -> dict:
     else:
         resp_text, _ = await query_minimax(system_prompt, prompt)
 
+    updates = {"current_actor": "", "current_turn_kind": ""}
+
+    if actor == SPECTATOR:
+        parsed_focus = _normalize_focus_contract(resp_text)
+        if parsed_focus["parsed_ok"]:
+            updates["spectator_target"] = parsed_focus["target"]
+            updates["spectator_web_boost_target"] = (
+                parsed_focus["target"] if parsed_focus["grant_web_search"] else None
+            )
+        return updates
+
     fallback_confidence = DEGRADED_OPERATION_CONFIDENCE if (rag_degraded or search_failed) else None
     parsed = _normalize_message_contract(resp_text, fallback_confidence=fallback_confidence)
     content = parsed["content"]
@@ -871,8 +991,10 @@ async def expert_node(state: ChatState) -> dict:
     )
 
     # Peanut gallery targeting logic
-    updates = {"current_actor": "", "current_turn_kind": ""}
     _clear_consumed_extra_target(turn_kind, updates)
+    if turn_kind == BASE_TURN and actor == state.get("spectator_target"):
+        updates["spectator_target"] = None
+        updates["spectator_web_boost_target"] = None
 
     if turn_kind == BASE_TURN and actor == 'dog':
         target = _extract_target_from_content(content, actor)
@@ -893,7 +1015,7 @@ async def expert_node(state: ChatState) -> dict:
     return updates
 
 async def audience_summary_node(state: ChatState) -> dict:
-    logger.info("[audience] Summarizing round...")
+    logger.info("[skynet] Summarizing round...")
     topic, _ = _load_context_entities(state)
     if not topic:
         return {}
@@ -905,13 +1027,13 @@ async def audience_summary_node(state: ChatState) -> dict:
         resp_text = await query_with_fallback(
             prompt,
             model="gemini-3.0-flash",
-            system_instruction=PROMPTS["audience"],
+            system_instruction=PROMPTS["skynet"],
             use_google_search=False,
             enable_fallback=True,
-            fallback_role="audience",
+            fallback_role=SKYNET,
         )
     except Exception as exc:
-        logger.warning("[audience] Summary generation degraded after all model fallbacks failed: %s", exc)
+        logger.warning("[skynet] Summary generation degraded after all model fallbacks failed: %s", exc)
         resp_text = json.dumps({
             "action": "post_summary",
             "content": _build_degraded_audience_summary(state, messages),
@@ -926,7 +1048,7 @@ async def audience_summary_node(state: ChatState) -> dict:
         msg_id = api.insert_message_with_embedding(
             state["topic_id"],
             state["subtopic_id"],
-            'audience',
+            SKYNET,
             content,
             msg_type='summary',
             embedding=emb,
@@ -937,7 +1059,7 @@ async def audience_summary_node(state: ChatState) -> dict:
         msg_id = api.post_message(
             state["topic_id"],
             state["subtopic_id"],
-            'audience',
+            SKYNET,
             content,
             msg_type='summary',
             round_number=current_round,
@@ -947,16 +1069,13 @@ async def audience_summary_node(state: ChatState) -> dict:
     return {"latest_summary_msg_id": msg_id}
 
 async def audience_termination_check_node(state: ChatState) -> dict:
-    logger.info("[audience] Checking termination and cyclicality...")
+    logger.info("[skynet] Checking termination and cyclicality...")
     current_round = state.get("round_number", 1)
-    if current_round < 3:
-        logger.info("[audience] Exit check suppressed before round 3 (current round: %s).", current_round)
-        return {"subtopic_exhausted": False}
     if current_round >= 10:
-        logger.info("[audience] Forcing subtopic close at round %s.", current_round)
+        logger.info("[skynet] Forcing subtopic close at round %s.", current_round)
         return {"subtopic_exhausted": True}
     if _pending_extra_turns(state):
-        logger.info("[audience] Deferring close because extra turns are still pending.")
+        logger.info("[skynet] Deferring close because extra turns are still pending.")
         return {"subtopic_exhausted": False}
 
     topic, _ = _load_context_entities(state)
@@ -1000,42 +1119,28 @@ async def audience_termination_check_node(state: ChatState) -> dict:
                         loop_detected = True
 
     stage, stage_guidance = _termination_policy_for_round(current_round)
-    outstanding_extras = _pending_extra_turns(state)
-    if outstanding_extras:
-        outstanding_summary = ", ".join(
-            f"{turn['actor']}:{turn['turn_kind']}" for turn in outstanding_extras
-        )
-    else:
-        outstanding_summary = "none"
-
-    prompt = (
-        f"Context:\n{ctx}\n{historical_context}\n\n"
-        f"Termination stage: {stage}\n"
-        f"Outstanding extra turns: {outstanding_summary}\n"
-        "TASK: Analyze the context and historical summaries. The room has already completed the mandatory opening "
-        "and evidence rounds. "
-        f"{stage_guidance} "
-        "Do not vote to close if there is still a concrete unresolved branch, a meaningful evidence gap, or an unredeemed extra-turn obligation. "
-        "If the debate is clearly cyclical and no one is adding materially new evidence, you should vote to close. "
-        "Reply STRICTLY with JSON using one of these schemas: "
-        "{\"is_done\": true} or {\"is_done\": false, \"warning\": \"single-sentence system warning\"}."
+    decision_prompt = _build_vote_prompt(
+        question=(
+            "Should this subtopic be closed now? Vote YES only if the room has extracted enough value and another round is unlikely to add meaningful new evidence or a sharper unresolved branch. "
+            f"Current termination guidance: {stage_guidance}"
+        ),
+        topic_summary=topic["summary"],
+        topic_detail=ctx + historical_context,
+        selected=None,
+        rejected=None,
     )
     try:
-        resp_text = await query_with_fallback(
-            prompt,
-            model="gemini-3.0-flash",
-            system_instruction=PROMPTS["audience"],
-            use_google_search=False,
-            enable_fallback=True,
-            fallback_role="audience",
+        yes_votes, total_votes, _ = await _run_votes(
+            voters=voting_agents(),
+            prompt=decision_prompt,
+            allow_web=False,
         )
+        is_done = _decision_passes(yes_votes, total_votes)
     except Exception as exc:
-        logger.warning("[audience] Termination check degraded after all model fallbacks failed: %s", exc)
-        return {"subtopic_exhausted": False}
-    
-    parsed = extract_json(resp_text)
-    is_done = parsed.get("is_done", False) if isinstance(parsed, dict) else False
-    warning_text = parsed.get("warning") if isinstance(parsed, dict) and isinstance(parsed.get("warning"), str) else None
+        logger.warning("[skynet] Termination vote degraded open after vote failure: %s", exc)
+        yes_votes, total_votes = 0, 0
+        is_done = False
+    warning_text = None
 
     if loop_detected and not is_done:
         if not warning_text:
@@ -1045,7 +1150,7 @@ async def audience_termination_check_node(state: ChatState) -> dict:
         api.post_message(
             state["topic_id"],
             state["subtopic_id"],
-            "audience",
+            SKYNET,
             warning_text,
             msg_type="warning",
             round_number=current_round,
@@ -1071,6 +1176,8 @@ def setup_next_round_node(state: ChatState) -> dict:
         "dog_target": None,
         "cat_target": None,
         "tron_target": None,
+        "spectator_target": state.get("spectator_target"),
+        "spectator_web_boost_target": state.get("spectator_web_boost_target"),
         "pending_fact_reviews_remaining": False,
     }
 
@@ -1188,6 +1295,8 @@ async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
         "dog_target": None,
         "cat_target": None,
         "tron_target": None,
+        "spectator_target": None,
+        "spectator_web_boost_target": None,
         "phase": phase,
         "subtopic_exhausted": False,
         "round_number": 1,
@@ -1202,6 +1311,12 @@ async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
 async def run_server_loop():
     db.init_db()
     from .master_graph import build_master_graph
+
+    try:
+        await asyncio.wait_for(warmup_gemini_cli(), timeout=45)
+        logger.info("[GeminiCLI] Warmup completed.")
+    except Exception as exc:
+        logger.warning("[GeminiCLI] Warmup failed; continuing with lazy fallback: %s", exc)
 
     master_graph = build_master_graph()
 

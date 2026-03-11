@@ -284,7 +284,7 @@ async def test_librarian_node_falls_back_to_gemini_when_minimax_schema_invalid()
 
 
 @pytest.mark.asyncio
-async def test_audience_termination_is_suppressed_before_round_three():
+async def test_audience_termination_continues_when_room_votes_no():
     state = {
         "topic_id": 1,
         "plan_id": 1,
@@ -302,12 +302,15 @@ async def test_audience_termination_is_suppressed_before_round_three():
         "round_number": 2,
     }
 
-    with patch("grox_chat.server.query_with_fallback", new=AsyncMock()) as query_gemini_cli:
-        with patch("grox_chat.server.api.post_message") as post_message:
-            result = await audience_termination_check_node(state)
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=[]):
+                with patch("grox_chat.server._run_votes", new=AsyncMock(return_value=(0, 10, {}))) as run_votes:
+                    with patch("grox_chat.server.api.post_message") as post_message:
+                        result = await audience_termination_check_node(state)
 
     assert result["subtopic_exhausted"] is False
-    query_gemini_cli.assert_not_awaited()
+    run_votes.assert_awaited_once()
     post_message.assert_not_called()
 
 
@@ -331,7 +334,7 @@ async def test_audience_termination_posts_warning_when_loop_detected_but_continu
         "latest_summary_msg_id": 9,
     }
     messages = [
-        {"id": 9, "sender": "audience", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
+        {"id": 9, "sender": "skynet", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
     ]
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
@@ -343,8 +346,8 @@ async def test_audience_termination_posts_warning_when_loop_detected_but_continu
                         return_value=[{"id": 3, "content": "Past summary", "distance": 0.2}],
                     ):
                         with patch(
-                            "grox_chat.server.query_with_fallback",
-                            new=AsyncMock(return_value='{"is_done": false, "warning": "Move to new evidence."}'),
+                            "grox_chat.server._run_votes",
+                            new=AsyncMock(return_value=(0, 10, {})),
                         ):
                             with patch("grox_chat.server.api.post_message") as post_message:
                                 result = await audience_termination_check_node(state)
@@ -353,16 +356,16 @@ async def test_audience_termination_posts_warning_when_loop_detected_but_continu
     post_message.assert_called_once_with(
         1,
         1,
-        "audience",
-        "Move to new evidence.",
+        "skynet",
+        "System warning: this debate is revisiting prior conclusions. Bring new evidence, a narrower unresolved claim, or a different assumption next round.",
         msg_type="warning",
         round_number=3,
-        turn_kind="audience_warning",
+        turn_kind="skynet_warning",
     )
 
 
 @pytest.mark.asyncio
-async def test_audience_termination_degrades_open_when_all_model_fallbacks_fail():
+async def test_audience_termination_degrades_open_when_vote_execution_fails():
     state = {
         "topic_id": 1,
         "plan_id": 1,
@@ -380,7 +383,7 @@ async def test_audience_termination_degrades_open_when_all_model_fallbacks_fail(
         "round_number": 3,
     }
     messages = [
-        {"id": 9, "sender": "audience", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
+        {"id": 9, "sender": "skynet", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
     ]
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
@@ -389,8 +392,8 @@ async def test_audience_termination_degrades_open_when_all_model_fallbacks_fail(
                 with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
                     with patch("grox_chat.server.api.search_messages_hybrid", return_value=[]):
                         with patch(
-                            "grox_chat.server.query_with_fallback",
-                            new=AsyncMock(side_effect=RuntimeError("all fallbacks failed")),
+                            "grox_chat.server._run_votes",
+                            new=AsyncMock(side_effect=RuntimeError("all vote paths failed")),
                         ):
                             result = await audience_termination_check_node(state)
 
@@ -416,11 +419,11 @@ async def test_audience_termination_forces_close_at_round_ten():
         "round_number": 10,
     }
 
-    with patch("grox_chat.server.query_with_fallback", new=AsyncMock()) as query_with_fallback:
+    with patch("grox_chat.server._run_votes", new=AsyncMock()) as run_votes:
         result = await audience_termination_check_node(state)
 
     assert result["subtopic_exhausted"] is True
-    query_with_fallback.assert_not_awaited()
+    run_votes.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -443,7 +446,7 @@ async def test_audience_termination_does_not_treat_lexical_hit_alone_as_loop():
         "latest_summary_msg_id": 9,
     }
     messages = [
-        {"id": 9, "sender": "audience", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
+        {"id": 9, "sender": "skynet", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
     ]
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
@@ -455,8 +458,8 @@ async def test_audience_termination_does_not_treat_lexical_hit_alone_as_loop():
                         return_value=[{"id": 3, "content": "Past summary", "distance": 0.9, "lexical_score": -0.2}],
                     ):
                         with patch(
-                            "grox_chat.server.query_with_fallback",
-                            new=AsyncMock(return_value='{"is_done": false}'),
+                            "grox_chat.server._run_votes",
+                            new=AsyncMock(return_value=(0, 10, {})),
                         ):
                             with patch("grox_chat.server.api.post_message") as post_message:
                                 result = await audience_termination_check_node(state)
@@ -520,7 +523,7 @@ async def test_opening_round_expert_node_skips_web_search():
         "round_number": 1,
     }
     messages = [
-        {"id": 1, "sender": "audience", "content": "Grounding brief", "msg_type": "standard", "confidence_score": None},
+        {"id": 1, "sender": "skynet", "content": "Grounding brief", "msg_type": "standard", "confidence_score": None},
     ]
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
@@ -584,7 +587,7 @@ def test_phase_helpers_and_base_turns():
         "dreamer", "scientist", "engineer", "analyst", "critic", "tron"
     ]
     assert [turn["actor"] for turn in build_base_turns_for_phase(EVIDENCE_PHASE)] == [
-        "dreamer", "scientist", "engineer", "analyst", "critic", "contrarian", "dog", "cat", "tron"
+        "dreamer", "scientist", "engineer", "analyst", "critic", "contrarian", "dog", "cat", "tron", "spectator"
     ]
 
     _, evidence_turns = build_turn_queue_for_round({"round_number": 2}, 2)
@@ -765,7 +768,7 @@ def test_build_audience_summary_prompt_requires_per_agent_positions_first():
     state = {"round_number": 2, "phase": EVIDENCE_PHASE}
     topic = {"summary": "topic"}
     messages = [
-        {"sender": "audience", "content": "brief", "msg_type": "standard", "confidence_score": None},
+        {"sender": "skynet", "content": "brief", "msg_type": "standard", "confidence_score": None},
         {"sender": "dreamer", "content": "idea", "msg_type": "standard", "confidence_score": 7.0},
         {"sender": "scientist", "content": "check", "msg_type": "standard", "confidence_score": 6.0},
         {"sender": "writer", "content": "verify", "msg_type": "standard", "confidence_score": None},

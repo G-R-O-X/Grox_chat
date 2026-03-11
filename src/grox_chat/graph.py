@@ -22,6 +22,8 @@ class ChatState(TypedDict):
     dog_target: Optional[str]
     cat_target: Optional[str]
     tron_target: Optional[str]
+    spectator_target: Optional[str]
+    spectator_web_boost_target: Optional[str]
     
     # Internal routing markers
     phase: str
@@ -32,6 +34,7 @@ class ChatState(TypedDict):
     last_fact_proposer_round: NotRequired[Optional[int]]
     last_final_fact_proposer_round: NotRequired[Optional[int]]
     pending_fact_reviews_remaining: NotRequired[bool]
+    subtopic_vote_cycle: NotRequired[int]
 
 def dispatcher_node(state: ChatState) -> dict:
     """

@@ -7,6 +7,7 @@ from grox_chat.master_graph import (
     node_open_next_subtopic,
     node_plan_generation,
     node_topic_replan_or_close,
+    route_after_generate_plan,
     route_after_replan,
     route_after_open_next_subtopic,
 )
@@ -16,30 +17,35 @@ from grox_chat.master_graph import (
 async def test_node_plan_generation():
     state = {"topic_id": 1}
 
-    mock_gemini = AsyncMock(
-        return_value={
-            "action": "create_plan",
-            "subtopics": [
-                {"summary": "Subtopic 1", "detail": "Detail 1"},
-                {"summary": "Subtopic 2", "detail": "Detail 2"},
-            ],
-        }
-    )
-
-    with patch("grox_chat.master_graph.ask_gemini_cli", new=mock_gemini):
-        with patch("grox_chat.master_graph.api.create_plan", return_value=7):
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph._propose_subtopics",
+            new=AsyncMock(
+                return_value={
+                    "candidates": [
+                        {"summary": "Subtopic 1", "detail": "Detail 1"},
+                        {"summary": "Subtopic 2", "detail": "Detail 2"},
+                    ],
+                    "error": None,
+                }
+            ),
+        ):
             with patch(
-                "grox_chat.master_graph.api.get_topic",
-                return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(return_value={"yes_votes": 8, "successful_votes": 10, "failed_votes": 0}),
             ):
-                new_state = await node_plan_generation(state)
+                with patch("grox_chat.master_graph.api.create_plan", return_value=7):
+                    new_state = await node_plan_generation(state)
 
     assert new_state["plan_id"] == 7
     assert new_state["next_action"] == "open_next_subtopic"
 
 
 @pytest.mark.asyncio
-async def test_node_plan_generation_truncates_to_three_subtopics():
+async def test_node_plan_generation_truncates_to_four_subtopics():
     state = {"topic_id": 1}
     model_subtopics = [
         {"summary": f"Subtopic {idx}", "detail": f"Detail {idx}"}
@@ -51,15 +57,52 @@ async def test_node_plan_generation_truncates_to_three_subtopics():
         return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
     ):
         with patch(
-            "grox_chat.master_graph.ask_gemini_cli",
-            new=AsyncMock(return_value={"action": "create_plan", "subtopics": model_subtopics}),
+            "grox_chat.master_graph._propose_subtopics",
+            new=AsyncMock(return_value={"candidates": model_subtopics, "error": None}),
         ):
-            with patch("grox_chat.master_graph.api.create_plan", return_value=7) as create_plan:
-                new_state = await node_plan_generation(state)
+            with patch(
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(return_value={"yes_votes": 8, "successful_votes": 10, "failed_votes": 0}),
+            ):
+                with patch("grox_chat.master_graph.api.create_plan", return_value=7) as create_plan:
+                    new_state = await node_plan_generation(state)
 
     stored_subtopics = json.loads(create_plan.call_args.args[1])
-    assert len(stored_subtopics) == 3
+    assert len(stored_subtopics) == 4
     assert new_state["plan_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_node_plan_generation_closes_after_three_empty_cycles():
+    state = {"topic_id": 1}
+
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph._propose_subtopics",
+            new=AsyncMock(
+                side_effect=[
+                    {"candidates": [{"summary": "A", "detail": "A"}], "error": None},
+                    {"candidates": [{"summary": "B", "detail": "B"}], "error": None},
+                    {"candidates": [{"summary": "C", "detail": "C"}], "error": None},
+                ]
+            ),
+        ):
+            with patch(
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(return_value={"yes_votes": 0, "successful_votes": 10, "failed_votes": 0}),
+            ):
+                with patch("grox_chat.master_graph.aget_embedding", new=AsyncMock(return_value=None)):
+                    with patch("grox_chat.master_graph.api.set_topic_status") as set_status:
+                        with patch("grox_chat.master_graph.api.post_message") as post_message:
+                            result = await node_plan_generation(state)
+
+    assert result["topic_complete"] is True
+    assert result["next_action"] == "close_topic"
+    set_status.assert_called_once_with(1, "Closed")
+    post_message.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -97,7 +140,7 @@ async def test_node_open_next_subtopic():
 
 
 @pytest.mark.asyncio
-async def test_node_topic_replan_or_close_defers_on_error():
+async def test_node_topic_replan_or_close_closes_when_room_votes_no():
     state = {"topic_id": 1}
 
     with patch(
@@ -109,29 +152,35 @@ async def test_node_topic_replan_or_close_defers_on_error():
             return_value=[{"summary": "Subtopic 1", "conclusion": "Conclusion 1"}],
         ):
             with patch(
-                "grox_chat.master_graph.ask_gemini_cli",
-                new=AsyncMock(return_value={"error": "timeout"}),
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(return_value={"yes_votes": 0, "successful_votes": 10, "failed_votes": 0}),
             ):
-                with patch("grox_chat.master_graph.api.post_message") as post_message:
-                    with patch("grox_chat.master_graph.api.set_topic_status") as set_status:
-                        result = await node_topic_replan_or_close(state)
+                with patch("grox_chat.master_graph.aget_embedding", new=AsyncMock(return_value=None)):
+                    with patch("grox_chat.master_graph.api.post_message") as post_message:
+                        with patch("grox_chat.master_graph.api.set_topic_status") as set_status:
+                            result = await node_topic_replan_or_close(state)
 
-    assert result["deferred"] is True
-    assert result["topic_complete"] is False
-    assert result["next_action"] == "defer_topic"
-    assert route_after_replan(result) == "defer_topic"
-    post_message.assert_not_called()
-    set_status.assert_not_called()
+    assert result["topic_complete"] is True
+    assert result["next_action"] == "close_topic"
+    assert route_after_replan(result) == "close_topic"
+    post_message.assert_called_once()
+    set_status.assert_called_once_with(1, "Closed")
 
 
 @pytest.mark.asyncio
-async def test_node_topic_replan_or_close_truncates_new_subtopics_to_two():
+async def test_node_topic_replan_or_close_refills_and_truncates_to_four():
     state = {"topic_id": 1}
     replanned = [
         {"summary": "A", "detail": "Detail A"},
         {"summary": "B", "detail": "Detail B"},
         {"summary": "C", "detail": "Detail C"},
     ]
+    proposal_calls = 0
+
+    async def _proposal_side_effect(*_args, **_kwargs):
+        nonlocal proposal_calls
+        proposal_calls += 1
+        return {"candidates": replanned if proposal_calls == 1 else [], "error": None}
 
     with patch(
         "grox_chat.master_graph.api.get_topic",
@@ -142,14 +191,25 @@ async def test_node_topic_replan_or_close_truncates_new_subtopics_to_two():
             return_value=[{"summary": "Done 1", "conclusion": "Conclusion 1"}],
         ):
             with patch(
-                "grox_chat.master_graph.ask_gemini_cli",
-                new=AsyncMock(return_value={"action": "create_plan", "subtopics": replanned}),
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(
+                    side_effect=[
+                        {"yes_votes": 8, "successful_votes": 10, "failed_votes": 0},
+                        {"yes_votes": 8, "successful_votes": 10, "failed_votes": 0},
+                        {"yes_votes": 8, "successful_votes": 10, "failed_votes": 0},
+                        {"yes_votes": 8, "successful_votes": 10, "failed_votes": 0},
+                    ]
+                ),
             ):
-                with patch("grox_chat.master_graph.api.create_plan", return_value=9) as create_plan:
-                    result = await node_topic_replan_or_close(state)
+                with patch(
+                    "grox_chat.master_graph._propose_subtopics",
+                    new=AsyncMock(side_effect=_proposal_side_effect),
+                ):
+                    with patch("grox_chat.master_graph.api.create_plan", return_value=9) as create_plan:
+                        result = await node_topic_replan_or_close(state)
 
     stored_subtopics = json.loads(create_plan.call_args.args[1])
-    assert len(stored_subtopics) == 2
+    assert len(stored_subtopics) == 3
     assert result["plan_id"] == 9
     assert result["next_action"] == "open_next_subtopic"
 
@@ -182,3 +242,108 @@ def test_route_after_open_next_subtopic_replans_when_no_subtopic_was_opened():
     assert route_after_open_next_subtopic({"next_action": "replan_or_close"}) == "replan_or_close"
     assert route_after_open_next_subtopic({"current_subtopic_id": 0}) == "replan_or_close"
     assert route_after_open_next_subtopic({"current_subtopic_id": 10, "next_action": "run_subtopic"}) == "run_subtopic"
+
+
+def test_route_after_generate_plan_honors_close_and_defer():
+    assert route_after_generate_plan({"topic_complete": True, "next_action": "close_topic"}) == "close_topic"
+    assert route_after_generate_plan({"deferred": True, "next_action": "defer_topic"}) == "defer_topic"
+    assert route_after_generate_plan({"plan_id": 7, "next_action": "open_next_subtopic"}) == "open_next_subtopic"
+
+
+@pytest.mark.asyncio
+async def test_node_plan_generation_defers_on_vote_execution_failure():
+    state = {"topic_id": 1}
+
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph._propose_subtopics",
+            new=AsyncMock(return_value={"candidates": [{"summary": "A", "detail": "A"}], "error": None}),
+        ):
+            with patch(
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(return_value={"yes_votes": 2, "successful_votes": 8, "failed_votes": 2}),
+            ):
+                result = await node_plan_generation(state)
+
+    assert result["deferred"] is True
+    assert result["next_action"] == "defer_topic"
+
+
+@pytest.mark.asyncio
+async def test_node_plan_generation_defers_on_proposal_error():
+    state = {"topic_id": 1}
+
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph._propose_subtopics",
+            new=AsyncMock(return_value={"candidates": [], "error": "provider outage"}),
+        ):
+            result = await node_plan_generation(state)
+
+    assert result["deferred"] is True
+    assert result["next_action"] == "defer_topic"
+
+
+@pytest.mark.asyncio
+async def test_node_topic_replan_or_close_defers_on_replan_vote_failure():
+    state = {"topic_id": 1}
+
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph.api.get_current_subtopics",
+            return_value=[{"summary": "Done 1", "conclusion": "Conclusion 1"}],
+        ):
+            with patch(
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(return_value={"yes_votes": 0, "successful_votes": 9, "failed_votes": 1}),
+            ):
+                result = await node_topic_replan_or_close(state)
+
+    assert result["deferred"] is True
+    assert result["next_action"] == "defer_topic"
+
+
+@pytest.mark.asyncio
+async def test_node_topic_replan_or_close_passes_completed_subtopics_into_proposals():
+    state = {"topic_id": 1}
+    current_subtopics = [
+        {"summary": "Done 1", "conclusion": "Conclusion 1"},
+        {"summary": "Done 2", "conclusion": "Conclusion 2"},
+    ]
+
+    with patch(
+        "grox_chat.master_graph.api.get_topic",
+        return_value={"id": 1, "summary": "Topic Summary", "detail": "Topic Detail"},
+    ):
+        with patch(
+            "grox_chat.master_graph.api.get_current_subtopics",
+            return_value=current_subtopics,
+        ):
+            with patch(
+                "grox_chat.master_graph._collect_votes",
+                new=AsyncMock(
+                    side_effect=[
+                        {"yes_votes": 8, "successful_votes": 10, "failed_votes": 0},
+                        {"yes_votes": 8, "successful_votes": 10, "failed_votes": 0},
+                    ]
+                ),
+            ):
+                with patch(
+                    "grox_chat.master_graph._propose_subtopics",
+                    new=AsyncMock(return_value={"candidates": [], "error": None}),
+                ) as propose:
+                    with patch("grox_chat.master_graph.aget_embedding", new=AsyncMock(return_value=None)):
+                        with patch("grox_chat.master_graph.api.post_message"):
+                            with patch("grox_chat.master_graph.api.set_topic_status"):
+                                await node_topic_replan_or_close(state)
+
+    assert propose.await_args.args[3] == ["Done 1", "Done 2"]

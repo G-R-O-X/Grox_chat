@@ -165,6 +165,14 @@ uv run python -c "from grox_chat.db import init_db; init_db()"
 uv run python -m grox_chat.server
 ```
 
+Environment notes:
+
+- `ENABLE_GEMINI=0` is the default in `.env.example`
+- Set `ENABLE_GEMINI=1` in `.env` only if you want real Gemini Pro/Flash calls
+- When Gemini is disabled, Gemini profiles automatically fall back to MiniMax
+  - `allow_web=False`: MiniMax no-web deep fallback (`plan -> draft -> reflect`)
+  - `allow_web=True`: MiniMax web research flow
+
 Create a topic from another shell:
 
 ```bash
@@ -181,6 +189,7 @@ uv run pytest -q
 
 - Default host: mainland `https://api.minimaxi.com`
 - Set `MINIMAX_EN=1` in `.env` to use international `https://api.minimax.io`
+- Set `ENABLE_GEMINI=1` in `.env` to enable Gemini; otherwise Gemini requests degrade to MiniMax fallbacks
 - This applies to both:
   - Anthropic-compatible Messages API
   - Coding Plan search API

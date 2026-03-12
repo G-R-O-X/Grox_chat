@@ -165,6 +165,14 @@ uv run python -c "from grox_chat.db import init_db; init_db()"
 uv run python -m grox_chat.server
 ```
 
+环境说明：
+
+- `.env.example` 默认是 `ENABLE_GEMINI=0`
+- 只有在 `.env` 中设置 `ENABLE_GEMINI=1` 时，才会真正调用 Gemini Pro/Flash
+- Gemini 关闭时，Gemini profile 会自动退化到 MiniMax
+  - `allow_web=False`：走 MiniMax 的无联网深度 fallback（`plan -> draft -> reflect`）
+  - `allow_web=True`：走 MiniMax 的 web research 流程
+
 在另一个终端创建 topic：
 
 ```bash
@@ -181,6 +189,7 @@ uv run pytest -q
 
 - 默认使用国内 MiniMax：`https://api.minimaxi.com`
 - 如果在 `.env` 中设置 `MINIMAX_EN=1`，则切换到国际版：`https://api.minimax.io`
+- 如果在 `.env` 中设置 `ENABLE_GEMINI=1`，则启用 Gemini；否则所有 Gemini 请求都会退化到 MiniMax fallback
 - 该开关同时影响：
   - Anthropic 兼容 Messages API
   - Coding Plan Search API

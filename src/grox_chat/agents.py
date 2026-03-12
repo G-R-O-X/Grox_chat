@@ -290,6 +290,25 @@ class Agent:
         )
         return parsed_vote
 
+    async def governance_vote(self, prompt: str) -> str:
+        vote_instruction = (
+            f"{self.spec.role_prompt}\n\n"
+            "GOVERNANCE VOTING MODE:\n"
+            "You are not posting a normal debate message. "
+            "You must analyze governance state and reply with strict JSON only using the exact schema requested in the user prompt. "
+            "Do not output markdown, prose outside JSON, or extra keys."
+        )
+        result = await llm_call(
+            prompt,
+            system_prompt=vote_instruction,
+            provider_profile=self.spec.default_provider,
+            require_json=True,
+            role=self.spec.name,
+            temperature=0.3,
+            max_tokens=2048,
+        )
+        return result.text
+
 
 def get_agent(name: str) -> Agent:
     return Agent(get_agent_spec(name))

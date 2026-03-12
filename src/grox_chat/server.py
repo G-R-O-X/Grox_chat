@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from langgraph.graph import END, START, StateGraph
 
@@ -28,6 +28,7 @@ from .broker import (
     is_gemini_enabled,
     shutdown_broker,
 )
+from .minimax_client import query_minimax
 from .rag import assemble_rag_context, build_query_rag_context
 from .external.gemini_cli_client import warmup_gemini_cli
 from .logging_utils import configure_logging
@@ -85,6 +86,17 @@ TARGET_NAME_ALIASES = {
 SUBTOPIC_CANDIDATE_COUNT = 4
 SUBTOPIC_VOTE_CYCLE_LIMIT = 3
 DECISION_PASS_RATIO = 2 / 3
+TERMINATION_MAX_INVALID_VOTES = 2
+ROUND3_CLOSE_RATIO = 0.8
+ROUND46_CLOSE_RATIO = 2 / 3
+ROUND79_CLOSE_RATIO = 0.6
+SUMMARY_SECTION_HEADERS = (
+    "TRAJECTORY:",
+    "CONSENSUS:",
+    "BLOCKERS:",
+    "EVIDENCE GAPS:",
+    "AGENT DELTAS:",
+)
 
 def extract_json(text: str) -> dict:
     import re
@@ -375,19 +387,378 @@ def _termination_policy_for_round(round_number: int) -> tuple[str, str]:
     if round_number <= 3:
         return (
             "weak",
-            "Use a weak close threshold. Bias toward continuing unless the core subtopic is clearly resolved and no concrete unresolved branch remains.",
+            "EARLY STAGE. The burden of proof is on continuing. If any central blocker remains, or if the recommendation is still shifting, you should continue.",
         )
     if round_number <= 6:
         return (
             "medium",
-            "Use a balanced close threshold. Close if another round is unlikely to add materially new evidence, a sharper claim, or a narrower unresolved branch.",
+            "MID STAGE. Close only when the remaining disagreement is peripheral or repetitive. Continue if the recommendation is still unstable or a central branch remains.",
         )
     if round_number <= 9:
         return (
             "strong",
-            "Use a strong close threshold. Bias toward closing unless you can name a specific unresolved branch or evidence gap worth another round.",
+            "LATE STAGE. The burden of proof is on closing, but you must continue if a severe central blocker still makes the current recommendation unstable or unsafe.",
         )
     return ("forced", "Round 10 is a forced close.")
+
+
+def _should_run_termination_vote(round_number: int) -> bool:
+    return round_number >= 3
+
+
+def _build_termination_question(stage_guidance: str) -> str:
+    return (
+        "Decide whether this subtopic should CONTINUE or CLOSE.\n"
+        f"Current stage guidance: {stage_guidance}\n"
+        "Fill every field before you choose the final vote.\n"
+        "Field rules:\n"
+        "- `main_branch`: name the main unresolved branch; use `none` only if no meaningful blocker remains.\n"
+        "- `centrality`: use `central`, `mixed`, `peripheral`, or `none`.\n"
+        "- `recent_shift`: use `yes`, `no`, or `unclear` based on whether the framing, governing metric, or recommendation changed in the last 1-2 rounds.\n"
+        "- `conditional_support`: use `yes` if the current recommendation still relies on softened, caveated, or weakly validated facts.\n"
+        "- `untested_novelty`: use `yes` if a new framework, router, metric, or failure model affecting the recommendation has not yet been stress-tested.\n"
+        "Default voting policy:\n"
+        "- If `centrality` is `central` or `mixed`, default to `continue`.\n"
+        "- If `recent_shift` is `yes` or `unclear`, default to `continue`.\n"
+        "- If `conditional_support` is `yes`, default to `continue`.\n"
+        "- If `untested_novelty` is `yes`, default to `continue`.\n"
+        "- Vote `close` only when blockers are gone and another round would mostly repeat the same ground.\n"
+        "- If you vote `close` while any blocker is present, `override_reason` must be a short non-empty sentence.\n"
+        'Reply with strict JSON only: {"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","override_reason":"... or null"}.'
+    )
+
+
+def _build_termination_vote_prompt(*, topic_summary: str, topic_detail: str, stage_guidance: str) -> str:
+    return "\n".join(
+        [
+            f"Topic: {topic_summary}",
+            f"Topic Detail: {topic_detail}",
+            "",
+            "TASK: SUBTOPIC CLOSURE GOVERNANCE",
+            _build_termination_question(stage_guidance),
+        ]
+    )
+
+
+def _build_termination_vote_repair_prompt(*, original_prompt: str, invalid_text: str, invalid_reason: str) -> str:
+    return (
+        "Original governance task:\n"
+        f"{original_prompt}\n\n"
+        "Invalid governance response:\n"
+        f"{invalid_text}\n\n"
+        f"Validation failure: {invalid_reason}\n\n"
+        "Rewrite the response into valid JSON using exactly this schema:\n"
+        '{"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","override_reason":"... or null"}\n'
+        "Preserve the original intent when possible.\n"
+        "Output JSON only. Do not add markdown fences, commentary, or extra keys."
+    )
+
+
+def _has_required_summary_sections(content: str) -> bool:
+    line_cursor = -1
+    lines = (content or "").splitlines()
+    for header in SUMMARY_SECTION_HEADERS:
+        position = next(
+            (index for index, line in enumerate(lines) if index > line_cursor and line.strip() == header),
+            -1,
+        )
+        if position < 0:
+            return False
+        line_cursor = position
+    return True
+
+
+def _normalize_yes_no(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"yes", "y", "true", "1"}:
+            return "yes"
+        if normalized in {"no", "n", "false", "0"}:
+            return "no"
+    return None
+
+
+def _normalize_centrality(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    aliases = {
+        "central": "central",
+        "core": "central",
+        "mixed": "mixed",
+        "peripheral": "peripheral",
+        "secondary": "peripheral",
+        "none": "none",
+    }
+    return aliases.get(normalized)
+
+
+def _normalize_recent_shift(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        aliases = {
+            "yes": "yes",
+            "y": "yes",
+            "true": "yes",
+            "changed": "yes",
+            "no": "no",
+            "n": "no",
+            "false": "no",
+            "stable": "no",
+            "unclear": "unclear",
+            "unknown": "unclear",
+            "maybe": "unclear",
+        }
+        return aliases.get(normalized)
+    return None
+
+
+def _normalize_termination_vote_label(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return "close" if value else "continue"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"close", "yes", "approve"}:
+            return "close"
+        if normalized in {"continue", "no", "reject", "keep_open"}:
+            return "continue"
+    return None
+
+
+def _empty_termination_vote(reason: str) -> dict[str, Any]:
+    return {
+        "parsed_ok": False,
+        "main_branch": "none",
+        "centrality": "none",
+        "recent_shift": "unclear",
+        "conditional_support": "no",
+        "untested_novelty": "no",
+        "vote": "continue",
+        "override_reason": None,
+        "central_blocker": False,
+        "volatility_blocker": True,
+        "support_blocker": False,
+        "novelty_blocker": False,
+        "invalid_reason": reason,
+    }
+
+
+def _normalize_termination_vote_contract(raw_text: str) -> dict[str, Any]:
+    parsed = _parse_single_json_wrapper(raw_text) or extract_json(raw_text)
+    if not isinstance(parsed, dict):
+        return _empty_termination_vote("invalid_json")
+
+    centrality = _normalize_centrality(parsed.get("centrality"))
+    recent_shift = _normalize_recent_shift(parsed.get("recent_shift"))
+    conditional_support = _normalize_yes_no(parsed.get("conditional_support"))
+    untested_novelty = _normalize_yes_no(parsed.get("untested_novelty"))
+    vote = _normalize_termination_vote_label(parsed.get("vote"))
+
+    if not all((centrality, recent_shift, conditional_support, untested_novelty, vote)):
+        return _empty_termination_vote("invalid_fields")
+
+    raw_branch = parsed.get("main_branch")
+    if isinstance(raw_branch, str) and raw_branch.strip():
+        main_branch = raw_branch.strip()
+    elif centrality == "none":
+        main_branch = "none"
+    else:
+        main_branch = "unspecified"
+
+    raw_override = parsed.get("override_reason")
+    override_reason = raw_override.strip() if isinstance(raw_override, str) and raw_override.strip() else None
+
+    central_blocker = centrality in {"central", "mixed"}
+    volatility_blocker = recent_shift in {"yes", "unclear"}
+    support_blocker = conditional_support == "yes"
+    novelty_blocker = untested_novelty == "yes"
+    has_blocker = central_blocker or volatility_blocker or support_blocker or novelty_blocker
+
+    if vote == "close" and has_blocker and not override_reason:
+        result = _empty_termination_vote("missing_override_reason")
+        result.update(
+            {
+                "main_branch": main_branch,
+                "centrality": centrality,
+                "recent_shift": recent_shift,
+                "conditional_support": conditional_support,
+                "untested_novelty": untested_novelty,
+                "vote": vote,
+                "central_blocker": central_blocker,
+                "volatility_blocker": volatility_blocker,
+                "support_blocker": support_blocker,
+                "novelty_blocker": novelty_blocker,
+            }
+        )
+        return result
+
+    return {
+        "parsed_ok": True,
+        "main_branch": main_branch,
+        "centrality": centrality,
+        "recent_shift": recent_shift,
+        "conditional_support": conditional_support,
+        "untested_novelty": untested_novelty,
+        "vote": vote,
+        "override_reason": override_reason,
+        "central_blocker": central_blocker,
+        "volatility_blocker": volatility_blocker,
+        "support_blocker": support_blocker,
+        "novelty_blocker": novelty_blocker,
+        "invalid_reason": None,
+    }
+
+
+async def _run_termination_votes(
+    *,
+    voters: Sequence[str],
+    prompt: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for voter in voters:
+        agent = get_agent(voter)
+        raw_response = ""
+        repair_response = ""
+        repair_used = False
+        try:
+            raw_response = await agent.governance_vote(prompt)
+            parsed = _normalize_termination_vote_contract(raw_response)
+            if not parsed["parsed_ok"] and raw_response.strip():
+                repair_used = True
+                try:
+                    repair_response, _ = await query_minimax(
+                        system_prompt=(
+                            f"{agent.spec.role_prompt}\n\n"
+                            "GOVERNANCE JSON REPAIR MODE:\n"
+                            "You are repairing a subtopic termination governance vote that failed validation.\n"
+                            "Preserve the original intent when possible.\n"
+                            "Output valid JSON only with the exact requested keys.\n"
+                            "Do not add markdown fences, commentary, or extra keys."
+                        ).strip(),
+                        question=_build_termination_vote_repair_prompt(
+                            original_prompt=prompt,
+                            invalid_text=raw_response,
+                            invalid_reason=parsed["invalid_reason"] or "unknown",
+                        ),
+                        temperature=0.1,
+                        max_tokens=1024,
+                    )
+                    repaired = _normalize_termination_vote_contract(repair_response)
+                    if repaired["parsed_ok"]:
+                        parsed = repaired
+                    else:
+                        logger.warning(
+                            "[GovVote] agent=%s repair failed invalid_reason=%s repair_response=%s",
+                            voter,
+                            repaired["invalid_reason"],
+                            repair_response,
+                        )
+                except Exception as exc:
+                    logger.warning("[GovVote] agent=%s repair failed with exception: %s", voter, exc)
+        except Exception as exc:
+            parsed = _empty_termination_vote(f"exception:{type(exc).__name__}")
+            logger.warning("[GovVote] agent=%s execution failed: %s", voter, exc)
+        record = {
+            "voter": voter,
+            "raw_response": raw_response,
+            "repair_used": repair_used,
+            "repair_response": repair_response,
+            "parsed": parsed,
+        }
+        logger.info(
+            "[GovVote] agent=%s parsed_ok=%s vote=%s centrality=%s recent_shift=%s conditional_support=%s untested_novelty=%s override_reason=%s invalid_reason=%s repair_used=%s raw_response=%s repair_response=%s",
+            voter,
+            parsed["parsed_ok"],
+            parsed["vote"],
+            parsed["centrality"],
+            parsed["recent_shift"],
+            parsed["conditional_support"],
+            parsed["untested_novelty"],
+            parsed["override_reason"],
+            parsed["invalid_reason"],
+            repair_used,
+            raw_response,
+            repair_response,
+        )
+        records.append(record)
+    return records
+
+
+def _termination_thresholds_for_round(round_number: int) -> dict[str, float | int]:
+    if round_number <= 3:
+        return {
+            "close_ratio": ROUND3_CLOSE_RATIO,
+            "central_blocker": 1,
+            "volatility_blocker": 1,
+            "support_blocker": 1,
+            "novelty_blocker": 1,
+        }
+    if round_number <= 6:
+        return {
+            "close_ratio": ROUND46_CLOSE_RATIO,
+            "central_blocker": 2,
+            "volatility_blocker": 2,
+            "support_blocker": 2,
+            "novelty_blocker": 2,
+        }
+    return {
+        "close_ratio": ROUND79_CLOSE_RATIO,
+        "central_blocker": 2,
+        "volatility_blocker": 2,
+        "support_blocker": 3,
+        "novelty_blocker": 3,
+    }
+
+
+def _aggregate_termination_votes(vote_records: Sequence[dict[str, Any]], round_number: int) -> dict[str, Any]:
+    valid_votes = [record["parsed"] for record in vote_records if record.get("parsed", {}).get("parsed_ok")]
+    blocker_signal_votes = [
+        record["parsed"]
+        for record in vote_records
+        if record.get("parsed", {}).get("parsed_ok")
+        or record.get("parsed", {}).get("invalid_reason") == "missing_override_reason"
+    ]
+    invalid_votes = len(vote_records) - len(valid_votes)
+    close_votes = sum(1 for parsed in valid_votes if parsed["vote"] == "close")
+    close_ratio = close_votes / len(valid_votes) if valid_votes else 0.0
+    blocker_counts = {
+        "central_blocker": sum(1 for parsed in blocker_signal_votes if parsed["central_blocker"]),
+        "volatility_blocker": sum(1 for parsed in blocker_signal_votes if parsed["volatility_blocker"]),
+        "support_blocker": sum(1 for parsed in blocker_signal_votes if parsed["support_blocker"]),
+        "novelty_blocker": sum(1 for parsed in blocker_signal_votes if parsed["novelty_blocker"]),
+    }
+
+    if invalid_votes > TERMINATION_MAX_INVALID_VOTES:
+        return {
+            "subtopic_exhausted": False,
+            "valid_votes": len(valid_votes),
+            "invalid_votes": invalid_votes,
+            "close_votes": close_votes,
+            "close_ratio": close_ratio,
+            "blocker_counts": blocker_counts,
+            "blocked_by": ["invalid_votes"],
+        }
+
+    thresholds = _termination_thresholds_for_round(round_number)
+    blocked_by = [
+        category
+        for category, count in blocker_counts.items()
+        if count >= thresholds[category]
+    ]
+    subtopic_exhausted = bool(valid_votes) and not blocked_by and close_ratio >= thresholds["close_ratio"]
+    return {
+        "subtopic_exhausted": subtopic_exhausted,
+        "valid_votes": len(valid_votes),
+        "invalid_votes": invalid_votes,
+        "close_votes": close_votes,
+        "close_ratio": close_ratio,
+        "blocker_counts": blocker_counts,
+        "blocked_by": blocked_by,
+    }
 
 
 def _normalize_target_name(name: str) -> Optional[str]:
@@ -803,11 +1174,19 @@ def build_audience_summary_prompt(state: ChatState, topic: dict, messages: list[
     task = (
         "TASK: Post a round summary. Reply in JSON using this schema: "
         "{\"action\":\"post_summary\",\"content\":\"...\"}.\n"
-        "Inside `content`, you MUST begin with a section titled `AGENT POSITIONS:` "
-        f"and include one bullet for each participant in this order: {participant_block}. "
-        "State each participant's main claim, correction, or objection in one concise bullet.\n"
-        "After that, add a section titled `SYNTHESIS:` that explains where the debate currently stands.\n"
-        "Then add a section titled `OPEN QUESTIONS:` listing the main unresolved questions or evidence gaps."
+        "Inside `content`, you MUST use exactly these section headers in this exact order:\n"
+        "TRAJECTORY:\n"
+        "CONSENSUS:\n"
+        "BLOCKERS:\n"
+        "EVIDENCE GAPS:\n"
+        "AGENT DELTAS:\n"
+        "Section rules:\n"
+        "- `TRAJECTORY`: 1-2 short sentences stating whether the room changed framing, governing metric, or recommendation this round.\n"
+        "- `CONSENSUS`: state the strongest current agreement and include the main caveats from recent Librarian rulings or softened facts.\n"
+        "- `BLOCKERS`: name the main unresolved branch blocking closure; write `None` only if no meaningful blocker remains.\n"
+        "- `EVIDENCE GAPS`: list only the gaps that could justify another round. Prefix each line with `[Central]` or `[Peripheral]`.\n"
+        f"- `AGENT DELTAS`: include one bullet for each participant in this order: {participant_block}. State only what changed, what was conceded, or what new attack/correction was introduced this round.\n"
+        "Do not state whether the subtopic is ready to close."
     )
     return f"{PROMPTS['skynet']}\n\nContext:\n{ctx}\n\n{task}"
 
@@ -832,12 +1211,16 @@ def _build_degraded_audience_summary(state: ChatState, messages: list[dict]) -> 
     ) or "- system: No participant positions were summarized because all orchestration model fallbacks failed."
 
     return (
-        "AGENT POSITIONS:\n"
-        f"{bullets}\n"
-        "SYNTHESIS:\n"
+        "TRAJECTORY:\n"
         "Round summary degraded because Gemini and MiniMax orchestration paths both failed.\n"
-        "OPEN QUESTIONS:\n"
-        "- Continue the debate and gather new evidence once orchestration is healthy again."
+        "CONSENSUS:\n"
+        "No reliable consensus summary is available from this round.\n"
+        "BLOCKERS:\n"
+        "Unknown due to degraded summary generation.\n"
+        "EVIDENCE GAPS:\n"
+        "[Central] Continue the debate once orchestration is healthy again.\n"
+        "AGENT DELTAS:\n"
+        f"{bullets}"
     )
 
 
@@ -1391,6 +1774,9 @@ async def audience_summary_node(state: ChatState) -> dict:
     
     parsed = _normalize_message_contract(resp_text, accepted_actions=("post_summary", "post_message"))
     content = parsed["content"]
+    if not _has_required_summary_sections(content):
+        logger.warning("[skynet] Summary missing required sections; using degraded fallback.")
+        content = _build_degraded_audience_summary(state, messages)
     
     # Embed the summary for future cyclicality detection
     emb = await aget_embedding(content)
@@ -1424,9 +1810,6 @@ async def audience_termination_check_node(state: ChatState) -> dict:
     if current_round >= 10:
         logger.info("[skynet] Forcing subtopic close at round %s.", current_round)
         return {"subtopic_exhausted": True}
-    if _pending_extra_turns(state):
-        logger.info("[skynet] Deferring close because extra turns are still pending.")
-        return {"subtopic_exhausted": False}
 
     topic, _ = _load_context_entities(state)
     if not topic:
@@ -1469,33 +1852,47 @@ async def audience_termination_check_node(state: ChatState) -> dict:
                         loop_detected = True
 
     stage, stage_guidance = _termination_policy_for_round(current_round)
-    decision_prompt = _build_vote_prompt(
-        question=(
-            "Should this subtopic be closed now? Vote YES only if the room has extracted enough value and another round is unlikely to add meaningful new evidence or a sharper unresolved branch. "
-            f"Current termination guidance: {stage_guidance}"
-        ),
+    decision_prompt = _build_termination_vote_prompt(
         topic_summary=topic["summary"],
         topic_detail=ctx + historical_context,
-        selected=None,
-        rejected=None,
+        stage_guidance=stage_guidance,
     )
-    try:
-        yes_votes, total_votes, failed_votes, _ = await _run_votes(
-            voters=voting_agents(),
-            prompt=decision_prompt,
-            allow_web=False,
+    if not _should_run_termination_vote(current_round):
+        logger.info(
+            "[skynet] Skipping termination vote at round %s because early rounds are for stance-taking and evidence gathering.",
+            current_round,
         )
-        if failed_votes:
-            logger.warning(
-                "[skynet] Termination vote deferred because %s votes failed or were invalid.",
-                failed_votes,
-            )
-            is_done = False
-        else:
-            is_done = _decision_passes(yes_votes, total_votes)
-    except Exception as exc:
-        logger.warning("[skynet] Termination vote degraded open after vote failure: %s", exc)
         is_done = False
+    elif _pending_extra_turns(state):
+        logger.info("[skynet] Deferring close because extra turns are still pending.")
+        is_done = False
+    else:
+        try:
+            vote_records = await _run_termination_votes(
+                voters=voting_agents(),
+                prompt=decision_prompt,
+            )
+            aggregation = _aggregate_termination_votes(vote_records, current_round)
+            logger.info(
+                "[skynet] Termination aggregation round=%s valid_votes=%s invalid_votes=%s close_votes=%s close_ratio=%.2f blocker_counts=%s blocked_by=%s subtopic_exhausted=%s",
+                current_round,
+                aggregation["valid_votes"],
+                aggregation["invalid_votes"],
+                aggregation["close_votes"],
+                aggregation["close_ratio"],
+                aggregation["blocker_counts"],
+                aggregation["blocked_by"],
+                aggregation["subtopic_exhausted"],
+            )
+            if aggregation["invalid_votes"] > TERMINATION_MAX_INVALID_VOTES:
+                logger.warning(
+                    "[skynet] Termination vote degraded open because %s governance votes were invalid.",
+                    aggregation["invalid_votes"],
+                )
+            is_done = aggregation["subtopic_exhausted"]
+        except Exception as exc:
+            logger.warning("[skynet] Termination vote degraded open after vote failure: %s", exc)
+            is_done = False
     warning_text = None
 
     if loop_detected and not is_done:

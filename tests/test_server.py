@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from grox_chat.broker import BrokerResponse, SearchEvidenceItem
@@ -10,9 +11,15 @@ from grox_chat.server import (
     OPENING_PHASE,
     TRON_REMEDIATION_TURN,
     route_after_final_librarian,
+    _aggregate_termination_votes,
     _extract_target_from_content,
     _refresh_pending_turns_with_extras,
+    _build_termination_question,
+    _has_required_summary_sections,
+    _normalize_termination_vote_contract,
+    _run_termination_votes,
     _termination_policy_for_round,
+    _should_run_termination_vote,
     _normalize_fact_proposal_contract,
     _normalize_focus_contract,
     _build_vote_prompt,
@@ -288,6 +295,44 @@ async def test_librarian_node_falls_back_to_gemini_when_minimax_schema_invalid()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("round_number, phase", [(1, OPENING_PHASE), (2, EVIDENCE_PHASE)])
+async def test_audience_termination_skips_votes_before_round_three(round_number, phase):
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "phase": phase,
+        "subtopic_exhausted": False,
+        "round_number": round_number,
+    }
+
+    messages = [
+        {"id": 9, "sender": "skynet", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
+    ]
+
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
+                    with patch("grox_chat.server.api.search_messages_hybrid", return_value=[]):
+                        with patch("grox_chat.server._run_termination_votes", new=AsyncMock()) as run_votes:
+                            with patch("grox_chat.server.api.post_message") as post_message:
+                                result = await audience_termination_check_node(state)
+
+    assert result["subtopic_exhausted"] is False
+    run_votes.assert_not_awaited()
+    post_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_audience_termination_continues_when_room_votes_no():
     state = {
         "topic_id": 1,
@@ -301,15 +346,15 @@ async def test_audience_termination_continues_when_room_votes_no():
         "dog_target": None,
         "cat_target": None,
         "tron_target": None,
-        "phase": EVIDENCE_PHASE,
+        "phase": DEBATE_PHASE,
         "subtopic_exhausted": False,
-        "round_number": 2,
+        "round_number": 3,
     }
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=[]):
-                with patch("grox_chat.server._run_votes", new=AsyncMock(return_value=(0, 10, 0, {}))) as run_votes:
+                with patch("grox_chat.server._run_termination_votes", new=AsyncMock(return_value=[])) as run_votes:
                     with patch("grox_chat.server.api.post_message") as post_message:
                         result = await audience_termination_check_node(state)
 
@@ -350,8 +395,8 @@ async def test_audience_termination_posts_warning_when_loop_detected_but_continu
                         return_value=[{"id": 3, "content": "Past summary", "distance": 0.2}],
                     ):
                         with patch(
-                            "grox_chat.server._run_votes",
-                            new=AsyncMock(return_value=(0, 10, 0, {})),
+                            "grox_chat.server._run_termination_votes",
+                            new=AsyncMock(return_value=[]),
                         ):
                             with patch("grox_chat.server.api.post_message") as post_message:
                                 result = await audience_termination_check_node(state)
@@ -364,6 +409,54 @@ async def test_audience_termination_posts_warning_when_loop_detected_but_continu
         "System warning: this debate is revisiting prior conclusions. Bring new evidence, a narrower unresolved claim, or a different assumption next round.",
         msg_type="warning",
         round_number=3,
+        turn_kind="skynet_warning",
+    )
+
+
+@pytest.mark.asyncio
+async def test_audience_termination_keeps_loop_warning_before_round_three():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "phase": EVIDENCE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 2,
+        "latest_summary_msg_id": 9,
+    }
+    messages = [
+        {"id": 9, "sender": "skynet", "content": "Current summary", "msg_type": "summary", "confidence_score": None},
+    ]
+
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
+                    with patch(
+                        "grox_chat.server.api.search_messages_hybrid",
+                        return_value=[{"id": 3, "content": "Past summary", "distance": 0.2}],
+                    ):
+                        with patch("grox_chat.server._run_termination_votes", new=AsyncMock()) as run_votes:
+                            with patch("grox_chat.server.api.post_message") as post_message:
+                                result = await audience_termination_check_node(state)
+
+    assert result["subtopic_exhausted"] is False
+    run_votes.assert_not_awaited()
+    post_message.assert_called_once_with(
+        1,
+        1,
+        "skynet",
+        "System warning: this debate is revisiting prior conclusions. Bring new evidence, a narrower unresolved claim, or a different assumption next round.",
+        msg_type="warning",
+        round_number=2,
         turn_kind="skynet_warning",
     )
 
@@ -396,7 +489,7 @@ async def test_audience_termination_degrades_open_when_vote_execution_fails():
                 with patch("grox_chat.server.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
                     with patch("grox_chat.server.api.search_messages_hybrid", return_value=[]):
                         with patch(
-                            "grox_chat.server._run_votes",
+                            "grox_chat.server._run_termination_votes",
                             new=AsyncMock(side_effect=RuntimeError("all vote paths failed")),
                         ):
                             result = await audience_termination_check_node(state)
@@ -423,7 +516,7 @@ async def test_audience_termination_forces_close_at_round_ten():
         "round_number": 10,
     }
 
-    with patch("grox_chat.server._run_votes", new=AsyncMock()) as run_votes:
+    with patch("grox_chat.server._run_termination_votes", new=AsyncMock()) as run_votes:
         result = await audience_termination_check_node(state)
 
     assert result["subtopic_exhausted"] is True
@@ -462,8 +555,8 @@ async def test_audience_termination_does_not_treat_lexical_hit_alone_as_loop():
                         return_value=[{"id": 3, "content": "Past summary", "distance": 0.9, "lexical_score": -0.2}],
                     ):
                         with patch(
-                            "grox_chat.server._run_votes",
-                            new=AsyncMock(return_value=(0, 10, 0, {})),
+                            "grox_chat.server._run_termination_votes",
+                            new=AsyncMock(return_value=[]),
                         ):
                             with patch("grox_chat.server.api.post_message") as post_message:
                                 result = await audience_termination_check_node(state)
@@ -682,6 +775,12 @@ def test_termination_policy_is_graduated_by_round():
     assert _termination_policy_for_round(10)[0] == "forced"
 
 
+def test_termination_votes_begin_at_round_three():
+    assert _should_run_termination_vote(1) is False
+    assert _should_run_termination_vote(2) is False
+    assert _should_run_termination_vote(3) is True
+
+
 @pytest.mark.asyncio
 async def test_final_librarian_keeps_subtopic_open_when_pending_candidates_remain():
     state = {
@@ -805,7 +904,7 @@ def test_build_vote_prompt_for_close_vote_does_not_include_candidate_admission_r
     assert "redundant with already selected items" not in prompt
 
 
-def test_build_audience_summary_prompt_requires_per_agent_positions_first():
+def test_build_audience_summary_prompt_requires_mini_max_safe_sections():
     state = {"round_number": 2, "phase": EVIDENCE_PHASE}
     topic = {"summary": "topic"}
     messages = [
@@ -817,10 +916,228 @@ def test_build_audience_summary_prompt_requires_per_agent_positions_first():
 
     prompt = build_audience_summary_prompt(state, topic, messages)
 
-    assert "AGENT POSITIONS:" in prompt
-    assert "SYNTHESIS:" in prompt
-    assert "OPEN QUESTIONS:" in prompt
+    assert "TRAJECTORY:" in prompt
+    assert "CONSENSUS:" in prompt
+    assert "BLOCKERS:" in prompt
+    assert "EVIDENCE GAPS:" in prompt
+    assert "AGENT DELTAS:" in prompt
     assert "dreamer, scientist, writer" in prompt
+    assert "Librarian rulings" in prompt or "Librarian" in prompt
+    assert "Prefix each line with `[Central]` or `[Peripheral]`" in prompt
+    assert "Do not state whether the subtopic is ready to close." in prompt
+
+
+def test_has_required_summary_sections_requires_standalone_section_lines():
+    malformed = (
+        "This summary mentions TRAJECTORY: and CONSENSUS: in prose.\n"
+        "It also references BLOCKERS: and EVIDENCE GAPS: casually.\n"
+        "Finally it name-drops AGENT DELTAS: without using real sections."
+    )
+    valid = (
+        "TRAJECTORY:\nStable this round.\n"
+        "CONSENSUS:\nSingle-call stays default.\n"
+        "BLOCKERS:\nNeed direct benchmark evidence.\n"
+        "EVIDENCE GAPS:\n[Central] Missing controlled benchmark.\n"
+        "AGENT DELTAS:\n- critic: pressed on evidence.\n"
+    )
+
+    assert _has_required_summary_sections(malformed) is False
+    assert _has_required_summary_sections(valid) is True
+
+
+def test_build_termination_question_requires_unresolved_pattern_checks():
+    prompt = _build_termination_question("EARLY STAGE. The burden of proof is on continuing.")
+
+    assert "Decide whether this subtopic should CONTINUE or CLOSE." in prompt
+    assert "`main_branch`" in prompt
+    assert "`centrality`" in prompt
+    assert "`recent_shift`" in prompt
+    assert "`conditional_support`" in prompt
+    assert "`untested_novelty`" in prompt
+    assert '"vote":"continue|close"' in prompt
+
+
+def test_normalize_termination_vote_contract_accepts_aliases():
+    parsed = _normalize_termination_vote_contract(
+        '{"main_branch":"router circularity","centrality":"central","recent_shift":"no","conditional_support":"false","untested_novelty":"no","vote":"no","override_reason":null}'
+    )
+
+    assert parsed["parsed_ok"] is True
+    assert parsed["vote"] == "continue"
+    assert parsed["main_branch"] == "router circularity"
+    assert parsed["central_blocker"] is True
+    assert parsed["support_blocker"] is False
+
+
+def test_normalize_termination_vote_contract_requires_override_to_close_through_blocker():
+    parsed = _normalize_termination_vote_contract(
+        '{"main_branch":"empirical gap","centrality":"central","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+    )
+
+    assert parsed["parsed_ok"] is False
+    assert parsed["invalid_reason"] == "missing_override_reason"
+
+
+@pytest.mark.asyncio
+async def test_run_termination_votes_repairs_invalid_schema_once():
+    fake_agent = SimpleNamespace(
+        spec=SimpleNamespace(role_prompt="Role prompt"),
+        governance_vote=AsyncMock(
+            return_value='{"main_branch":"empirical gap","centrality":"central","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+        ),
+    )
+
+    with patch("grox_chat.server.get_agent", return_value=fake_agent):
+        with patch(
+            "grox_chat.server.query_minimax",
+            new=AsyncMock(
+                return_value=(
+                    '{"main_branch":"empirical gap","centrality":"central","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"continue","override_reason":null}',
+                    [],
+                )
+            ),
+        ) as repair_call:
+            vote_records = await _run_termination_votes(voters=["critic"], prompt="close or continue?")
+
+    assert len(vote_records) == 1
+    assert vote_records[0]["repair_used"] is True
+    assert vote_records[0]["parsed"]["parsed_ok"] is True
+    assert vote_records[0]["parsed"]["vote"] == "continue"
+    repair_call.assert_awaited_once()
+
+
+def test_aggregate_termination_votes_round_three_blocks_on_single_central_vote():
+    vote_records = [
+        {
+            "voter": "critic",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"empirical gap","centrality":"central","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"continue","override_reason":null}'
+            ),
+        },
+        {
+            "voter": "engineer",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"none","centrality":"none","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+    ]
+
+    aggregated = _aggregate_termination_votes(vote_records, 3)
+
+    assert aggregated["subtopic_exhausted"] is False
+    assert "central_blocker" in aggregated["blocked_by"]
+
+
+def test_aggregate_termination_votes_counts_blockers_from_invalid_close_votes():
+    vote_records = [
+        {
+            "voter": "critic",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"empirical gap","centrality":"central","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+        {
+            "voter": "engineer",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"none","centrality":"none","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+    ]
+
+    aggregated = _aggregate_termination_votes(vote_records, 3)
+
+    assert aggregated["subtopic_exhausted"] is False
+    assert aggregated["invalid_votes"] == 1
+    assert aggregated["blocker_counts"]["central_blocker"] == 1
+    assert "central_blocker" in aggregated["blocked_by"]
+
+
+def test_aggregate_termination_votes_round_five_needs_two_blockers_to_stop_close():
+    vote_records = [
+        {
+            "voter": "critic",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"soft facts","centrality":"peripheral","recent_shift":"no","conditional_support":"yes","untested_novelty":"no","vote":"continue","override_reason":null}'
+            ),
+        },
+        {
+            "voter": "engineer",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"none","centrality":"none","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+        {
+            "voter": "scientist",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"none","centrality":"none","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+    ]
+
+    aggregated = _aggregate_termination_votes(vote_records, 5)
+
+    assert aggregated["subtopic_exhausted"] is True
+    assert aggregated["blocked_by"] == []
+
+
+def test_aggregate_termination_votes_round_eight_blocks_on_three_support_flags():
+    vote_records = [
+        {
+            "voter": voter,
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"soft support","centrality":"peripheral","recent_shift":"no","conditional_support":"yes","untested_novelty":"no","vote":"continue","override_reason":null}'
+            ),
+        }
+        for voter in ("critic", "scientist", "analyst")
+    ] + [
+        {
+            "voter": "engineer",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"none","centrality":"none","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+        {
+            "voter": "dreamer",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"none","centrality":"none","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+        {
+            "voter": "cat",
+            "raw_response": "{}",
+            "parsed": _normalize_termination_vote_contract(
+                '{"main_branch":"none","centrality":"none","recent_shift":"no","conditional_support":"no","untested_novelty":"no","vote":"close","override_reason":null}'
+            ),
+        },
+    ]
+
+    aggregated = _aggregate_termination_votes(vote_records, 8)
+
+    assert aggregated["subtopic_exhausted"] is False
+    assert "support_blocker" in aggregated["blocked_by"]
+
+
+def test_aggregate_termination_votes_degrades_open_on_too_many_invalid_votes():
+    vote_records = [
+        {"voter": "critic", "raw_response": "oops", "parsed": _normalize_termination_vote_contract("oops")},
+        {"voter": "scientist", "raw_response": "oops", "parsed": _normalize_termination_vote_contract("oops")},
+        {"voter": "engineer", "raw_response": "oops", "parsed": _normalize_termination_vote_contract("oops")},
+    ]
+
+    aggregated = _aggregate_termination_votes(vote_records, 4)
+
+    assert aggregated["subtopic_exhausted"] is False
+    assert aggregated["blocked_by"] == ["invalid_votes"]
 
 
 @pytest.mark.asyncio
@@ -845,7 +1162,11 @@ async def test_audience_summary_node_uses_degraded_summary_when_all_model_fallba
 
     assert result["latest_summary_msg_id"] == 77
     stored_summary = post_message.call_args.args[3]
-    assert "AGENT POSITIONS:" in stored_summary
+    assert "TRAJECTORY:" in stored_summary
+    assert "CONSENSUS:" in stored_summary
+    assert "BLOCKERS:" in stored_summary
+    assert "EVIDENCE GAPS:" in stored_summary
+    assert "AGENT DELTAS:" in stored_summary
     assert "dreamer" in stored_summary
     assert "scientist" in stored_summary
 

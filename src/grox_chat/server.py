@@ -645,6 +645,56 @@ def _build_termination_vote_repair_prompt(*, original_prompt: str, invalid_text:
     )
 
 
+
+async def _repair_summary_by_decomposition(flawed_content: str, provider: str = "minimax") -> str:
+    logger.warning("[skynet] Summary missing headers. Initiating decomposition repair...")
+    
+    async def extract_section(header: str) -> str:
+        prompt = (
+            f"Here is a raw, unformatted summary of a debate. Your task is to extract ONLY the information "
+            f"pertaining to the section '{header}'.\n"
+            f"Re-write it so your output starts EXACTLY with '{header}'.\n"
+            f"If the information is completely missing from the text, output exactly '{header}\nUnknown.'\n\n"
+            f"Raw summary:\n{flawed_content}"
+        )
+        
+        for attempt in range(2):
+            try:
+                resp = await call_text(
+                    prompt,
+                    provider=provider,
+                    strategy="direct",
+                    allow_web=False,
+                    system_instruction="You are a strict text formatting assistant. Extract only what is requested. Output plain text, absolutely no markdown fences like ``` or ```json.",
+                    model="MiniMax-M2.5" if provider == "minimax" else "gemini-3.0-flash",
+                    fallback_role="skynet",
+                    require_json=False,
+                )
+                if not resp:
+                    continue
+                    
+                # Strip any markdown fences just in case
+                resp = re.sub(r"^```[a-zA-Z]*\n|```$", "", resp.strip(), flags=re.MULTILINE).strip()
+                
+                # Check if it properly starts with the required header
+                if not resp.startswith(header):
+                    # Force the prefix if it generated useful content but forgot the header
+                    if len(resp) > 20:
+                        return f"{header}\n{resp}"
+                    continue # Try again if it's completely malformed
+                    
+                return resp
+            except Exception as e:
+                logger.warning(f"[skynet] Attempt {attempt+1} failed to extract {header}: {e}")
+                
+        # Ultimate fallback if both attempts fail or return garbage
+        return f"{header}\nUnknown."
+
+    tasks = [extract_section(header) for header in SUMMARY_SECTION_HEADERS]
+    results = await asyncio.gather(*tasks)
+    return "\n\n".join(results)
+
+
 def _has_required_summary_sections(content: str) -> bool:
     line_cursor = -1
     lines = (content or "").splitlines()
@@ -2569,8 +2619,12 @@ async def audience_summary_node(state: ChatState) -> dict:
     parsed = _normalize_message_contract(resp_text, accepted_actions=("post_summary", "post_message"))
     content = parsed["content"]
     if not _has_required_summary_sections(content):
-        logger.warning("[skynet] Summary missing required sections; using degraded fallback.")
-        content = _build_degraded_audience_summary(state, messages)
+        # Attempt to repair the malformed summary using decomposition
+        content = await _repair_summary_by_decomposition(content)
+        # Final sanity check: if the repair also fails to produce the headers, then degrade.
+        if not _has_required_summary_sections(content):
+            logger.warning("[skynet] Decomposition repair failed to produce required sections; using degraded fallback.")
+            content = _build_degraded_audience_summary(state, messages)
     
     # Embed the summary for future cyclicality detection
     emb = await aget_embedding(content)

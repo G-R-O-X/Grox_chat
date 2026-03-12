@@ -60,19 +60,19 @@ flowchart TD
 - `engineer`（工程师）
 - `analyst`（数据分析师）
 - `critic`（批评家）
-- `contrarian`（抬杠者）
+- `contrarian`（少数派）
 
 特殊角色：
 
-- `dog`（看门狗）
+- `dog`（狗）
 - `cat`（猫）
-- `tron`（创/风纪委员）
-- `spectator`（旁观者）
+- `tron`（创）
+- `spectator`（观众）
 
 被动 NPC：
 
-- `writer`（记录员）
-- 隐藏的 `fact proposer`（书记员/事实提案者）
+- `writer`（作家）
+- 隐藏的 `fact proposer`（书记员）
 - `librarian`（图书管理员）
 
 硬规则：

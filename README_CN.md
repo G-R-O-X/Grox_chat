@@ -51,29 +51,29 @@ flowchart TD
 
 治理角色：
 
-- `skynet`
+- `skynet`（天网）
 
 普通讨论者：
 
-- `dreamer`
-- `scientist`
-- `engineer`
-- `analyst`
-- `critic`
-- `contrarian`
+- `dreamer`（空想家）
+- `scientist`（科学家）
+- `engineer`（工程师）
+- `analyst`（数据分析师）
+- `critic`（批评家）
+- `contrarian`（抬杠者）
 
 特殊角色：
 
-- `dog`
-- `cat`
-- `tron`
-- `spectator`
+- `dog`（看门狗）
+- `cat`（猫）
+- `tron`（创/风纪委员）
+- `spectator`（旁观者）
 
 被动 NPC：
 
-- `writer`
-- 隐藏 `fact proposer`
-- `librarian`
+- `writer`（记录员）
+- 隐藏的 `fact proposer`（书记员/事实提案者）
+- `librarian`（图书管理员）
 
 硬规则：
 

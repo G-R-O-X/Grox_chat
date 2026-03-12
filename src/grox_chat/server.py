@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 from langgraph.graph import END, START, StateGraph
 
@@ -13,16 +13,24 @@ from .agents import (
     DELIBERATORS,
     SKYNET,
     SPECTATOR,
-    VOTING_PARTICIPANTS,
     can_special_target,
     get_agent,
     get_agent_spec,
     ordinary_deliberators,
+    special_agents,
     voting_agents,
 )
-from .broker import call_text, shutdown_broker
+from .broker import (
+    SearchEvidenceItem,
+    call_text,
+    call_text_with_search_evidence,
+    collect_search_evidence_bundle,
+    is_gemini_enabled,
+    shutdown_broker,
+)
 from .rag import assemble_rag_context, build_query_rag_context
 from .external.gemini_cli_client import warmup_gemini_cli
+from .logging_utils import configure_logging
 from .prompts import PROMPTS
 from .writer_processor import process_writer_output
 from .librarian_processor import (
@@ -40,6 +48,8 @@ DEGRADED_OPERATION_CONFIDENCE = 3.0
 LOOP_WARNING_DISTANCE = 0.25
 WRITER_FACT_LIMIT = 2
 FINAL_WRITER_FACT_LIMIT = 3
+BOOTSTRAP_FACT_DIRECTION_LIMIT = 3
+INLINE_FACT_LIMIT = 1
 
 OPENING_PHASE = "opening"
 EVIDENCE_PHASE = "evidence"
@@ -163,6 +173,17 @@ def _normalize_fact_proposal_contract(raw_text: str) -> dict:
         "parsed_ok": False,
         "facts": [],
     }
+
+
+def _normalize_fact_direction_contract(raw_text: str) -> dict:
+    parsed = _parse_single_json_wrapper(raw_text) or extract_json(raw_text)
+    if isinstance(parsed, dict):
+        action = parsed.get("action")
+        raw_directions = parsed.get("directions")
+        if action == "propose_fact_directions" and isinstance(raw_directions, list):
+            directions = [direction.strip() for direction in raw_directions if isinstance(direction, str) and direction.strip()]
+            return {"parsed_ok": True, "directions": directions}
+    return {"parsed_ok": False, "directions": []}
 
 
 def _normalize_focus_contract(raw_text: str) -> dict:
@@ -618,23 +639,43 @@ def build_fact_proposer_prompt(
     messages: list[dict],
     rag_context: str,
     max_facts: int,
+    fact_stage: str = "synthesized",
+    focus_label: str | None = None,
 ) -> str:
     prompt = (
         f"Round: {state.get('round_number', 1)}\n"
         f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
         f"Topic: {topic['summary']}\n"
     )
+    if focus_label:
+        prompt += f"Fact Stage: {fact_stage}\nFocus: {focus_label}\n"
     if rag_context:
         prompt += f"{rag_context}\n"
     prompt += "=== RECENT DEBATE ===\n"
     for message in messages:
         prompt += f"{_format_message_for_prompt(message)}\n"
+    if fact_stage == "bootstrap":
+        prompt += (
+            "\nTASK: From this single bootstrap fact direction and its web evidence, propose externally verifiable baseline facts. "
+            f"Return at most {max_facts} candidate facts. "
+            "Only include data-like, factual, reusable claims grounded in the cited search evidence. "
+            "Do not include broad conclusions, opinions, or synthesis."
+        )
+    elif fact_stage == "inline":
+        prompt += (
+            "\nTASK: From this turn's web evidence, propose at most one immediately reusable hard fact for shared memory. "
+            "Prefer a fact that later speakers could reuse instead of repeating the same search. "
+            "Do not include opinions, interpretations, or broad summaries."
+        )
+    else:
+        prompt += (
+            "\nTASK: Propose candidate synthesized facts for long-term memory using local context plus web research when relevant. "
+            f"Return at most {max_facts} candidate facts. "
+            "Only include specific, reusable, evidence-worthy claims or cautious working conclusions. "
+            "Do not include opinions or broad narrative summaries."
+        )
     prompt += (
-        "\nTASK: Propose candidate facts for long-term memory using local context plus web research. "
-        f"Return at most {max_facts} candidate facts. "
-        "Only include specific, reusable, evidence-worthy factual claims. "
-        "Do not include opinions, interpretations, or broad summaries. "
-        "Reply with JSON using this schema: "
+        " Reply with JSON using this schema: "
         "{\"action\": \"propose_facts\", \"facts\": [\"candidate fact 1\", \"candidate fact 2\"]}. "
         "Use an empty facts array when nothing should be proposed."
     )
@@ -649,6 +690,7 @@ def build_librarian_prompt(
     messages: list[dict],
     rag_context: str,
 ) -> str:
+    fact_stage = candidate.get("fact_stage", "synthesized")
     prompt = (
         f"Round: {state.get('round_number', 1)}\n"
         f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
@@ -659,21 +701,76 @@ def build_librarian_prompt(
     prompt += (
         f"Candidate ID: {candidate['id']}\n"
         f"Candidate Fact: {candidate['candidate_text']}\n"
+        f"Fact Stage: {fact_stage}\n"
     )
+    if candidate.get("evidence_note"):
+        prompt += f"Evidence Note:\n{candidate['evidence_note']}\n"
     if rag_context:
         prompt += f"{rag_context}\n"
     prompt += "=== RECENT TRANSCRIPT ===\n"
     for message in messages:
         prompt += f"{_format_message_for_prompt(message)}\n"
+    if fact_stage in {"bootstrap", "inline"}:
+        prompt += (
+            "\nTASK: Verify whether this candidate fact should enter permanent memory as an externally checkable factual claim. "
+            "For bootstrap and inline facts, be strict: prefer concrete, externally verifiable claims grounded in the current web evidence. "
+            "Reject weak, interpretive, or overstated wording aggressively."
+        )
+    else:
+        prompt += (
+            "\nTASK: Verify whether this candidate fact should enter permanent memory as a synthesized working conclusion. "
+            "For synthesized facts, cautious consolidation is allowed, but the wording must stay conservative and evidence-grounded."
+        )
     prompt += (
-        "\nTASK: Verify whether this candidate fact should enter permanent memory. "
-        "You MUST rely on both the local context above and web-grounded verification. "
+        " You MUST rely on both the local context above and web-grounded verification. "
         "Decision rules: accept if the claim is specific and supported; soften if the core idea is supportable but the wording is too broad, too absolute, or too strong; reject if unsupported, speculative, or merely interpretive. "
         "Absolute formulations such as `no evidence`, `always`, `never`, `proves`, or `definitively` must be softened or rejected unless the evidence explicitly supports them. "
         "Reply with STRICT JSON using this schema: "
         "{\"action\": \"review_fact\", \"decision\": \"accept|soften|reject\", \"reviewed_text\": \"...\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"confidence_score\": 8}."
     )
     return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
+
+
+def build_bootstrap_fact_direction_prompt(topic: dict, subtopic: dict) -> str:
+    prompt = (
+        f"Topic: {topic['summary']}\n"
+        f"Subtopic: {subtopic['summary']}\n"
+        f"Subtopic Detail: {subtopic.get('detail', '')}\n"
+        "TASK: Propose up to 3 fact directions that are worth checking before round 1 starts. "
+        "These should be baseline external facts or data points that would reduce early hallucination and improve the quality of the first discussion round. "
+        "Prefer directions that can be checked on reputable sources and reused later in the subtopic. "
+        "Reply with JSON using this schema: "
+        "{\"action\":\"propose_fact_directions\",\"directions\":[\"direction 1\",\"direction 2\",\"direction 3\"]}."
+    )
+    return f"{PROMPTS['skynet']}\n\nContext:\n{prompt}"
+
+
+def _render_search_evidence_note(search_evidence: Sequence[SearchEvidenceItem]) -> str:
+    lines: list[str] = []
+    for item in search_evidence:
+        status = "error" if item.had_error else "ok"
+        snippet = item.rendered_results.strip().replace("\n", " ")[:240]
+        lines.append(f"query={item.query} status={status} evidence={snippet}")
+    return "\n".join(lines)
+
+
+def _render_search_evidence_context(search_evidence: Sequence[SearchEvidenceItem]) -> str:
+    chunks: list[str] = []
+    for item in search_evidence:
+        if item.had_error:
+            continue
+        rendered = (item.rendered_results or "").strip()
+        if not rendered:
+            continue
+        without_header = rendered.replace("=== WEB SEARCH RESULTS ===", "", 1).strip()
+        if not without_header or without_header == "No useful results found.":
+            continue
+        chunks.append(f"=== SEARCH EVIDENCE: {item.query} ===\n{rendered}")
+    return "\n\n".join(chunks)
+
+
+def _has_usable_search_evidence(search_evidence: Sequence[SearchEvidenceItem]) -> bool:
+    return bool(_render_search_evidence_context(search_evidence))
 
 
 def build_audience_summary_prompt(state: ChatState, topic: dict, messages: list[dict]) -> str:
@@ -822,7 +919,14 @@ async def _run_fact_proposer_pass(state: ChatState, force: bool = False) -> dict
         "writer",
     )
     max_facts = FINAL_WRITER_FACT_LIMIT if force else WRITER_FACT_LIMIT
-    prompt = build_fact_proposer_prompt(state, topic, standard_messages, rag_context, max_facts=max_facts)
+    prompt = build_fact_proposer_prompt(
+        state,
+        topic,
+        standard_messages,
+        rag_context,
+        max_facts=max_facts,
+        fact_stage="synthesized",
+    )
     try:
         resp_text = await call_text(
             prompt,
@@ -854,6 +958,7 @@ async def _run_fact_proposer_pass(state: ChatState, force: bool = False) -> dict
         None,
         "",
         structured_facts=parsed["facts"],
+        fact_stage="synthesized",
         max_candidates=max_facts,
     )
     marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
@@ -888,13 +993,21 @@ async def _query_librarian_review_text(prompt: str) -> tuple[str, str]:
     return resp_text, "gemini"
 
 
-async def _run_librarian_pass(state: ChatState) -> dict:
+async def _run_librarian_pass(
+    state: ChatState,
+    *,
+    candidate_ids: Optional[Sequence[int]] = None,
+    emit_audit_message: bool = True,
+) -> dict:
     logger.info("[librarian] Reviewing pending fact candidates...")
     topic, subtopic = _load_context_entities(state)
     if not topic or not subtopic:
         return {}
 
     pending_candidates = api.get_pending_fact_candidates(state["topic_id"], state["subtopic_id"])
+    if candidate_ids is not None:
+        allowed_ids = set(candidate_ids)
+        pending_candidates = [candidate for candidate in pending_candidates if candidate["id"] in allowed_ids]
     if not pending_candidates:
         return {}
 
@@ -942,7 +1055,7 @@ async def _run_librarian_pass(state: ChatState) -> dict:
                 exc,
             )
 
-    if not review_results:
+    if not review_results or not emit_audit_message:
         return {}
 
     audit_message = build_librarian_audit_message(review_results)
@@ -955,6 +1068,183 @@ async def _run_librarian_pass(state: ChatState) -> dict:
         turn_kind=LIBRARIAN_AUDIT_TURN,
     )
     return {}
+
+
+async def bootstrap_fact_intake_node(state: ChatState) -> dict:
+    logger.info("[skynet] Bootstrapping baseline facts for the subtopic...")
+    topic, subtopic = _load_context_entities(state)
+    if not topic or not subtopic:
+        return {}
+
+    direction_prompt = build_bootstrap_fact_direction_prompt(topic, subtopic)
+    try:
+        direction_text = await call_text(
+            direction_prompt,
+            provider="gemini",
+            strategy="direct",
+            allow_web=False,
+            system_instruction=PROMPTS["skynet"],
+            model="gemini-3.0-flash",
+            fallback_role=SKYNET,
+        )
+    except Exception as exc:
+        logger.warning("[skynet] Bootstrap fact direction generation failed: %s", exc)
+        return {}
+
+    parsed_directions = _normalize_fact_direction_contract(direction_text)
+    if not parsed_directions["parsed_ok"]:
+        logger.warning("[skynet] Bootstrap fact directions were not parseable; skipping bootstrap fact intake.")
+        return {}
+
+    created_candidate_ids: list[int] = []
+    for direction in parsed_directions["directions"][:BOOTSTRAP_FACT_DIRECTION_LIMIT]:
+        try:
+            evidence_response = await collect_search_evidence_bundle(
+                "fact_proposer",
+                f"Gather evidence for this bootstrap fact direction:\n{direction}",
+                max_iter=1,
+                system_prompt=PROMPTS["fact_proposer"],
+            )
+        except Exception as exc:
+            logger.warning("[skynet] Bootstrap search failed for direction '%s': %s", direction, exc)
+            continue
+
+        if not _has_usable_search_evidence(evidence_response.search_evidence):
+            continue
+
+        evidence_note = _render_search_evidence_note(evidence_response.search_evidence)
+        synthetic_messages = [
+            {
+                "sender": SKYNET,
+                "content": f"Bootstrap fact direction: {direction}\n\n{evidence_note}",
+                "msg_type": "standard",
+            }
+        ]
+        try:
+            rag_context, _ = await build_query_rag_context(
+                state["topic_id"],
+                direction,
+            )
+        except Exception as exc:
+            logger.warning("[skynet] Bootstrap RAG context failed for direction '%s': %s", direction, exc)
+            rag_context = ""
+
+        proposer_prompt = build_fact_proposer_prompt(
+            state,
+            topic,
+            synthetic_messages,
+            rag_context,
+            max_facts=1,
+            fact_stage="bootstrap",
+            focus_label=direction,
+        )
+        try:
+            proposer_text = await call_text(
+                proposer_prompt,
+                provider="minimax",
+                strategy="direct",
+                allow_web=False,
+                system_instruction=PROMPTS["fact_proposer"],
+                fallback_role="fact_proposer",
+            )
+        except Exception as exc:
+            logger.warning("[fact_proposer] Bootstrap fact proposal failed for '%s': %s", direction, exc)
+            continue
+
+        parsed = _normalize_fact_proposal_contract(proposer_text)
+        if not parsed["parsed_ok"]:
+            continue
+
+        candidate_ids = await process_writer_output(
+            state["topic_id"],
+            state["subtopic_id"],
+            None,
+            "",
+            structured_facts=parsed["facts"],
+            fact_stage="bootstrap",
+            evidence_note=evidence_note,
+            max_candidates=1,
+        )
+        created_candidate_ids.extend(candidate_ids)
+
+    if created_candidate_ids:
+        await _run_librarian_pass(
+            state,
+            candidate_ids=created_candidate_ids,
+            emit_audit_message=False,
+        )
+    return {}
+
+
+async def _run_inline_fact_intake(
+    state: ChatState,
+    *,
+    actor: str,
+    topic: dict,
+    subtopic: dict | None,
+    rag_context: str,
+    search_evidence: Sequence[SearchEvidenceItem],
+) -> None:
+    if actor == SPECTATOR:
+        return
+    if actor not in DELIBERATORS and actor not in special_agents():
+        return
+    if not _has_usable_search_evidence(search_evidence):
+        return
+
+    messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=8)
+    evidence_context = _render_search_evidence_context(search_evidence)
+    if not evidence_context:
+        return
+    prompt_messages = messages + [
+        {
+            "sender": "web_search",
+            "content": evidence_context,
+            "msg_type": "standard",
+        }
+    ]
+    prompt = build_fact_proposer_prompt(
+        state,
+        topic,
+        prompt_messages,
+        rag_context,
+        max_facts=1,
+        fact_stage="inline",
+        focus_label=f"Turn actor: {actor}",
+    )
+    try:
+        proposer_text = await call_text(
+            prompt,
+            provider="minimax",
+            strategy="direct",
+            allow_web=False,
+            system_instruction=PROMPTS["fact_proposer"],
+            fallback_role="fact_proposer",
+        )
+    except Exception as exc:
+        logger.warning("[fact_proposer] Inline fact proposal failed for %s: %s", actor, exc)
+        return
+
+    parsed = _normalize_fact_proposal_contract(proposer_text)
+    if not parsed["parsed_ok"]:
+        return
+
+    candidate_ids = await process_writer_output(
+        state["topic_id"],
+        state["subtopic_id"],
+        None,
+        "",
+        structured_facts=parsed["facts"],
+        fact_stage="inline",
+        evidence_note=_render_search_evidence_note(search_evidence),
+        max_candidates=INLINE_FACT_LIMIT,
+    )
+    if candidate_ids:
+        await _run_librarian_pass(
+            state,
+            candidate_ids=candidate_ids,
+            emit_audit_message=False,
+        )
 
 async def expert_node(state: ChatState) -> dict:
     actor = state["current_actor"]
@@ -978,10 +1268,11 @@ async def expert_node(state: ChatState) -> dict:
 
     # Model call depending on role and phase
     search_failed = False
+    search_evidence: Sequence[SearchEvidenceItem] = ()
     if should_enable_web_search(state, actor, turn_kind):
         logger.info(f"[{actor}] Entering ReAct search loop...")
         try:
-            resp_text = await call_text(
+            response = await call_text_with_search_evidence(
                 prompt,
                 provider="minimax",
                 strategy="react",
@@ -989,6 +1280,9 @@ async def expert_node(state: ChatState) -> dict:
                 system_instruction=system_prompt,
                 fallback_role=actor,
             )
+            resp_text = response.text
+            search_evidence = response.search_evidence
+            search_failed = response.search_failed
         except Exception as exc:
             logger.warning("[%s] Web-enhanced broker call failed: %s", actor, exc)
             resp_text = str(exc)
@@ -1034,6 +1328,16 @@ async def expert_node(state: ChatState) -> dict:
         round_number=state.get("round_number", 1),
         turn_kind=turn_kind,
     )
+
+    if search_evidence:
+        await _run_inline_fact_intake(
+            state,
+            actor=actor,
+            topic=topic,
+            subtopic=subtopic,
+            rag_context=rag_context,
+            search_evidence=search_evidence,
+        )
 
     # Peanut gallery targeting logic
     _clear_consumed_extra_target(turn_kind, updates)
@@ -1278,6 +1582,7 @@ def build_graph():
     builder = StateGraph(ChatState)
     
     # 1. Main Expert Loop
+    builder.add_node("bootstrap_fact_intake_node", bootstrap_fact_intake_node)
     builder.add_node("dispatcher", dispatcher_node)
     
     for agent in AGENTS:
@@ -1328,7 +1633,8 @@ def build_graph():
     builder.add_edge("close_subtopic_node", END)
     
     # Entry point
-    builder.add_edge(START, "dispatcher")
+    builder.add_edge(START, "bootstrap_fact_intake_node")
+    builder.add_edge("bootstrap_fact_intake_node", "dispatcher")
     
     return builder.compile()
 
@@ -1364,11 +1670,14 @@ async def run_server_loop():
     db.init_db()
     from .master_graph import build_master_graph
 
-    try:
-        await asyncio.wait_for(warmup_gemini_cli(), timeout=45)
-        logger.info("[GeminiCLI] Warmup completed.")
-    except Exception as exc:
-        logger.warning("[GeminiCLI] Warmup failed; continuing with lazy fallback: %s", exc)
+    if is_gemini_enabled():
+        try:
+            await asyncio.wait_for(warmup_gemini_cli(), timeout=45)
+            logger.info("[GeminiCLI] Warmup completed.")
+        except Exception as exc:
+            logger.warning("[GeminiCLI] Warmup failed; continuing with lazy fallback: %s", exc)
+    else:
+        logger.info("[GeminiCLI] Warmup skipped because ENABLE_GEMINI is not enabled.")
 
     master_graph = build_master_graph()
     try:
@@ -1388,4 +1697,5 @@ async def run_server_loop():
         await shutdown_broker()
 
 if __name__ == "__main__":
+    configure_logging()
     asyncio.run(run_server_loop())

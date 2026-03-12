@@ -16,6 +16,7 @@ This repository is intentionally the **base chatroom**, not the conference-mode 
 - uses `Dog / Cat / Tron / Spectator` as non-debate intervention roles
 - separates critique, fact proposal, and fact admission
 - routes Gemini, MiniMax, and web-search calls through one in-process broker surface
+- documents every RAG section so `[F...]` (verified facts), `[C...]` (derived claims), `Summary`, `Message`, and `[W...]` (web evidence) carry their intended meaning, enforces citation IDs only when provided in the injected prompt, and caches `[W...]` rows for 30 days under a higher rerank threshold before they reach the clerk.
 
 ## Runtime Shape
 

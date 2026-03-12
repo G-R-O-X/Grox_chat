@@ -8,3 +8,11 @@ __pycache__/
 **/__pycache__/
 *.pyc
 .plan/
+THINKING.md
+logs/
+outputs/
+scripts/
+ROLES.md
+GEMINI.md
+DESIGN.md
+PLAN.md

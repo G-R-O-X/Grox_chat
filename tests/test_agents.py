@@ -10,6 +10,7 @@ from grox_chat.agents import (
     is_deliberator,
     is_npc,
     is_special,
+    parse_vote_payload,
     parse_vote_response,
     voting_agents,
 )
@@ -45,8 +46,26 @@ def test_special_roles_can_target_only_deliberators():
 @pytest.mark.asyncio
 async def test_spectator_vote_uses_strict_json_contract():
     spectator = get_agent(SPECTATOR)
-    with patch("grox_chat.agents.llm_call", new=AsyncMock(return_value=type("Result", (), {"text": '{"vote":"yes"}'})())):
+    with patch(
+        "grox_chat.agents.llm_call",
+        new=AsyncMock(return_value=type("Result", (), {"text": '{"vote":"yes","reason":"worth exploring"}'})()),
+    ):
         assert await spectator.vote("Vote on this.", allow_web=True) is True
+
+
+@pytest.mark.asyncio
+async def test_vote_retries_invalid_json_once_before_succeeding():
+    spectator = get_agent(SPECTATOR)
+    responses = [
+        type("Result", (), {"text": "not-json"})(),
+        type("Result", (), {"text": '{"vote":"yes","reason":"worth exploring"}'})(),
+    ]
+
+    with patch("grox_chat.agents.llm_call", new=AsyncMock(side_effect=responses)) as llm_call:
+        decision = await spectator.vote("Vote on this.")
+
+    assert decision is True
+    assert llm_call.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -56,13 +75,25 @@ async def test_vote_logs_full_raw_response(caplog):
     with caplog.at_level("INFO"):
         with patch(
             "grox_chat.agents.llm_call",
-            new=AsyncMock(return_value=type("Result", (), {"text": '{"vote":"no"}'})()),
+            new=AsyncMock(return_value=type("Result", (), {"text": '{"vote":"no","reason":"too redundant"}'})()),
         ):
             decision = await spectator.vote("Vote on this.")
 
     assert decision is False
-    assert 'raw_response={"vote":"no"}' in caplog.text
-    assert "parsed=False" in caplog.text
+    assert 'raw_response={"vote":"no","reason":"too redundant"}' in caplog.text
+    assert "parsed=True" in caplog.text
+    assert "decision=no" in caplog.text
+    assert "reason=too redundant" in caplog.text
+
+
+def test_parse_vote_payload_extracts_reason_when_present():
+    parsed = parse_vote_payload('{"vote":"yes","reason":"non-redundant axis"}')
+
+    assert parsed == {
+        "decision": True,
+        "decision_label": "yes",
+        "reason": "non-redundant axis",
+    }
 
 
 @pytest.mark.asyncio
@@ -101,6 +132,17 @@ async def test_spectator_turn_sets_next_round_focus_and_web_boost():
 
     assert updates["spectator_target"] == "scientist"
     assert updates["spectator_web_boost_target"] == "scientist"
+
+
+def test_spectator_never_uses_web_search_directly():
+    state = {
+        "phase": EVIDENCE_PHASE,
+        "round_number": 2,
+        "spectator_target": None,
+        "spectator_web_boost_target": None,
+    }
+
+    assert should_enable_web_search(state, SPECTATOR, BASE_TURN) is False
 
 
 @pytest.mark.asyncio

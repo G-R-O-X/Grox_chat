@@ -78,6 +78,26 @@ def _insert_message_fts(
     )
 
 
+def _insert_claim_fts(conn: sqlite3.Connection, claim_id: int, topic_id: int, content: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO claims_fts(rowid, content, topic_id) VALUES (?, ?, ?)",
+        (claim_id, content, str(topic_id)),
+    )
+
+
+def _insert_web_evidence_fts(
+    conn: sqlite3.Connection,
+    web_id: int,
+    origin_topic_id: int,
+    source_domain: str,
+    content: str,
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO web_evidence_fts(rowid, content, origin_topic_id, source_domain) VALUES (?, ?, ?, ?)",
+        (web_id, content, str(origin_topic_id), source_domain),
+    )
+
+
 def _backfill_fts(conn: sqlite3.Connection) -> None:
     fact_count = conn.execute("SELECT COUNT(*) FROM Fact").fetchone()[0]
     if fact_count:
@@ -107,6 +127,35 @@ def _backfill_fts(conn: sqlite3.Connection) -> None:
             conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
         except sqlite3.OperationalError as rebuild_exc:
             logger.warning("messages_fts rebuild fallback also failed; continuing without legacy backfill: %s", rebuild_exc)
+
+    claim_count = conn.execute("SELECT COUNT(*) FROM Claim").fetchone()[0]
+    if claim_count:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO claims_fts(rowid, content, topic_id)
+            SELECT Claim.id, Claim.content, CAST(Claim.topic_id AS TEXT)
+            FROM Claim
+            """
+        )
+
+    web_count = conn.execute("SELECT COUNT(*) FROM WebEvidence").fetchone()[0]
+    if web_count:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO web_evidence_fts(rowid, content, origin_topic_id, source_domain)
+            SELECT
+                WebEvidence.id,
+                TRIM(
+                    COALESCE(WebEvidence.title, '') || ' ' ||
+                    COALESCE(WebEvidence.snippet, '') || ' ' ||
+                    COALESCE(WebEvidence.query_text, '') || ' ' ||
+                    COALESCE(WebEvidence.source_domain, '')
+                ),
+                CAST(WebEvidence.origin_topic_id AS TEXT),
+                COALESCE(WebEvidence.source_domain, '')
+            FROM WebEvidence
+            """
+        )
 
 
 def _build_fts_query(query_text: str) -> Optional[str]:
@@ -169,11 +218,16 @@ def init_db():
                 writer_msg_id INTEGER,
                 candidate_text TEXT NOT NULL,
                 fact_stage TEXT NOT NULL DEFAULT 'synthesized',
+                candidate_type TEXT NOT NULL DEFAULT 'sourced_claim',
                 status TEXT NOT NULL DEFAULT 'pending',
                 reviewed_text TEXT,
                 review_note TEXT,
                 evidence_note TEXT,
+                source_refs_json TEXT,
+                source_excerpt TEXT,
+                verification_status TEXT,
                 confidence_score REAL,
+                round_number INTEGER,
                 reviewer TEXT,
                 accepted_fact_id INTEGER,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -187,16 +241,96 @@ def init_db():
             CREATE TABLE IF NOT EXISTS Fact (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_id INTEGER NOT NULL,
+                subtopic_id INTEGER,
                 content TEXT NOT NULL,
                 source TEXT NOT NULL,
                 fact_stage TEXT NOT NULL DEFAULT 'synthesized',
+                fact_type TEXT NOT NULL DEFAULT 'sourced_claim',
+                verification_status TEXT,
+                source_kind TEXT,
+                source_refs_json TEXT,
+                source_excerpt TEXT,
                 candidate_id INTEGER,
                 review_status TEXT,
                 evidence_note TEXT,
                 confidence_score REAL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(subtopic_id) REFERENCES Subtopic(id),
                 FOREIGN KEY(topic_id) REFERENCES Topic(id),
                 FOREIGN KEY(candidate_id) REFERENCES FactCandidate(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS ClaimCandidate (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER NOT NULL,
+                subtopic_id INTEGER,
+                clerk_msg_id INTEGER,
+                candidate_text TEXT NOT NULL,
+                support_fact_ids_json TEXT,
+                rationale_short TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                review_note TEXT,
+                reviewed_text TEXT,
+                claim_score REAL,
+                accepted_claim_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at DATETIME,
+                FOREIGN KEY(topic_id) REFERENCES Topic(id),
+                FOREIGN KEY(subtopic_id) REFERENCES Subtopic(id),
+                FOREIGN KEY(clerk_msg_id) REFERENCES Message(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS Claim (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER NOT NULL,
+                subtopic_id INTEGER,
+                content TEXT NOT NULL,
+                support_fact_ids_json TEXT,
+                rationale_short TEXT,
+                claim_score REAL,
+                status TEXT NOT NULL DEFAULT 'active',
+                candidate_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(topic_id) REFERENCES Topic(id),
+                FOREIGN KEY(subtopic_id) REFERENCES Subtopic(id),
+                FOREIGN KEY(candidate_id) REFERENCES ClaimCandidate(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS WebEvidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                origin_topic_id INTEGER NOT NULL,
+                origin_subtopic_id INTEGER,
+                query_text TEXT NOT NULL,
+                title TEXT,
+                snippet TEXT,
+                url TEXT,
+                source_domain TEXT,
+                result_rank INTEGER,
+                search_provider TEXT,
+                search_role TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(origin_topic_id) REFERENCES Topic(id),
+                FOREIGN KEY(origin_subtopic_id) REFERENCES Subtopic(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS VoteRecord (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER NOT NULL,
+                subtopic_id INTEGER,
+                round_number INTEGER,
+                vote_kind TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                prompt_text TEXT NOT NULL,
+                voter TEXT NOT NULL,
+                parsed_ok INTEGER NOT NULL DEFAULT 0,
+                decision TEXT,
+                reason TEXT,
+                raw_response TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(topic_id) REFERENCES Topic(id),
+                FOREIGN KEY(subtopic_id) REFERENCES Subtopic(id)
             );
             
             -- Virtual table for storing embeddings of Facts using sqlite-vec
@@ -223,6 +357,17 @@ def init_db():
                 msg_type UNINDEXED,
                 sender UNINDEXED
             );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS claims_fts USING fts5(
+                content,
+                topic_id UNINDEXED
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS web_evidence_fts USING fts5(
+                content,
+                origin_topic_id UNINDEXED,
+                source_domain UNINDEXED
+            );
         """)
         _ensure_column(conn, "Plan", "current_index", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "Subtopic", "start_msg_id", "INTEGER")
@@ -232,19 +377,36 @@ def init_db():
         _ensure_column(conn, "Message", "round_number", "INTEGER")
         _ensure_column(conn, "Message", "turn_kind", "TEXT")
         _ensure_column(conn, "Fact", "candidate_id", "INTEGER")
+        _ensure_column(conn, "Fact", "subtopic_id", "INTEGER")
         _ensure_column(conn, "Fact", "fact_stage", "TEXT NOT NULL DEFAULT 'synthesized'")
+        _ensure_column(conn, "Fact", "fact_type", "TEXT NOT NULL DEFAULT 'sourced_claim'")
+        _ensure_column(conn, "Fact", "verification_status", "TEXT")
+        _ensure_column(conn, "Fact", "source_kind", "TEXT")
+        _ensure_column(conn, "Fact", "source_refs_json", "TEXT")
+        _ensure_column(conn, "Fact", "source_excerpt", "TEXT")
         _ensure_column(conn, "Fact", "review_status", "TEXT")
         _ensure_column(conn, "Fact", "evidence_note", "TEXT")
         _ensure_column(conn, "Fact", "confidence_score", "REAL")
         _ensure_column(conn, "FactCandidate", "fact_stage", "TEXT NOT NULL DEFAULT 'synthesized'")
+        _ensure_column(conn, "FactCandidate", "candidate_type", "TEXT NOT NULL DEFAULT 'sourced_claim'")
+        _ensure_column(conn, "FactCandidate", "source_refs_json", "TEXT")
+        _ensure_column(conn, "FactCandidate", "source_excerpt", "TEXT")
+        _ensure_column(conn, "FactCandidate", "verification_status", "TEXT")
+        _ensure_column(conn, "FactCandidate", "round_number", "INTEGER")
         _backfill_fts(conn)
 
 def _insert_fact_row(
     conn: sqlite3.Connection,
     topic_id: int,
+    subtopic_id: Optional[int],
     content: str,
     source: str,
     fact_stage: str = "synthesized",
+    fact_type: str = "sourced_claim",
+    verification_status: Optional[str] = None,
+    source_kind: Optional[str] = None,
+    source_refs_json: Optional[str] = None,
+    source_excerpt: Optional[str] = None,
     candidate_id: Optional[int] = None,
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
@@ -252,10 +414,40 @@ def _insert_fact_row(
 ) -> int:
     cursor = conn.execute(
         """
-        INSERT INTO Fact (topic_id, content, source, fact_stage, candidate_id, review_status, evidence_note, confidence_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO Fact (
+            topic_id,
+            subtopic_id,
+            content,
+            source,
+            fact_stage,
+            fact_type,
+            verification_status,
+            source_kind,
+            source_refs_json,
+            source_excerpt,
+            candidate_id,
+            review_status,
+            evidence_note,
+            confidence_score
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (topic_id, content, source, fact_stage, candidate_id, review_status, evidence_note, confidence_score),
+        (
+            topic_id,
+            subtopic_id,
+            content,
+            source,
+            fact_stage,
+            fact_type,
+            verification_status,
+            source_kind,
+            source_refs_json,
+            source_excerpt,
+            candidate_id,
+            review_status,
+            evidence_note,
+            confidence_score,
+        ),
     )
     fact_id = cursor.lastrowid
     _insert_fact_fts(conn, fact_id, topic_id, content, source)
@@ -266,7 +458,13 @@ def insert_fact(
     topic_id: int,
     content: str,
     source: str,
+    subtopic_id: Optional[int] = None,
     fact_stage: str = "synthesized",
+    fact_type: str = "sourced_claim",
+    verification_status: Optional[str] = None,
+    source_kind: Optional[str] = None,
+    source_refs_json: Optional[str] = None,
+    source_excerpt: Optional[str] = None,
     candidate_id: Optional[int] = None,
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
@@ -276,9 +474,15 @@ def insert_fact(
         return _insert_fact_row(
             conn,
             topic_id,
+            subtopic_id,
             content,
             source,
             fact_stage=fact_stage,
+            fact_type=fact_type,
+            verification_status=verification_status,
+            source_kind=source_kind,
+            source_refs_json=source_refs_json,
+            source_excerpt=source_excerpt,
             candidate_id=candidate_id,
             review_status=review_status,
             evidence_note=evidence_note,
@@ -291,7 +495,13 @@ def insert_fact_with_embedding(
     content: str,
     source: str,
     embedding: List[float],
+    subtopic_id: Optional[int] = None,
     fact_stage: str = "synthesized",
+    fact_type: str = "sourced_claim",
+    verification_status: Optional[str] = None,
+    source_kind: Optional[str] = None,
+    source_refs_json: Optional[str] = None,
+    source_excerpt: Optional[str] = None,
     candidate_id: Optional[int] = None,
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
@@ -302,9 +512,15 @@ def insert_fact_with_embedding(
         fact_id = _insert_fact_row(
             conn,
             topic_id,
+            subtopic_id,
             content,
             source,
             fact_stage=fact_stage,
+            fact_type=fact_type,
+            verification_status=verification_status,
+            source_kind=source_kind,
+            source_refs_json=source_refs_json,
+            source_excerpt=source_excerpt,
             candidate_id=candidate_id,
             review_status=review_status,
             evidence_note=evidence_note,
@@ -322,15 +538,70 @@ def create_fact_candidate(
     writer_msg_id: Optional[int],
     candidate_text: str,
     fact_stage: str = "synthesized",
+    candidate_type: str = "sourced_claim",
     evidence_note: Optional[str] = None,
+    source_refs_json: Optional[str] = None,
+    source_excerpt: Optional[str] = None,
+    verification_status: Optional[str] = None,
+    round_number: Optional[int] = None,
 ) -> int:
     with get_db() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO FactCandidate (topic_id, subtopic_id, writer_msg_id, candidate_text, fact_stage, evidence_note)
+            INSERT INTO FactCandidate (
+                topic_id,
+                subtopic_id,
+                writer_msg_id,
+                candidate_text,
+                fact_stage,
+                candidate_type,
+                evidence_note,
+                source_refs_json,
+                source_excerpt,
+                verification_status,
+                round_number
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                topic_id,
+                subtopic_id,
+                writer_msg_id,
+                candidate_text,
+                fact_stage,
+                candidate_type,
+                evidence_note,
+                source_refs_json,
+                source_excerpt,
+                verification_status,
+                round_number,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def create_claim_candidate(
+    topic_id: int,
+    subtopic_id: int,
+    clerk_msg_id: Optional[int],
+    candidate_text: str,
+    support_fact_ids_json: Optional[str] = None,
+    rationale_short: Optional[str] = None,
+) -> int:
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO ClaimCandidate (
+                topic_id,
+                subtopic_id,
+                clerk_msg_id,
+                candidate_text,
+                support_fact_ids_json,
+                rationale_short
+            )
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (topic_id, subtopic_id, writer_msg_id, candidate_text, fact_stage, evidence_note),
+            (topic_id, subtopic_id, clerk_msg_id, candidate_text, support_fact_ids_json, rationale_short),
         )
         return cursor.lastrowid
 
@@ -356,6 +627,30 @@ def get_fact_candidates(
         return [dict(row) for row in rows]
 
 
+def get_claim_candidates(
+    topic_id: int,
+    subtopic_id: Optional[int] = None,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        clauses = ["topic_id = ?"]
+        params: list[Any] = [topic_id]
+        if subtopic_id is not None:
+            clauses.append("subtopic_id = ?")
+            params.append(subtopic_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        try:
+            rows = conn.execute(
+                f"SELECT * FROM ClaimCandidate WHERE {' AND '.join(clauses)} ORDER BY id ASC",
+                params,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(row) for row in rows]
+
+
 def fact_candidate_exists(
     topic_id: int,
     candidate_text: str,
@@ -375,6 +670,31 @@ def fact_candidate_exists(
             params.extend(status_list)
         query += " LIMIT 1"
         row = conn.execute(query, params).fetchone()
+        return row is not None
+
+
+def claim_candidate_exists(
+    topic_id: int,
+    candidate_text: str,
+    statuses: Optional[Iterable[str]] = None,
+) -> bool:
+    with get_db() as conn:
+        params: list[Any] = [topic_id, candidate_text]
+        query = """
+            SELECT 1
+            FROM ClaimCandidate
+            WHERE topic_id = ? AND candidate_text = ?
+        """
+        status_list = [status for status in (statuses or []) if status]
+        if status_list:
+            placeholders = ", ".join("?" for _ in status_list)
+            query += f" AND status IN ({placeholders})"
+            params.extend(status_list)
+        query += " LIMIT 1"
+        try:
+            row = conn.execute(query, params).fetchone()
+        except sqlite3.OperationalError:
+            return False
         return row is not None
 
 
@@ -415,6 +735,37 @@ def update_fact_candidate_review(
         )
 
 
+def update_claim_candidate_review(
+    candidate_id: int,
+    status: str,
+    reviewed_text: Optional[str] = None,
+    review_note: Optional[str] = None,
+    claim_score: Optional[float] = None,
+    accepted_claim_id: Optional[int] = None,
+) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE ClaimCandidate
+            SET status = ?,
+                reviewed_text = ?,
+                review_note = ?,
+                claim_score = ?,
+                accepted_claim_id = ?,
+                reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                status,
+                reviewed_text,
+                review_note,
+                claim_score,
+                accepted_claim_id,
+                candidate_id,
+            ),
+        )
+
+
 def fact_exists(topic_id: int, content: str, source: Optional[str] = None) -> bool:
     with get_db() as conn:
         params: list[Any] = [topic_id, content]
@@ -444,6 +795,198 @@ def get_fact_by_content(topic_id: int, content: str) -> Optional[Dict[str, Any]]
             (topic_id, content),
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_facts_by_ids(topic_id: int, fact_ids: Iterable[int]) -> List[Dict[str, Any]]:
+    ids = [int(fact_id) for fact_id in fact_ids]
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    with get_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM Fact
+            WHERE topic_id = ? AND id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            [topic_id, *ids],
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def insert_claim(
+    topic_id: int,
+    subtopic_id: Optional[int],
+    content: str,
+    support_fact_ids_json: Optional[str] = None,
+    rationale_short: Optional[str] = None,
+    claim_score: Optional[float] = None,
+    status: str = "active",
+    candidate_id: Optional[int] = None,
+) -> int:
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO Claim (
+                topic_id,
+                subtopic_id,
+                content,
+                support_fact_ids_json,
+                rationale_short,
+                claim_score,
+                status,
+                candidate_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                topic_id,
+                subtopic_id,
+                content,
+                support_fact_ids_json,
+                rationale_short,
+                claim_score,
+                status,
+                candidate_id,
+            ),
+        )
+        claim_id = cursor.lastrowid
+        _insert_claim_fts(conn, claim_id, topic_id, content)
+        return claim_id
+
+
+def insert_web_evidence(
+    origin_topic_id: int,
+    origin_subtopic_id: Optional[int],
+    query_text: str,
+    title: str,
+    snippet: str,
+    url: str,
+    source_domain: str,
+    result_rank: int,
+    search_provider: str,
+    search_role: str,
+) -> int:
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO WebEvidence (
+                origin_topic_id,
+                origin_subtopic_id,
+                query_text,
+                title,
+                snippet,
+                url,
+                source_domain,
+                result_rank,
+                search_provider,
+                search_role
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                origin_topic_id,
+                origin_subtopic_id,
+                query_text,
+                title,
+                snippet,
+                url,
+                source_domain,
+                result_rank,
+                search_provider,
+                search_role,
+            ),
+        )
+        web_id = cursor.lastrowid
+        content = " ".join(
+            part.strip()
+            for part in (title or "", snippet or "", query_text or "", source_domain or "")
+            if isinstance(part, str) and part.strip()
+        )
+        _insert_web_evidence_fts(conn, web_id, origin_topic_id, source_domain or "", content)
+        return web_id
+
+
+def insert_vote_record(
+    topic_id: int,
+    subtopic_id: Optional[int],
+    round_number: Optional[int],
+    vote_kind: str,
+    subject: str,
+    prompt_text: str,
+    voter: str,
+    parsed_ok: bool,
+    decision: Optional[str],
+    reason: Optional[str],
+    raw_response: str,
+    metadata_json: Optional[str] = None,
+) -> int:
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO VoteRecord (
+                topic_id,
+                subtopic_id,
+                round_number,
+                vote_kind,
+                subject,
+                prompt_text,
+                voter,
+                parsed_ok,
+                decision,
+                reason,
+                raw_response,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                topic_id,
+                subtopic_id,
+                round_number,
+                vote_kind,
+                subject,
+                prompt_text,
+                voter,
+                int(parsed_ok),
+                decision,
+                reason,
+                raw_response,
+                metadata_json,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def get_vote_records(
+    topic_id: int,
+    *,
+    subtopic_id: Optional[int] = None,
+    vote_kind: Optional[str] = None,
+    round_number: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    clauses = ["topic_id = ?"]
+    params: list[Any] = [topic_id]
+    if subtopic_id is not None:
+        clauses.append("subtopic_id = ?")
+        params.append(subtopic_id)
+    if vote_kind is not None:
+        clauses.append("vote_kind = ?")
+        params.append(vote_kind)
+    if round_number is not None:
+        clauses.append("round_number = ?")
+        params.append(round_number)
+
+    query = f"SELECT * FROM VoteRecord WHERE {' AND '.join(clauses)} ORDER BY id ASC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    with get_db() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
 def search_facts(topic_id: int, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
     """Search for the most semantically similar facts using sqlite-vec."""
@@ -476,6 +1019,96 @@ def search_facts_lexical(topic_id: int, query_text: str, top_k: int = 5) -> List
             LIMIT ?
             """,
             (match_query, topic_id, top_k),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def search_claims_lexical(topic_id: int, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    match_query = _build_fts_query(query_text)
+    if not match_query:
+        return []
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT Claim.*, bm25(claims_fts) as lexical_score
+            FROM claims_fts
+            JOIN Claim ON Claim.id = claims_fts.rowid
+            WHERE claims_fts MATCH ? AND Claim.topic_id = ?
+            ORDER BY lexical_score
+            LIMIT ?
+            """,
+            (match_query, topic_id, top_k),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def search_web_evidence_same_topic(
+    topic_id: int,
+    query_text: str,
+    top_k: int = 5,
+    max_age_days: int = 30,
+) -> List[Dict[str, Any]]:
+    match_query = _build_fts_query(query_text)
+    if not match_query:
+        return []
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                WebEvidence.*,
+                TRIM(
+                    COALESCE(WebEvidence.title, '') || ' ' ||
+                    COALESCE(WebEvidence.snippet, '') || ' ' ||
+                    COALESCE(WebEvidence.query_text, '') || ' ' ||
+                    COALESCE(WebEvidence.source_domain, '')
+                ) AS content,
+                bm25(web_evidence_fts) AS lexical_score
+            FROM web_evidence_fts
+            JOIN WebEvidence ON WebEvidence.id = web_evidence_fts.rowid
+            WHERE web_evidence_fts MATCH ?
+              AND WebEvidence.origin_topic_id = ?
+              AND WebEvidence.fetched_at >= datetime('now', ?)
+            ORDER BY lexical_score
+            LIMIT ?
+            """,
+            (match_query, topic_id, f"-{int(max_age_days)} days", top_k),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def search_web_evidence_cross_topic(
+    topic_id: int,
+    query_text: str,
+    top_k: int = 5,
+    max_age_days: int = 30,
+) -> List[Dict[str, Any]]:
+    match_query = _build_fts_query(query_text)
+    if not match_query:
+        return []
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                WebEvidence.*,
+                TRIM(
+                    COALESCE(WebEvidence.title, '') || ' ' ||
+                    COALESCE(WebEvidence.snippet, '') || ' ' ||
+                    COALESCE(WebEvidence.query_text, '') || ' ' ||
+                    COALESCE(WebEvidence.source_domain, '')
+                ) AS content,
+                bm25(web_evidence_fts) AS lexical_score
+            FROM web_evidence_fts
+            JOIN WebEvidence ON WebEvidence.id = web_evidence_fts.rowid
+            WHERE web_evidence_fts MATCH ?
+              AND WebEvidence.origin_topic_id != ?
+              AND WebEvidence.fetched_at >= datetime('now', ?)
+            ORDER BY lexical_score
+            LIMIT ?
+            """,
+            (match_query, topic_id, f"-{int(max_age_days)} days", top_k),
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -9,6 +9,7 @@ from grox_chat.server import (
     DOG_CORRECTION_TURN,
     EVIDENCE_PHASE,
     OPENING_PHASE,
+    SPECTATOR,
     TRON_REMEDIATION_TURN,
     route_after_final_librarian,
     _aggregate_termination_votes,
@@ -18,14 +19,20 @@ from grox_chat.server import (
     _has_required_summary_sections,
     _normalize_termination_vote_contract,
     _run_termination_votes,
+    _sanitize_citations_to_allowed_ids,
     _termination_policy_for_round,
     _should_run_termination_vote,
     _normalize_fact_proposal_contract,
     _normalize_focus_contract,
+    build_actor_system_prompt,
     _build_vote_prompt,
     _normalize_message_contract,
     audience_summary_node,
     build_audience_summary_prompt,
+    build_clerk_sourced_fact_prompt,
+    build_fact_proposer_prompt,
+    build_graph,
+    build_librarian_prompt,
     audience_termination_check_node,
     build_base_turns_for_phase,
     build_extra_turns,
@@ -38,13 +45,14 @@ from grox_chat.server import (
     final_writer_node,
     get_phase_for_round,
     librarian_node,
+    should_enable_web_backup,
     should_enable_web_search,
     writer_node,
 )
 
 
 @pytest.mark.asyncio
-async def test_final_writer_node_skips_same_round_duplicate_pass():
+async def test_final_writer_node_is_harvest_only_noop():
     state = {
         "topic_id": 1,
         "plan_id": 1,
@@ -92,23 +100,94 @@ async def test_writer_node_persists_only_critique_message():
     messages = [
         {"id": 1, "sender": "dreamer", "content": "claim", "msg_type": "standard", "confidence_score": 7.0},
     ]
-    writer_reply = '{"action":"post_message","content":"Writer critique"}'
+    writer_replies = [
+        "ISSUE 1: False precision\nWHY IT MATTERS: The recommendation depends on invented numbers.",
+        "PRIMARY ISSUE: False precision\nWHY CENTRAL: It distorts the recommendation.\nSECONDARY ISSUE: none",
+        '{"action":"post_message","content":"Writer critique"}',
+    ]
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=writer_reply)):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(side_effect=writer_replies)) as writer_query:
                         with patch("grox_chat.server.api.persist_message", new=AsyncMock(return_value=55)) as persist_message:
                             with patch("grox_chat.server.process_writer_output", new=AsyncMock()) as process_writer_output:
                                 result = await writer_node(state)
 
+    assert writer_query.await_count == 3
+    assert writer_query.await_args_list[0].kwargs["provider"] == "minimax"
+    assert writer_query.await_args_list[1].kwargs["provider"] == "minimax"
+    assert writer_query.await_args_list[2].kwargs["require_json"] is True
     persist_message.assert_awaited_once()
     assert persist_message.await_args.args[:4] == (1, 1, "writer", "Writer critique")
     assert persist_message.await_args.kwargs["round_number"] == 2
     assert persist_message.await_args.kwargs["turn_kind"] == "writer_critique"
     process_writer_output.assert_not_awaited()
     assert result["last_writer_round"] == 2
+
+
+@pytest.mark.asyncio
+async def test_writer_node_retries_empty_outputs_for_all_three_stages():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "phase": EVIDENCE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 2,
+        "last_writer_round": None,
+    }
+    messages = [
+        {"id": 1, "sender": "dreamer", "content": "claim", "msg_type": "standard", "confidence_score": 7.0},
+    ]
+    writer_replies = [
+        "",
+        "ISSUE 1: False precision\nWHY IT MATTERS: The recommendation depends on invented numbers.",
+        "   ",
+        "PRIMARY ISSUE: False precision\nWHY CENTRAL: It distorts the recommendation.\nSECONDARY ISSUE: none",
+        "",
+        '{"action":"post_message","content":"Writer critique"}',
+    ]
+
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(side_effect=writer_replies)) as writer_query:
+                        with patch("grox_chat.server.api.persist_message", new=AsyncMock(return_value=55)) as persist_message:
+                            result = await writer_node(state)
+
+    assert writer_query.await_count == 6
+    assert writer_query.await_args_list[0].kwargs["require_json"] is False
+    assert writer_query.await_args_list[1].kwargs["require_json"] is False
+    assert writer_query.await_args_list[2].kwargs["require_json"] is False
+    assert writer_query.await_args_list[3].kwargs["require_json"] is False
+    assert writer_query.await_args_list[4].kwargs["require_json"] is True
+    assert writer_query.await_args_list[5].kwargs["require_json"] is True
+    persist_message.assert_awaited_once()
+    assert persist_message.await_args.args[:4] == (1, 1, "writer", "Writer critique")
+    assert result["last_writer_round"] == 2
+
+
+def test_build_graph_routes_close_path_directly_to_final_fact_harvest():
+    graph = build_graph().get_graph()
+    close_targets = [
+        edge.target
+        for edge in graph.edges
+        if edge.source == "audience_termination_check_node" and edge.data == "close_subtopic"
+    ]
+
+    assert close_targets == ["final_fact_proposer_node"]
+    assert "final_writer_node" not in graph.nodes
 
 
 @pytest.mark.asyncio
@@ -132,9 +211,9 @@ async def test_fact_proposer_node_caps_candidates_in_regular_round():
         "last_fact_proposer_round": None,
     }
     messages = [
-        {"id": 1, "sender": "critic", "content": "claim", "msg_type": "standard", "confidence_score": 7.0},
+        {"id": 1, "sender": "critic", "content": "Latency rose by 12% in the cited benchmark.", "msg_type": "standard", "confidence_score": 7.0},
     ]
-    proposer_reply = '{"action":"propose_facts","facts":["Fact 1","Fact 2","Fact 3"]}'
+    proposer_reply = '{"action":"propose_fact_candidates","fact_candidates":[]}'
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
@@ -144,9 +223,9 @@ async def test_fact_proposer_node_caps_candidates_in_regular_round():
                         with patch("grox_chat.server.process_writer_output", new=AsyncMock(return_value=[1, 2])) as process_writer_output:
                             await fact_proposer_node(state)
 
-    assert process_writer_output.await_args.kwargs["max_candidates"] == 2
+    assert process_writer_output.await_args.kwargs["max_candidates"] == 3
     assert process_writer_output.await_args.args[2] is None
-    assert process_writer_output.await_args.kwargs["structured_facts"] == ["Fact 1", "Fact 2", "Fact 3"]
+    assert process_writer_output.await_args.kwargs["structured_facts"][0]["candidate_type"] == "number"
 
 
 @pytest.mark.asyncio
@@ -171,9 +250,9 @@ async def test_final_fact_proposer_node_allows_three_candidates():
         "last_final_fact_proposer_round": None,
     }
     messages = [
-        {"id": 1, "sender": "critic", "content": "claim", "msg_type": "standard", "confidence_score": 7.0},
+        {"id": 1, "sender": "critic", "content": "The paper reported a 42% failure reduction.", "msg_type": "standard", "confidence_score": 7.0},
     ]
-    proposer_reply = '{"action":"propose_facts","facts":["Fact 1","Fact 2","Fact 3","Fact 4"]}'
+    proposer_reply = '{"action":"propose_fact_candidates","fact_candidates":[]}'
 
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
@@ -183,7 +262,7 @@ async def test_final_fact_proposer_node_allows_three_candidates():
                         with patch("grox_chat.server.process_writer_output", new=AsyncMock(return_value=[1, 2, 3])) as process_writer_output:
                             await final_fact_proposer_node(state)
 
-    assert process_writer_output.await_args.kwargs["max_candidates"] == 3
+    assert process_writer_output.await_args.kwargs["max_candidates"] == 4
 
 
 def test_normalize_fact_proposal_contract_filters_blank_entries():
@@ -228,20 +307,21 @@ async def test_librarian_node_reviews_candidates_and_posts_visible_audit():
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_pending_fact_candidates", return_value=candidates):
-                with patch("grox_chat.server.api.get_messages", return_value=messages):
-                    with patch("grox_chat.server.build_query_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                        with patch(
-                            "grox_chat.server._query_librarian_review_text",
-                            new=AsyncMock(
-                                side_effect=[
-                                    ('{"decision":"accept","reviewed_text":"Fact A","review_note":"ok","evidence_note":"source","confidence_score":8}', "minimax"),
-                                    ('{"decision":"reject","review_note":"unsupported","evidence_note":"missing support","confidence_score":3}', "minimax"),
-                                ]
-                            ),
-                        ):
-                            with patch("grox_chat.server.apply_librarian_review", new=AsyncMock(side_effect=reviews)):
-                                with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
-                                    await librarian_node(state)
+                with patch("grox_chat.server.api.get_pending_claim_candidates", return_value=[]):
+                    with patch("grox_chat.server.api.get_messages", return_value=messages):
+                        with patch("grox_chat.server.build_query_rag_context", new=AsyncMock(return_value=("RAG", False))):
+                            with patch(
+                                "grox_chat.server._query_librarian_review_text",
+                                new=AsyncMock(
+                                    side_effect=[
+                                        ('{"decision":"accept","reviewed_text":"Fact A","review_note":"ok","evidence_note":"source","confidence_score":8}', "minimax"),
+                                        ('{"decision":"reject","review_note":"unsupported","evidence_note":"missing support","confidence_score":3}', "minimax"),
+                                    ]
+                                ),
+                            ):
+                                with patch("grox_chat.server.apply_librarian_review", new=AsyncMock(side_effect=reviews)):
+                                    with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
+                                        await librarian_node(state)
 
     persist_message.assert_awaited_once()
     assert persist_message.await_args.args[2] == "librarian"
@@ -274,22 +354,23 @@ async def test_librarian_node_falls_back_to_gemini_when_minimax_schema_invalid()
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_pending_fact_candidates", return_value=candidates):
-                with patch("grox_chat.server.api.get_messages", return_value=messages):
-                    with patch("grox_chat.server.build_query_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                        with patch(
-                            "grox_chat.server._query_librarian_review_text",
-                            new=AsyncMock(return_value=('{"decision":"soften"}', "minimax")),
-                        ):
+                with patch("grox_chat.server.api.get_pending_claim_candidates", return_value=[]):
+                    with patch("grox_chat.server.api.get_messages", return_value=messages):
+                        with patch("grox_chat.server.build_query_rag_context", new=AsyncMock(return_value=("RAG", False))):
                             with patch(
-                                "grox_chat.server.call_text",
-                                new=AsyncMock(return_value='{"decision":"accept","reviewed_text":"Fact A","review_note":"ok","evidence_note":"source","confidence_score":8}'),
-                            ) as gemini_query:
+                                "grox_chat.server._query_librarian_review_text",
+                                new=AsyncMock(return_value=('{"decision":"soften"}', "minimax")),
+                            ):
                                 with patch(
-                                    "grox_chat.server.apply_librarian_review",
-                                    new=AsyncMock(return_value={"candidate_id": 10, "decision": "accept", "reviewed_text": "Fact A", "review_note": "ok"}),
-                                ):
-                                    with patch("grox_chat.server.api.persist_message", new=AsyncMock()):
-                                        await librarian_node(state)
+                                    "grox_chat.server.call_text",
+                                    new=AsyncMock(return_value='{"decision":"accept","reviewed_text":"Fact A","review_note":"ok","evidence_note":"source","confidence_score":8}'),
+                                ) as gemini_query:
+                                    with patch(
+                                        "grox_chat.server.apply_librarian_review",
+                                        new=AsyncMock(return_value={"candidate_id": 10, "decision": "accept", "reviewed_text": "Fact A", "review_note": "ok"}),
+                                    ):
+                                        with patch("grox_chat.server.api.persist_message", new=AsyncMock()):
+                                            await librarian_node(state)
 
     gemini_query.assert_awaited_once()
 
@@ -642,6 +723,50 @@ async def test_opening_round_expert_node_skips_web_search():
 
 
 @pytest.mark.asyncio
+async def test_expert_node_strips_citations_not_present_in_injected_knowledge():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "current_actor": "dreamer",
+        "current_turn_kind": "base",
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "phase": OPENING_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 1,
+    }
+    messages = [
+        {"id": 1, "sender": "skynet", "content": "Grounding brief", "msg_type": "standard", "confidence_score": None},
+    ]
+    rag_context = (
+        "=== RAG KNOWLEDGE INJECTION ===\n"
+        "[Related Facts]\n- [F1] Fact 1\n"
+        "[Related Claims]\n- [C7] Claim 7\n"
+        "[Related Web Evidence]\n- [W9] Web 9\n"
+    )
+    raw_reply = (
+        '{"action":"post_message","content":"Use [F1], [C7], and [W9]. Ignore [F999], [C88], and [W77].",'
+        '"confidence_score":7}'
+    )
+
+    with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
+        with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=(rag_context, False))):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=raw_reply)):
+                        with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
+                            await expert_node(state)
+
+    persist_message.assert_awaited_once()
+    assert persist_message.await_args.args[3] == "Use [F1], [C7], and [W9]. Ignore, and."
+
+
+@pytest.mark.asyncio
 async def test_contrarian_expert_node_uses_search_loop_response_instead_of_http_error():
     state = {
         "topic_id": 1,
@@ -805,7 +930,8 @@ async def test_final_librarian_keeps_subtopic_open_when_pending_candidates_remai
             "grox_chat.server.api.get_pending_fact_candidates",
             return_value=[{"id": 17, "candidate_text": "Still pending"}],
         ):
-            result = await final_librarian_node(state)
+            with patch("grox_chat.server.api.get_pending_claim_candidates", return_value=[]):
+                result = await final_librarian_node(state)
 
     assert result["pending_fact_reviews_remaining"] is True
     assert result["subtopic_exhausted"] is False
@@ -833,7 +959,8 @@ async def test_final_librarian_allows_close_when_no_pending_candidates_remain():
 
     with patch("grox_chat.server._run_librarian_pass", new=AsyncMock(return_value={})):
         with patch("grox_chat.server.api.get_pending_fact_candidates", return_value=[]):
-            result = await final_librarian_node(state)
+            with patch("grox_chat.server.api.get_pending_claim_candidates", return_value=[]):
+                result = await final_librarian_node(state)
 
     assert result["pending_fact_reviews_remaining"] is False
     assert route_after_final_librarian(result) == "close_subtopic"
@@ -853,6 +980,33 @@ def test_should_enable_web_search_is_phase_and_turn_kind_aware():
     assert should_enable_web_search({"phase": DEBATE_PHASE}, "dreamer", CAT_EXPANSION_TURN) is True
     assert should_enable_web_search({"phase": DEBATE_PHASE}, "dreamer", TRON_REMEDIATION_TURN) is False
     assert should_enable_web_search({"phase": DEBATE_PHASE}, "dog", "base") is False
+
+
+def test_should_enable_web_backup_is_debate_only_and_base_turn_only():
+    assert should_enable_web_backup({"phase": OPENING_PHASE}, "dreamer", "base") is False
+    assert should_enable_web_backup({"phase": EVIDENCE_PHASE}, "dreamer", "base") is False
+    assert should_enable_web_backup({"phase": DEBATE_PHASE}, "dreamer", "base") is True
+    assert should_enable_web_backup({"phase": DEBATE_PHASE}, "dog", "base") is True
+    assert should_enable_web_backup({"phase": DEBATE_PHASE}, "dreamer", DOG_CORRECTION_TURN) is False
+    assert should_enable_web_backup({"phase": DEBATE_PHASE}, SPECTATOR, "base") is False
+
+
+def test_build_actor_system_prompt_adds_mini_max_safe_deliberation_constraints():
+    prompt = build_actor_system_prompt({"phase": DEBATE_PHASE, "round_number": 4}, "analyst", "base")
+
+    assert "DEBATE DISCIPLINE:" in prompt
+    assert "Prefer net-new argument" in prompt
+    assert "Do not invent exact percentages, costs, latency figures, or synthetic scores" in prompt
+    assert "[F{id}]" in prompt
+
+
+def test_build_actor_system_prompt_preserves_dog_targeting_role():
+    prompt = build_actor_system_prompt({"phase": DEBATE_PHASE, "round_number": 4}, "dog", "base")
+
+    assert "Choose exactly one target" in prompt
+    assert "*growls at [Name]*" in prompt
+    assert "Prioritize logical pressure over roleplay volume" in prompt
+    assert "Do not invent exact percentages, costs, latency figures, or synthetic scores" not in prompt
 
 
 def test_normalize_message_contract_filters_non_string_facts():
@@ -883,6 +1037,36 @@ def test_normalize_message_contract_extracts_fenced_single_wrapped_content_witho
     assert parsed["content"] == '{"nested":true}'
 
 
+def test_sanitize_citations_to_allowed_ids_strips_only_unprovided_ids():
+    cleaned, removed = _sanitize_citations_to_allowed_ids(
+        "Use [F1] and [W7], ignore [F999] and [C88].",
+        knowledge_blocks=(
+            "=== RAG ===\n[F1] Fact\n[C5] Claim\n",
+            "=== WEB ===\n[W7] Title: T\n",
+        ),
+    )
+
+    assert cleaned == "Use [F1] and [W7], ignore and."
+    assert removed == {"F": (999,), "C": (88,), "W": ()}
+
+
+def test_build_fact_prompts_explain_that_web_leads_require_review_before_becoming_facts():
+    state = {"phase": DEBATE_PHASE, "round_number": 4}
+    topic = {"summary": "topic", "detail": "detail"}
+    subtopic = {"summary": "subtopic", "detail": "detail"}
+    messages = [{"sender": "critic", "content": "A [W17] article claimed something.", "msg_type": "standard"}]
+    candidate = {"id": 9, "candidate_text": "Claim text", "candidate_type": "sourced_claim"}
+
+    fact_prompt = build_fact_proposer_prompt(state, topic, messages, "RAG", max_facts=2)
+    sourced_prompt = build_clerk_sourced_fact_prompt(state, topic, messages, "RAG", max_facts=2)
+    librarian_prompt = build_librarian_prompt(state, topic, subtopic, candidate, messages, "RAG")
+
+    assert "Web evidence [W...]" in fact_prompt
+    assert "promote a [W] lead into a fact candidate" in fact_prompt
+    assert "Inspect both uncited externally-sourced statements in the debate and any retrieved [W...] items." in sourced_prompt
+    assert "raw [W...] text is never permanent memory by itself" in librarian_prompt
+
+
 def test_normalize_focus_contract_requires_json_boolean_for_grant_web_search():
     parsed = _normalize_focus_contract(
         '{"action":"focus","target":"scientist","reason":"watch closely","grant_web_search":"false"}'
@@ -902,6 +1086,7 @@ def test_build_vote_prompt_for_close_vote_does_not_include_candidate_admission_r
 
     assert "materially useful for the topic" not in prompt
     assert "redundant with already selected items" not in prompt
+    assert '{"vote":"yes|no","reason":"short sentence"}' in prompt
 
 
 def test_build_audience_summary_prompt_requires_mini_max_safe_sections():
@@ -997,13 +1182,32 @@ async def test_run_termination_votes_repairs_invalid_schema_once():
                 )
             ),
         ) as repair_call:
-            vote_records = await _run_termination_votes(voters=["critic"], prompt="close or continue?")
+            with patch("grox_chat.server.api.insert_vote_record") as insert_vote_record:
+                vote_records = await _run_termination_votes(
+                    voters=["critic"],
+                    prompt="close or continue?",
+                    topic_id=1,
+                    subtopic_id=2,
+                    round_number=3,
+                    subject="Current subtopic summary",
+                )
 
     assert len(vote_records) == 1
     assert vote_records[0]["repair_used"] is True
     assert vote_records[0]["parsed"]["parsed_ok"] is True
     assert vote_records[0]["parsed"]["vote"] == "continue"
     repair_call.assert_awaited_once()
+    insert_vote_record.assert_called_once()
+    assert insert_vote_record.call_args.args[:8] == (
+        1,
+        2,
+        3,
+        "termination",
+        "Current subtopic summary",
+        "close or continue?",
+        "critic",
+        True,
+    )
 
 
 def test_aggregate_termination_votes_round_three_blocks_on_single_central_vote():
@@ -1376,9 +1580,9 @@ async def test_fact_proposer_node_marks_synthesized_stage():
     topic = {"id": 1, "summary": "topic", "detail": "detail"}
     subtopic = {"id": 1, "summary": "subtopic", "detail": "detail"}
     messages = [
-        {"id": 1, "sender": "critic", "content": "claim", "msg_type": "standard", "confidence_score": 7.0},
+        {"id": 1, "sender": "critic", "content": "The benchmark shows a 12% latency increase.", "msg_type": "standard", "confidence_score": 7.0},
     ]
-    proposer_reply = '{"action":"propose_facts","facts":["Fact 1"]}'
+    proposer_reply = '{"action":"propose_fact_candidates","fact_candidates":[]}'
 
     with patch("grox_chat.server.api.get_topic", return_value=topic):
         with patch("grox_chat.server.api.get_subtopic", return_value=subtopic):
@@ -1390,3 +1594,4 @@ async def test_fact_proposer_node_marks_synthesized_stage():
 
     process_writer_output.assert_awaited_once()
     assert process_writer_output.await_args.kwargs["fact_stage"] == "synthesized"
+    assert process_writer_output.await_args.kwargs["structured_facts"][0]["candidate_type"] == "number"

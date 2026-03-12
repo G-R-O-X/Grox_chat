@@ -69,3 +69,28 @@ def test_search_facts_hybrid_merges_lexical_hits_before_truncating():
             result = api.search_facts_hybrid(1, "query", [0.1] * 384, top_k=2)
 
     assert [row["id"] for row in result] == [10, 12]
+
+
+def test_insert_claim_delegates_to_db_insert_claim():
+    with patch("grox_chat.api.db_insert_claim", return_value=88) as insert_claim:
+        claim_id = api.insert_claim(
+            1,
+            2,
+            "Claim text",
+            support_fact_ids_json="[1,2]",
+            rationale_short="Facts align.",
+            claim_score=7.5,
+            status="active",
+            candidate_id=3,
+        )
+
+    assert claim_id == 88
+    insert_claim.assert_called_once()
+
+
+def test_get_facts_by_ids_delegates_to_db_layer():
+    with patch("grox_chat.api.db_get_facts_by_ids", return_value=[{"id": 1}, {"id": 2}]) as get_facts_by_ids:
+        rows = api.get_facts_by_ids(1, [1, 2])
+
+    assert rows == [{"id": 1}, {"id": 2}]
+    get_facts_by_ids.assert_called_once_with(1, [1, 2])

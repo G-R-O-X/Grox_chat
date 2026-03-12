@@ -10,16 +10,25 @@ from .agents import SKYNET, get_agent, voting_agents
 from .broker import (
     PROFILE_GEMINI_FLASH,
     PROFILE_GEMINI_PRO,
-    llm_call,
     llm_call_with_web,
 )
 from .embedding import aget_embedding
 from .server import run_subtopic_graph
+from .structured_retry import retry_structured_output, usable_text_output
 
 logger = logging.getLogger(__name__)
 SUBTOPIC_CANDIDATE_COUNT = 4
 SUBTOPIC_VOTE_CYCLE_LIMIT = 3
 DECISION_PASS_RATIO = 2 / 3
+
+
+def _is_usable_json_text(text: str) -> bool:
+    if not usable_text_output(text):
+        return False
+    try:
+        return isinstance(_parse_json_object(text), dict)
+    except Exception:
+        return False
 
 
 class TopicState(TypedDict, total=False):
@@ -81,7 +90,14 @@ def _sanitize_subtopics(raw_subtopics: Any, limit: int) -> List[Dict[str, str]]:
     return cleaned
 
 
-async def ask_gemini_cli(system_prompt: str, context: str, role: str, model: str = "gemini-3.0-flash") -> Dict[str, Any]:
+async def ask_gemini_cli(
+    system_prompt: str,
+    context: str,
+    role: str,
+    model: str = "gemini-3.0-flash",
+    *,
+    topic_id: int = 0,
+) -> Dict[str, Any]:
     prompt = f"{system_prompt}\n\nHere is the context of the chatroom:\n{context}"
     provider_profile = (
         PROFILE_GEMINI_PRO if "pro" in (model or "").lower() else PROFILE_GEMINI_FLASH
@@ -97,16 +113,24 @@ async def ask_gemini_cli(system_prompt: str, context: str, role: str, model: str
     )
 
     try:
-        result = await llm_call_with_web(
-            prompt,
-            provider_profile=provider_profile,
-            role=role,
-            require_json=True,
-            model=model,
-            search_budget=2,
-            temperature=0.7,
-            system_prompt=system_prompt,
+        result = await retry_structured_output(
+            stage_name=f"{role} orchestration",
+            logger=logger,
+            is_usable=lambda item: _is_usable_json_text(item.text),
+            invoke=lambda: llm_call_with_web(
+                prompt,
+                provider_profile=provider_profile,
+                role=role,
+                require_json=True,
+                model=model,
+                search_budget=2,
+                temperature=0.7,
+                system_prompt=system_prompt,
+                topic_id=topic_id,
+            ),
         )
+        if result is None:
+            raise RuntimeError("orchestration structured retry exhausted")
         output = result.text
         logger.info(
             "[%s] Orchestration broker call succeeded provider_used=%s fallback_used=%s search_used=%s text_chars=%s; attempting JSON parse.",
@@ -159,30 +183,80 @@ def _build_vote_prompt(
             f"Already rejected candidates: {rejected_block}",
             "",
             question,
-            'Reply with strict JSON: {"vote":"yes"} or {"vote":"no"}.',
+            'Reply with strict JSON: {"vote":"yes|no","reason":"short sentence"}.',
         ]
     )
     return "\n".join(lines)
 
 
-async def _collect_votes(prompt: str) -> VoteTally:
+async def _collect_votes(
+    prompt: str,
+    *,
+    topic_id: int,
+    subtopic_id: int | None,
+    round_number: int | None,
+    vote_kind: str,
+    subject: str,
+) -> VoteTally:
     yes_votes = 0
     successful_votes = 0
     failed_votes = 0
     for voter in voting_agents():
         agent = get_agent(voter)
         try:
-            decision = await agent.vote(prompt, allow_web=False)
+            payload = await agent.vote_detail(prompt, allow_web=False)
         except Exception as exc:
             logger.warning("[skynet] Vote execution failed for %s: %s", voter, exc)
+            api.insert_vote_record(
+                topic_id,
+                subtopic_id,
+                round_number,
+                vote_kind,
+                subject,
+                prompt,
+                voter,
+                False,
+                None,
+                None,
+                "",
+                metadata_json=json.dumps({"invalid_reason": f"exception:{type(exc).__name__}"}),
+            )
             failed_votes += 1
             continue
-        if decision is None:
+        if payload is None:
             logger.warning("[skynet] Vote from %s was invalid or malformed.", voter)
+            api.insert_vote_record(
+                topic_id,
+                subtopic_id,
+                round_number,
+                vote_kind,
+                subject,
+                prompt,
+                voter,
+                False,
+                None,
+                None,
+                "",
+                metadata_json=json.dumps({"invalid_reason": "invalid_or_malformed"}),
+            )
             failed_votes += 1
             continue
         successful_votes += 1
+        decision = payload["decision"]
         yes_votes += int(decision)
+        api.insert_vote_record(
+            topic_id,
+            subtopic_id,
+            round_number,
+            vote_kind,
+            subject,
+            prompt,
+            voter,
+            True,
+            payload["decision_label"],
+            payload["reason"],
+            payload["raw_response"],
+        )
     return {
         "yes_votes": yes_votes,
         "successful_votes": successful_votes,
@@ -210,7 +284,7 @@ async def _propose_subtopics(
         f"Already rejected candidates: {', '.join(rejected) or 'none'}\n"
         f"Already completed subtopics: {', '.join(completed) or 'none'}"
     )
-    data = await ask_gemini_cli(system_prompt, context, SKYNET)
+    data = await ask_gemini_cli(system_prompt, context, SKYNET, topic_id=topic["id"])
     if isinstance(data, dict) and data.get("error"):
         return {"candidates": [], "error": str(data["error"])}
     candidates = _sanitize_subtopics(data.get("subtopics", []) if isinstance(data, dict) else [], limit=SUBTOPIC_CANDIDATE_COUNT)
@@ -288,7 +362,14 @@ async def node_plan_generation(state: TopicState) -> TopicState:
                 selected=[item["summary"] for item in selected],
                 rejected=rejected,
             )
-            tally = await _collect_votes(prompt)
+            tally = await _collect_votes(
+                prompt,
+                topic_id=topic["id"],
+                subtopic_id=None,
+                round_number=None,
+                vote_kind="candidate_admission",
+                subject=candidate["summary"],
+            )
             if tally["failed_votes"] > 0:
                 logger.warning("[skynet] Deferring topic after vote execution failures during plan generation.")
                 return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
@@ -353,7 +434,7 @@ async def node_open_next_subtopic(state: TopicState) -> TopicState:
         f"Subtopic: {next_subtopic['summary']}\n"
         f"Subtopic Detail: {next_subtopic['detail']}"
     )
-    data = await ask_gemini_cli(system_prompt, context, SKYNET)
+    data = await ask_gemini_cli(system_prompt, context, SKYNET, topic_id=state["topic_id"])
     brief_content = data.get("content") if isinstance(data, dict) else None
     if not brief_content:
         brief_content = f"Grounding Brief: {next_subtopic['detail']}"
@@ -398,7 +479,13 @@ async def node_conclude_subtopic(state: TopicState) -> TopicState:
         "Output strictly JSON using this schema: "
         "{\"action\":\"close_subtopic\",\"content\":\"final conclusion\"}"
     )
-    data = await ask_gemini_cli(system_prompt, ctx, SKYNET, model="gemini-3.0-flash")
+    data = await ask_gemini_cli(
+        system_prompt,
+        ctx,
+        SKYNET,
+        model="gemini-3.0-flash",
+        topic_id=state["topic_id"],
+    )
     conclusion = data.get("content") if isinstance(data, dict) else None
     if not conclusion:
         conclusion = f"Subtopic '{subtopic['summary']}' exhausted."
@@ -439,7 +526,14 @@ async def node_topic_replan_or_close(state: TopicState) -> TopicState:
         candidate_summary="",
         candidate_detail=ctx,
     )
-    tally = await _collect_votes(replan_vote_prompt)
+    tally = await _collect_votes(
+        replan_vote_prompt,
+        topic_id=topic["id"],
+        subtopic_id=None,
+        round_number=None,
+        vote_kind="replan_gate",
+        subject="Should the topic replan?",
+    )
     if tally["failed_votes"] > 0:
         logger.warning("[skynet] Deferring topic after vote execution failures during replan gate.")
         return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}
@@ -488,7 +582,14 @@ async def node_topic_replan_or_close(state: TopicState) -> TopicState:
                 selected=[item["summary"] for item in selected],
                 rejected=rejected,
             )
-            tally = await _collect_votes(prompt)
+            tally = await _collect_votes(
+                prompt,
+                topic_id=topic["id"],
+                subtopic_id=None,
+                round_number=None,
+                vote_kind="replan_admission",
+                subject=candidate["summary"],
+            )
             if tally["failed_votes"] > 0:
                 logger.warning("[skynet] Deferring topic after vote execution failures during replanning.")
                 return {"deferred": True, "topic_complete": False, "next_action": "defer_topic"}

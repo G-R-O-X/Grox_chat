@@ -6,7 +6,9 @@ import logging
 import os
 from dataclasses import asdict, dataclass, field, replace
 from typing import Optional
+from urllib.parse import urlparse
 
+from . import api
 from .external.gemini_cli_client import (
     close_gemini_cli_client,
     query_gemini_cli,
@@ -17,6 +19,7 @@ from .minimax_client import (
     query_minimax,
 )
 from .prompts import PROMPTS
+from .reranker import arerank
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,10 @@ GEMINI_PRO_MODEL = "gemini-3.1-pro-preview"
 GEMINI_FLASH_MODEL = "gemini-3.0-flash"
 MINIMAX_DEFAULT_MODEL = "MiniMax-M2.5"
 ENABLE_GEMINI_ENV = "ENABLE_GEMINI"
+WEB_CACHE_MAX_AGE_DAYS = 30
+WEB_CACHE_TOP_K = 6
+WEB_CACHE_SELECTED_TOP_K = 3
+WEB_CACHE_RERANK_THRESHOLD = 0.45
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,8 @@ class BrokerRequest:
     recover_pseudo_tool_query: bool = False
     require_json: bool = False
     search_budget: int = 2
+    topic_id: int = 0
+    subtopic_id: int = 0
 
     def key(self) -> str:
         return json.dumps(asdict(self), sort_keys=True, ensure_ascii=True)
@@ -55,6 +64,7 @@ class SearchEvidenceItem:
     query: str
     rendered_results: str
     had_error: bool = False
+    web_ids: tuple[int, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -132,6 +142,189 @@ def _render_search_results(search_res: dict) -> str:
     else:
         rendered += "No useful results found.\n\n"
     return rendered
+
+
+def _web_record_to_content(record: dict) -> str:
+    return "\n".join(
+        part.strip()
+        for part in (
+            record.get("title") or "",
+            record.get("snippet") or "",
+            record.get("query_text") or "",
+            record.get("source_domain") or "",
+        )
+        if isinstance(part, str) and part.strip()
+    )
+
+
+async def _select_web_cache_rows(query: str, rows: list[dict], *, top_k: int = WEB_CACHE_SELECTED_TOP_K) -> list[dict]:
+    if not rows:
+        return []
+    docs = [_web_record_to_content(row) for row in rows]
+    try:
+        ranked_indices = await arerank(query, docs, top_k=min(top_k, len(rows)))
+    except Exception as exc:
+        logger.warning("[Broker] Web cache rerank failed: %s", exc)
+        return []
+        
+    selected: list[dict] = []
+    for idx, score in ranked_indices:
+        if score >= WEB_CACHE_RERANK_THRESHOLD:
+            selected.append({**rows[idx], "score": score})
+    return selected
+
+
+def _render_web_records(rows: list[dict]) -> str:
+    rendered = "=== WEB SEARCH RESULTS ===\n"
+    if not rows:
+        rendered += "No useful results found.\n\n"
+        return rendered
+    for row in rows[:WEB_CACHE_SELECTED_TOP_K]:
+        source = row.get("source_domain") or "unknown"
+        title = row.get("title") or "(untitled)"
+        snippet = row.get("snippet") or ""
+        url = row.get("url") or ""
+        rendered += (
+            f"[W{row['id']}] Title: {title}\n"
+            f"Source: {source}\n"
+            f"Snippet: {snippet}\n"
+        )
+        if url:
+            rendered += f"URL: {url}\n"
+        rendered += "\n"
+    return rendered
+
+
+def _extract_domain(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+async def _lookup_cached_web_rows(query: str, *, topic_id: int) -> list[dict]:
+    if topic_id <= 0:
+        return []
+
+    topic_rows = api.search_web_evidence_same_topic(
+        topic_id,
+        query,
+        top_k=WEB_CACHE_TOP_K,
+        max_age_days=WEB_CACHE_MAX_AGE_DAYS,
+    )
+    selected_topic_rows = await _select_web_cache_rows(query, topic_rows)
+    if selected_topic_rows:
+        logger.info("[Broker] Reused same-topic web cache query=%s rows=%s", query, len(selected_topic_rows))
+        return selected_topic_rows
+
+    cross_topic_rows = api.search_web_evidence_cross_topic(
+        topic_id,
+        query,
+        top_k=WEB_CACHE_TOP_K,
+        max_age_days=WEB_CACHE_MAX_AGE_DAYS,
+    )
+    selected_cross_topic_rows = await _select_web_cache_rows(query, cross_topic_rows)
+    if selected_cross_topic_rows:
+        logger.info("[Broker] Reused cross-topic web cache query=%s rows=%s", query, len(selected_cross_topic_rows))
+        return selected_cross_topic_rows
+
+    return []
+
+
+def _persist_web_search_rows(
+    *,
+    topic_id: int,
+    subtopic_id: int,
+    query: str,
+    search_res: dict,
+    role: str,
+) -> list[dict]:
+    if topic_id <= 0:
+        return []
+
+    stored_rows: list[dict] = []
+    organic = search_res.get("organic") if isinstance(search_res, dict) else None
+    if not isinstance(organic, list):
+        return stored_rows
+
+    for rank, item in enumerate(organic[:WEB_CACHE_SELECTED_TOP_K], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "").strip()
+        snippet = (item.get("snippet") or "").strip()
+        url = (item.get("link") or item.get("url") or "").strip()
+        if not title and not snippet:
+            continue
+        web_id = api.insert_web_evidence(
+            topic_id,
+            subtopic_id or None,
+            query,
+            title,
+            snippet,
+            url,
+            _extract_domain(url),
+            rank,
+            "minimax_search",
+            role,
+        )
+        stored_rows.append(
+            {
+                "id": web_id,
+                "origin_topic_id": topic_id,
+                "origin_subtopic_id": subtopic_id,
+                "query_text": query,
+                "title": title,
+                "snippet": snippet,
+                "url": url,
+                "source_domain": _extract_domain(url),
+                "result_rank": rank,
+            }
+        )
+
+    return stored_rows
+
+
+async def get_or_collect_search_evidence_item(
+    query: str,
+    *,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
+    role: str = "agent",
+) -> SearchEvidenceItem:
+    cached_rows = await _lookup_cached_web_rows(query, topic_id=topic_id)
+    if cached_rows:
+        return SearchEvidenceItem(
+            query=query,
+            rendered_results=_render_web_records(cached_rows),
+            had_error=False,
+            web_ids=tuple(int(row["id"]) for row in cached_rows if row.get("id") is not None),
+        )
+
+    search_res = await minimax_search(query)
+    had_error = "error" in search_res
+    stored_rows = _persist_web_search_rows(
+        topic_id=topic_id,
+        subtopic_id=subtopic_id,
+        query=query,
+        search_res=search_res,
+        role=role,
+    )
+
+    if stored_rows:
+        return SearchEvidenceItem(
+            query=query,
+            rendered_results=_render_web_records(stored_rows),
+            had_error=had_error,
+            web_ids=tuple(int(row["id"]) for row in stored_rows if row.get("id") is not None),
+        )
+
+    return SearchEvidenceItem(
+        query=query,
+        rendered_results=_render_search_results(search_res),
+        had_error=had_error,
+    )
 
 
 def _build_search_decision_prompt(initial_prompt: str, rendered_results: list[str]) -> str:
@@ -501,6 +694,8 @@ async def _run_minimax_web_profile(request: BrokerRequest) -> BrokerResponse:
         request.prompt,
         max_iter=request.search_budget,
         system_prompt=request.system_instruction,
+        topic_id=request.topic_id,
+        subtopic_id=request.subtopic_id,
     )
     return BrokerResponse(
         text=_raise_on_minimax_error(response.text),
@@ -540,15 +735,14 @@ async def _run_gemini_web_profile(request: BrokerRequest, provider_profile: str)
                 request.fallback_role,
                 query,
             )
-            search_res = await minimax_search(query)
-            had_error = "error" in search_res
-            if had_error:
-                search_failed = True
-            item = SearchEvidenceItem(
-                query=query,
-                rendered_results=_render_search_results(search_res),
-                had_error=had_error,
+            item = await get_or_collect_search_evidence_item(
+                query,
+                topic_id=request.topic_id,
+                subtopic_id=request.subtopic_id,
+                role=request.fallback_role,
             )
+            if item.had_error:
+                search_failed = True
             evidence_items.append(item)
             rendered_results.append(item.rendered_results)
 
@@ -617,6 +811,8 @@ async def collect_search_evidence_bundle(
     initial_prompt: str,
     max_iter: int = 2,
     system_prompt: str | None = None,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> BrokerResponse:
     system_prompt = system_prompt or PROMPTS.get(agent_role, "")
     rendered_results: list[SearchEvidenceItem] = []
@@ -637,17 +833,15 @@ async def collect_search_evidence_bundle(
             )
 
         logger.info("[%s] Executing web search for: '%s'", agent_role, query)
-        search_res = await minimax_search(query)
-        had_error = "error" in search_res
-        if had_error:
-            search_failed = True
-        rendered_results.append(
-            SearchEvidenceItem(
-                query=query,
-                rendered_results=_render_search_results(search_res),
-                had_error=had_error,
-            )
+        item = await get_or_collect_search_evidence_item(
+            query,
+            topic_id=topic_id,
+            subtopic_id=subtopic_id,
+            role=agent_role,
         )
+        if item.had_error:
+            search_failed = True
+        rendered_results.append(item)
 
     logger.warning("[%s] Max iterations (%s) reached in search loop.", agent_role, max_iter)
     return BrokerResponse(
@@ -662,12 +856,16 @@ async def collect_search_evidence(
     initial_prompt: str,
     max_iter: int = 2,
     system_prompt: str | None = None,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> tuple[list[str], bool]:
     response = await collect_search_evidence_bundle(
         agent_role,
         initial_prompt,
         max_iter=max_iter,
         system_prompt=system_prompt,
+        topic_id=topic_id,
+        subtopic_id=subtopic_id,
     )
     return [item.rendered_results for item in response.search_evidence], response.search_failed
 
@@ -677,6 +875,8 @@ async def react_search_loop_with_evidence(
     initial_prompt: str,
     max_iter: int = 2,
     system_prompt: str | None = None,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> BrokerResponse:
     system_prompt = system_prompt or PROMPTS.get(agent_role, "")
     evidence = await collect_search_evidence_bundle(
@@ -684,6 +884,8 @@ async def react_search_loop_with_evidence(
         initial_prompt,
         max_iter=max_iter,
         system_prompt=system_prompt,
+        topic_id=topic_id,
+        subtopic_id=subtopic_id,
     )
     rendered_results = [item.rendered_results for item in evidence.search_evidence]
     final_prompt = _build_final_answer_prompt(initial_prompt, rendered_results)
@@ -703,12 +905,16 @@ async def react_search_loop(
     initial_prompt: str,
     max_iter: int = 2,
     system_prompt: str | None = None,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> tuple[str, bool]:
     response = await react_search_loop_with_evidence(
         agent_role,
         initial_prompt,
         max_iter=max_iter,
         system_prompt=system_prompt,
+        topic_id=topic_id,
+        subtopic_id=subtopic_id,
     )
     return response.text, response.search_failed
 
@@ -868,6 +1074,8 @@ async def call_text(
     fallback_role: str = "agent",
     recover_pseudo_tool_query: bool = False,
     require_json: bool = False,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> str:
     provider_profile = _infer_provider_profile(provider, model)
     if allow_web or strategy == "react":
@@ -882,6 +1090,8 @@ async def call_text(
             temperature=temperature,
             max_tokens=max_tokens,
             recover_pseudo_tool_query=recover_pseudo_tool_query,
+            topic_id=topic_id,
+            subtopic_id=subtopic_id,
         )
     else:
         response = await llm_call(
@@ -894,6 +1104,8 @@ async def call_text(
             temperature=temperature,
             max_tokens=max_tokens,
             recover_pseudo_tool_query=recover_pseudo_tool_query,
+            topic_id=topic_id,
+            subtopic_id=subtopic_id,
         )
     return response.text
 
@@ -911,6 +1123,8 @@ async def call_text_with_search_evidence(
     fallback_role: str = "agent",
     recover_pseudo_tool_query: bool = False,
     require_json: bool = False,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> BrokerResponse:
     provider_profile = _infer_provider_profile(provider, model)
     if allow_web or strategy == "react":
@@ -925,6 +1139,8 @@ async def call_text_with_search_evidence(
             temperature=temperature,
             max_tokens=max_tokens,
             recover_pseudo_tool_query=recover_pseudo_tool_query,
+            topic_id=topic_id,
+            subtopic_id=subtopic_id,
         )
     return await llm_call(
         prompt,
@@ -936,6 +1152,8 @@ async def call_text_with_search_evidence(
         temperature=temperature,
         max_tokens=max_tokens,
         recover_pseudo_tool_query=recover_pseudo_tool_query,
+        topic_id=topic_id,
+        subtopic_id=subtopic_id,
     )
 
 
@@ -951,6 +1169,8 @@ async def llm_call(
     max_tokens: int = 8192,
     boost: str = "",
     recover_pseudo_tool_query: bool = False,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> LLMResult:
     effective_system_prompt = system_prompt
     if boost:
@@ -967,6 +1187,8 @@ async def llm_call(
             fallback_role=role,
             require_json=require_json,
             recover_pseudo_tool_query=recover_pseudo_tool_query,
+            topic_id=topic_id,
+            subtopic_id=subtopic_id,
         )
     )
 
@@ -984,6 +1206,8 @@ async def llm_call_with_web(
     max_tokens: int = 8192,
     boost: str = "",
     recover_pseudo_tool_query: bool = False,
+    topic_id: int = 0,
+    subtopic_id: int = 0,
 ) -> LLMResult:
     effective_system_prompt = system_prompt
     if boost:
@@ -1001,6 +1225,8 @@ async def llm_call_with_web(
             require_json=require_json,
             search_budget=search_budget,
             recover_pseudo_tool_query=recover_pseudo_tool_query,
+            topic_id=topic_id,
+            subtopic_id=subtopic_id,
         )
     )
 

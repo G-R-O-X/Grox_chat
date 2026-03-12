@@ -37,6 +37,14 @@ def test_db_schema_upgrades():
         assert cursor.fetchone() is not None
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='FactCandidate'")
         assert cursor.fetchone() is not None
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Claim'")
+        assert cursor.fetchone() is not None
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ClaimCandidate'")
+        assert cursor.fetchone() is not None
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='WebEvidence'")
+        assert cursor.fetchone() is not None
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='VoteRecord'")
+        assert cursor.fetchone() is not None
 
         # Check Subtopic updates
         cursor = conn.execute("PRAGMA table_info(Subtopic)")
@@ -57,7 +65,13 @@ def test_db_schema_upgrades():
 
         cursor = conn.execute("PRAGMA table_info(Fact)")
         columns = [row['name'] for row in cursor.fetchall()]
+        assert 'subtopic_id' in columns
         assert 'fact_stage' in columns
+        assert 'fact_type' in columns
+        assert 'verification_status' in columns
+        assert 'source_kind' in columns
+        assert 'source_refs_json' in columns
+        assert 'source_excerpt' in columns
         assert 'candidate_id' in columns
         assert 'review_status' in columns
         assert 'evidence_note' in columns
@@ -66,6 +80,28 @@ def test_db_schema_upgrades():
         cursor = conn.execute("PRAGMA table_info(FactCandidate)")
         columns = [row['name'] for row in cursor.fetchall()]
         assert 'fact_stage' in columns
+        assert 'candidate_type' in columns
+        assert 'source_refs_json' in columns
+        assert 'source_excerpt' in columns
+        assert 'verification_status' in columns
+        assert 'round_number' in columns
+
+        cursor = conn.execute("PRAGMA table_info(Claim)")
+        columns = [row['name'] for row in cursor.fetchall()]
+        assert 'support_fact_ids_json' in columns
+        assert 'rationale_short' in columns
+        assert 'claim_score' in columns
+        assert 'status' in columns
+        assert 'candidate_id' in columns
+
+        cursor = conn.execute("PRAGMA table_info(ClaimCandidate)")
+        columns = [row['name'] for row in cursor.fetchall()]
+        assert 'support_fact_ids_json' in columns
+        assert 'rationale_short' in columns
+        assert 'status' in columns
+        assert 'review_note' in columns
+        assert 'claim_score' in columns
+        assert 'accepted_claim_id' in columns
         
         # Check vector tables
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vec_facts'")
@@ -76,6 +112,44 @@ def test_db_schema_upgrades():
         assert cursor.fetchone() is not None
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'")
         assert cursor.fetchone() is not None
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='claims_fts'")
+        assert cursor.fetchone() is not None
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='web_evidence_fts'")
+        assert cursor.fetchone() is not None
+
+
+def test_vote_record_insert_and_query():
+    with get_db() as conn:
+        cursor = conn.execute("INSERT INTO Topic (summary, detail) VALUES ('Topic A', 'Detail A')")
+        topic_id = cursor.lastrowid
+        cursor = conn.execute(
+            "INSERT INTO Subtopic (topic_id, summary, detail, status) VALUES (?, ?, ?, 'Open')",
+            (topic_id, "Subtopic A", "Subtopic Detail"),
+        )
+        subtopic_id = cursor.lastrowid
+
+    api.insert_vote_record(
+        topic_id,
+        subtopic_id,
+        3,
+        "termination",
+        "Current subtopic summary",
+        "Prompt snapshot",
+        "critic",
+        True,
+        "continue",
+        "central blocker remains",
+        '{"vote":"continue"}',
+        metadata_json='{"centrality":"central"}',
+    )
+
+    rows = api.get_vote_records(topic_id, subtopic_id=subtopic_id, vote_kind="termination", round_number=3)
+
+    assert len(rows) == 1
+    assert rows[0]["voter"] == "critic"
+    assert rows[0]["decision"] == "continue"
+    assert rows[0]["reason"] == "central blocker remains"
+    assert rows[0]["raw_response"] == '{"vote":"continue"}'
 
 def test_sqlite_vec_extension():
     with get_db() as conn:
@@ -209,3 +283,27 @@ def test_message_round_and_turn_metadata_persist():
 
     assert row["round_number"] == 3
     assert row["turn_kind"] == "cat_expansion"
+
+
+def test_claim_candidate_and_claim_persist():
+    with get_db() as conn:
+        cursor = conn.execute("INSERT INTO Topic (summary, detail) VALUES ('Topic A', 'Detail A')")
+        topic_id = cursor.lastrowid
+        cursor = conn.execute(
+            "INSERT INTO ClaimCandidate (topic_id, subtopic_id, candidate_text, support_fact_ids_json, rationale_short) VALUES (?, ?, ?, ?, ?)",
+            (topic_id, None, "Supported claim", "[1,2]", "Both facts point in the same direction."),
+        )
+        claim_candidate_id = cursor.lastrowid
+        cursor = conn.execute(
+            "INSERT INTO Claim (topic_id, subtopic_id, content, support_fact_ids_json, rationale_short, claim_score, candidate_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (topic_id, None, "Supported claim", "[1,2]", "Both facts point in the same direction.", 7.5, claim_candidate_id),
+        )
+        claim_id = cursor.lastrowid
+
+    with get_db() as conn:
+        claim_candidate = conn.execute("SELECT * FROM ClaimCandidate WHERE id = ?", (claim_candidate_id,)).fetchone()
+        claim = conn.execute("SELECT * FROM Claim WHERE id = ?", (claim_id,)).fetchone()
+
+    assert claim_candidate["candidate_text"] == "Supported claim"
+    assert claim["content"] == "Supported claim"
+    assert claim["candidate_id"] == claim_candidate_id

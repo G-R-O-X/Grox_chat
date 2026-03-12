@@ -9,6 +9,7 @@ from grox_chat.broker import (
     BrokerResponse,
     call_text,
     call_via_broker,
+    get_or_collect_search_evidence_item,
     llm_call,
     llm_call_with_web,
     PROFILE_GEMINI_FLASH,
@@ -115,6 +116,70 @@ async def test_broker_routes_minimax_direct_requests_through_query_minimax():
 
     assert result.text == "plain-result"
     query_minimax.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_broker_reuses_cached_web_evidence_before_running_fresh_search():
+    cached_rows = [
+        {
+            "id": 17,
+            "query_text": "query",
+            "title": "Cached title",
+            "snippet": "Cached snippet",
+            "url": "https://example.com/a",
+            "source_domain": "example.com",
+            "content": "Cached title Cached snippet query example.com",
+        }
+    ]
+
+    with patch("grox_chat.broker.api.search_web_evidence_same_topic", return_value=cached_rows):
+        with patch("grox_chat.broker.api.search_web_evidence_cross_topic", return_value=[]):
+            with patch("grox_chat.broker.arerank", new=AsyncMock(return_value=[(0, 0.9)])):
+                with patch("grox_chat.broker.minimax_search", new=AsyncMock()) as minimax_search:
+                    item = await get_or_collect_search_evidence_item(
+                        "query",
+                        topic_id=1,
+                        subtopic_id=2,
+                        role="dreamer",
+                    )
+
+    assert item.web_ids == (17,)
+    assert "[W17]" in item.rendered_results
+    minimax_search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_broker_ignores_low_scoring_cached_web_evidence_and_runs_fresh_search():
+    cached_rows = [
+        {
+            "id": 17,
+            "query_text": "query",
+            "title": "Cached title",
+            "snippet": "Cached snippet",
+            "url": "https://example.com/a",
+            "source_domain": "example.com",
+            "content": "Cached title Cached snippet query example.com",
+        }
+    ]
+
+    with patch("grox_chat.broker.api.search_web_evidence_same_topic", return_value=cached_rows):
+        with patch("grox_chat.broker.api.search_web_evidence_cross_topic", return_value=[]):
+            with patch("grox_chat.broker.arerank", new=AsyncMock(return_value=[(0, 0.35)])):
+                with patch(
+                    "grox_chat.broker.minimax_search",
+                    new=AsyncMock(return_value={"organic": [{"title": "Fresh", "snippet": "Fresh snippet", "link": "https://fresh.example.com"}]}),
+                ) as minimax_search:
+                    with patch("grox_chat.broker.api.insert_web_evidence", return_value=21):
+                        item = await get_or_collect_search_evidence_item(
+                            "query",
+                            topic_id=1,
+                            subtopic_id=2,
+                            role="dreamer",
+                        )
+
+    minimax_search.assert_awaited_once()
+    assert item.web_ids == (21,)
+    assert "[W21]" in item.rendered_results
 
 
 @pytest.mark.asyncio

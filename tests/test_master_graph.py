@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from grox_chat.master_graph import (
     ask_gemini_cli,
+    _collect_votes,
     node_inspect_topic_state,
     node_open_next_subtopic,
     node_plan_generation,
@@ -29,6 +30,27 @@ async def test_ask_gemini_cli_defaults_to_flash_first():
     assert llm_call_with_web.await_args.kwargs["model"] == "gemini-3.0-flash"
     assert llm_call_with_web.await_args.kwargs["require_json"] is True
     assert llm_call_with_web.await_args.kwargs["search_budget"] == 2
+
+
+@pytest.mark.asyncio
+async def test_ask_gemini_cli_retries_invalid_json_before_succeeding():
+    bad_result = AsyncMock()
+    bad_result.text = "not json"
+    bad_result.provider_used = "minimax"
+    bad_result.fallback_used = True
+    bad_result.search_used = False
+
+    good_result = AsyncMock()
+    good_result.text = '{"ok": true, "step": 2}'
+    good_result.provider_used = "minimax"
+    good_result.fallback_used = True
+    good_result.search_used = False
+
+    with patch("grox_chat.master_graph.llm_call_with_web", new=AsyncMock(side_effect=[bad_result, good_result])) as llm_call_with_web:
+        result = await ask_gemini_cli("System", "Context", "skynet")
+
+    assert result == {"ok": True, "step": 2}
+    assert llm_call_with_web.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -60,6 +82,44 @@ async def test_node_plan_generation():
 
     assert new_state["plan_id"] == 7
     assert new_state["next_action"] == "open_next_subtopic"
+
+
+@pytest.mark.asyncio
+async def test_collect_votes_persists_reasoned_vote_records():
+    fake_agent = AsyncMock()
+    fake_agent.vote_detail = AsyncMock(
+        side_effect=[
+            {"decision": True, "decision_label": "yes", "reason": "non-redundant axis", "raw_response": '{"vote":"yes","reason":"non-redundant axis"}'},
+            {"decision": False, "decision_label": "no", "reason": "too overlapping", "raw_response": '{"vote":"no","reason":"too overlapping"}'},
+        ]
+    )
+
+    with patch("grox_chat.master_graph.voting_agents", return_value=["dreamer", "critic"]):
+        with patch("grox_chat.master_graph.get_agent", return_value=fake_agent):
+            with patch("grox_chat.master_graph.api.insert_vote_record") as insert_vote_record:
+                tally = await _collect_votes(
+                    "Vote prompt",
+                    topic_id=11,
+                    subtopic_id=None,
+                    round_number=None,
+                    vote_kind="candidate_admission",
+                    subject="Subtopic A",
+                )
+
+    assert tally == {"yes_votes": 1, "successful_votes": 2, "failed_votes": 0}
+    assert insert_vote_record.call_count == 2
+    assert insert_vote_record.call_args_list[0].args[:10] == (
+        11,
+        None,
+        None,
+        "candidate_admission",
+        "Subtopic A",
+        "Vote prompt",
+        "dreamer",
+        True,
+        "yes",
+        "non-redundant axis",
+    )
 
 
 @pytest.mark.asyncio

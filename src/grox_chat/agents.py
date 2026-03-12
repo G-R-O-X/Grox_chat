@@ -7,6 +7,7 @@ from typing import Optional
 
 from .broker import PROFILE_GEMINI_FLASH, PROFILE_MINIMAX, llm_call
 from .prompts import PROMPTS
+from .structured_retry import retry_structured_output, usable_text_output
 
 logger = logging.getLogger(__name__)
 
@@ -202,23 +203,43 @@ def _extract_json_vote(text: str) -> Optional[dict]:
 
 
 def parse_vote_response(text: str) -> Optional[bool]:
+    payload = parse_vote_payload(text)
+    return None if payload is None else payload["decision"]
+
+
+def parse_vote_payload(text: str) -> Optional[dict]:
     parsed = _extract_json_vote(text)
     if isinstance(parsed, dict):
         raw_vote = parsed.get("vote")
         if isinstance(raw_vote, bool):
-            return raw_vote
+            reason = parsed.get("reason")
+            return {
+                "decision": raw_vote,
+                "decision_label": "yes" if raw_vote else "no",
+                "reason": reason.strip() if isinstance(reason, str) else "",
+            }
         if isinstance(raw_vote, str):
             normalized = raw_vote.strip().lower()
             if normalized in {"yes", "true", "continue", "approve", "select", "replan", "close"}:
-                return True
+                reason = parsed.get("reason")
+                return {
+                    "decision": True,
+                    "decision_label": "yes",
+                    "reason": reason.strip() if isinstance(reason, str) else "",
+                }
             if normalized in {"no", "false", "reject", "skip", "deny"}:
-                return False
+                reason = parsed.get("reason")
+                return {
+                    "decision": False,
+                    "decision_label": "no",
+                    "reason": reason.strip() if isinstance(reason, str) else "",
+                }
             return None
     normalized_text = (text or "").strip().lower()
     if normalized_text in {"yes", "true"} or normalized_text.startswith("yes ") or normalized_text.startswith("true "):
-        return True
+        return {"decision": True, "decision_label": "yes", "reason": ""}
     if normalized_text in {"no", "false"} or normalized_text.startswith("no ") or normalized_text.startswith("false "):
-        return False
+        return {"decision": False, "decision_label": "no", "reason": ""}
     return None
 
 
@@ -266,26 +287,51 @@ class Agent:
         return result.text
 
     async def vote(self, prompt: str, *, allow_web: bool = False) -> Optional[bool]:
+        payload = await self.vote_detail(prompt, allow_web=allow_web)
+        return None if payload is None else payload["decision"]
+
+    async def vote_detail(self, prompt: str, *, allow_web: bool = False) -> Optional[dict]:
+        del allow_web
         vote_instruction = (
             f"{self.spec.role_prompt}\n\n"
             "VOTING MODE:\n"
             "You are not posting a normal debate message. "
-            'You must reply with strict JSON only: {"vote":"yes"} or {"vote":"no"}.'
+            'You must reply with strict JSON only using this schema: {"vote":"yes|no","reason":"short sentence"}. '
+            "The `reason` must be brief and concrete."
         )
-        result = await llm_call(
-            prompt,
-            system_prompt=vote_instruction,
-            provider_profile=self.spec.default_provider,
-            require_json=True,
-            role=self.spec.name,
-            temperature=0.7,
-            max_tokens=8192,
+        result = await retry_structured_output(
+            stage_name=f"{self.spec.name} vote",
+            logger=logger,
+            is_usable=lambda item: parse_vote_payload(item.text) is not None,
+            invoke=lambda: llm_call(
+                prompt,
+                system_prompt=vote_instruction,
+                provider_profile=self.spec.default_provider,
+                require_json=True,
+                role=self.spec.name,
+                temperature=0.7,
+                max_tokens=8192,
+            ),
         )
-        parsed_vote = parse_vote_response(result.text)
+        if result is None:
+            logger.info(
+                "[Vote] agent=%s parsed=%s decision=%s reason=%s raw_response=%s",
+                self.spec.name,
+                None,
+                None,
+                "",
+                "",
+            )
+            return None
+        parsed_vote = parse_vote_payload(result.text)
+        if parsed_vote is not None:
+            parsed_vote = {**parsed_vote, "raw_response": result.text}
         logger.info(
-            "[Vote] agent=%s parsed=%s raw_response=%s",
+            "[Vote] agent=%s parsed=%s decision=%s reason=%s raw_response=%s",
             self.spec.name,
-            parsed_vote,
+            parsed_vote is not None,
+            parsed_vote["decision_label"] if parsed_vote is not None else None,
+            parsed_vote["reason"] if parsed_vote is not None else "",
             result.text,
         )
         return parsed_vote
@@ -298,16 +344,21 @@ class Agent:
             "You must analyze governance state and reply with strict JSON only using the exact schema requested in the user prompt. "
             "Do not output markdown, prose outside JSON, or extra keys."
         )
-        result = await llm_call(
-            prompt,
-            system_prompt=vote_instruction,
-            provider_profile=self.spec.default_provider,
-            require_json=True,
-            role=self.spec.name,
-            temperature=0.3,
-            max_tokens=2048,
+        result = await retry_structured_output(
+            stage_name=f"{self.spec.name} governance_vote",
+            logger=logger,
+            is_usable=lambda item: usable_text_output(item.text) and _extract_json_vote(item.text) is not None,
+            invoke=lambda: llm_call(
+                prompt,
+                system_prompt=vote_instruction,
+                provider_profile=self.spec.default_provider,
+                require_json=True,
+                role=self.spec.name,
+                temperature=0.3,
+                max_tokens=2048,
+            ),
         )
-        return result.text
+        return result.text if result is not None else ""
 
 
 def get_agent(name: str) -> Agent:

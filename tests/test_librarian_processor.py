@@ -25,6 +25,7 @@ def test_parse_librarian_review_accept_defaults_reviewed_text():
     assert review["decision"] == "accept"
     assert review["reviewed_text"] == "Original claim"
     assert review["confidence_score"] == 8.0
+    assert review["verification_status"] == "accepted"
 
 
 @pytest.mark.asyncio
@@ -48,17 +49,15 @@ async def test_apply_librarian_review_accepts_and_inserts_fact():
                     )
 
     assert result["accepted_fact_id"] == 12
-    insert_fact.assert_called_once_with(
-        1,
-        "Verified fact",
-        source="Librarian",
-        embedding=[0.1] * 384,
-        fact_stage="bootstrap",
-        candidate_id=5,
-        review_status="accept",
-        evidence_note="Matched search result.",
-        confidence_score=9.0,
-    )
+    assert insert_fact.call_args.args == (1, "Verified fact")
+    assert insert_fact.call_args.kwargs["source"] == "Librarian"
+    assert insert_fact.call_args.kwargs["embedding"] == [0.1] * 384
+    assert insert_fact.call_args.kwargs["fact_stage"] == "bootstrap"
+    assert insert_fact.call_args.kwargs["fact_type"] == "sourced_claim"
+    assert insert_fact.call_args.kwargs["candidate_id"] == 5
+    assert insert_fact.call_args.kwargs["review_status"] == "accept"
+    assert insert_fact.call_args.kwargs["evidence_note"] == "Matched search result."
+    assert insert_fact.call_args.kwargs["confidence_score"] == 9.0
     update_candidate.assert_called_once()
 
 
@@ -83,16 +82,14 @@ async def test_apply_librarian_review_softens_and_inserts_plain_fact_when_embedd
                     )
 
     assert result["accepted_fact_id"] == 14
-    insert_fact.assert_called_once_with(
-        1,
-        "No supporting empirical evidence was found in the current retrieval set.",
-        source="Librarian",
-        fact_stage="inline",
-        candidate_id=6,
-        review_status="soften",
-        evidence_note="Current retrieval set was limited.",
-        confidence_score=6.5,
-    )
+    assert insert_fact.call_args.args == (1, "No supporting empirical evidence was found in the current retrieval set.")
+    assert insert_fact.call_args.kwargs["source"] == "Librarian"
+    assert insert_fact.call_args.kwargs["fact_stage"] == "inline"
+    assert insert_fact.call_args.kwargs["fact_type"] == "sourced_claim"
+    assert insert_fact.call_args.kwargs["candidate_id"] == 6
+    assert insert_fact.call_args.kwargs["review_status"] == "soften"
+    assert insert_fact.call_args.kwargs["evidence_note"] == "Current retrieval set was limited."
+    assert insert_fact.call_args.kwargs["confidence_score"] == 6.5
     update_candidate.assert_called_once()
 
 
@@ -100,23 +97,26 @@ async def test_apply_librarian_review_softens_and_inserts_plain_fact_when_embedd
 async def test_apply_librarian_review_rejects_without_inserting_fact():
     candidate = {"id": 7, "candidate_text": "Unsupported claim", "fact_stage": "synthesized"}
 
-    with patch("grox_chat.librarian_processor.api.insert_fact") as insert_fact:
-        with patch("grox_chat.librarian_processor.api.insert_fact_with_embedding") as insert_fact_with_embedding:
-            with patch("grox_chat.librarian_processor.api.update_fact_candidate_review") as update_candidate:
-                result = await apply_librarian_review(
-                    1,
-                    candidate,
-                    {
-                        "decision": "reject",
-                        "reviewed_text": None,
-                        "review_note": "Unsupported by retrieved evidence.",
-                        "evidence_note": "Search results did not confirm the claim.",
-                        "confidence_score": 3.0,
-                    },
-                )
+    with patch("grox_chat.librarian_processor.api.get_fact_by_content", return_value=None):
+        with patch("grox_chat.librarian_processor.aget_embedding", new=AsyncMock(return_value=None)):
+            with patch("grox_chat.librarian_processor.api.insert_fact", return_value=22) as insert_fact:
+                with patch("grox_chat.librarian_processor.api.insert_fact_with_embedding") as insert_fact_with_embedding:
+                    with patch("grox_chat.librarian_processor.api.update_fact_candidate_review") as update_candidate:
+                        result = await apply_librarian_review(
+                            1,
+                            candidate,
+                            {
+                                "decision": "reject",
+                                "verification_status": "unsupported",
+                                "reviewed_text": None,
+                                "review_note": "Unsupported by retrieved evidence.",
+                                "evidence_note": "Search results did not confirm the claim.",
+                                "confidence_score": 3.0,
+                            },
+                        )
 
-    assert result["accepted_fact_id"] is None
-    insert_fact.assert_not_called()
+    assert result["accepted_fact_id"] == 22
+    assert "No reliable source was found" in insert_fact.call_args.args[1]
     insert_fact_with_embedding.assert_not_called()
     update_candidate.assert_called_once()
 
@@ -130,6 +130,6 @@ def test_build_librarian_audit_message_groups_decisions():
         ]
     )
 
-    assert "ACCEPTED:" in audit
-    assert "SOFTENED:" in audit
-    assert "REJECTED:" in audit
+    assert "FACT ACCEPTED:" in audit
+    assert "FACT SOFTENED:" in audit
+    assert "FACT REJECTED:" in audit

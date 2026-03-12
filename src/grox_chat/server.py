@@ -33,13 +33,16 @@ from .rag import assemble_rag_context, build_query_rag_context
 from .external.gemini_cli_client import warmup_gemini_cli
 from .logging_utils import configure_logging
 from .prompts import PROMPTS
-from .writer_processor import process_writer_output
+from .writer_processor import process_clerk_claim_output, process_writer_output
 from .librarian_processor import (
+    apply_claim_review,
     apply_librarian_review,
     build_librarian_audit_message,
+    parse_claim_review,
     parse_librarian_review,
 )
 from .embedding import aget_embedding
+from .structured_retry import retry_structured_output, usable_text_output
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,37 @@ SUMMARY_SECTION_HEADERS = (
     "EVIDENCE GAPS:",
     "AGENT DELTAS:",
 )
+DELIBERATION_DISCIPLINE_LINES = (
+    "DEBATE DISCIPLINE:",
+    "- Prefer net-new argument, explicit correction, or narrowed disagreement over praise, empty agreement, or broad recap.",
+    "- If you challenge a claim, identify the specific sentence, assumption, metric, or causal link you are attacking.",
+)
+WRITER_ANALYSIS_SYSTEM_PROMPT = """You are the Writer and a meta-Critic observing a multi-agent debate.
+Your job in this pass is to analyze the round, not to produce final JSON output.
+
+CRITICAL INSTRUCTION:
+Write in English only.
+Return concise plain text only.
+Do not use markdown fences, thinking tags, or extra commentary outside the requested format.
+"""
+WRITER_STAGE_MAX_ATTEMPTS = 2
+FACT_CITATION_PROTOCOL = (
+    "KNOWLEDGE CITATION PROTOCOL:\n"
+    "- Cite stored facts as `[F{id}]`.\n"
+    "- Cite stored claims as `[C{id}]`.\n"
+    "- Cite web evidence as `[W{id}]`, but describe it as unverified web evidence.\n"
+    "- `[W...]` items may guide verification, but they are not permanent facts unless later admitted as `[F...]`.\n"
+    "- Do not invent IDs.\n"
+    "- Summaries and historical messages are context only. Do not cite them as evidence."
+)
+NUMBER_FACT_LIMIT = 3
+FINAL_NUMBER_FACT_LIMIT = 4
+SOURCED_FACT_LIMIT = 2
+FINAL_SOURCED_FACT_LIMIT = 3
+CLAIM_LIMIT = 2
+FINAL_CLAIM_LIMIT = 3
+NUMERIC_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z])(?:\$)?\d[\d,]*(?:\.\d+)?%?")
+CITATION_ID_PATTERN = re.compile(r"\[(F|C|W)(\d+)\]")
 
 def extract_json(text: str) -> dict:
     import re
@@ -169,6 +203,44 @@ def _normalize_message_contract(
     }
 
 
+def _extract_allowed_citation_ids(*knowledge_blocks: str) -> dict[str, set[int]]:
+    allowed = {"F": set(), "C": set(), "W": set()}
+    for block in knowledge_blocks:
+        for prefix, raw_id in CITATION_ID_PATTERN.findall(block or ""):
+            allowed[prefix].add(int(raw_id))
+    return allowed
+
+
+def _sanitize_citations_to_allowed_ids(
+    content: str,
+    *,
+    knowledge_blocks: Sequence[str],
+) -> tuple[str, dict[str, tuple[int, ...]]]:
+    allowed = _extract_allowed_citation_ids(*knowledge_blocks)
+    removed: dict[str, list[int]] = {"F": [], "C": [], "W": []}
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix, raw_id = match.groups()
+        citation_id = int(raw_id)
+        if citation_id in allowed[prefix]:
+            return match.group(0)
+        removed[prefix].append(citation_id)
+        return ""
+
+    cleaned = CITATION_ID_PATTERN.sub(_replace, content or "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+    cleaned = re.sub(r"[ ]+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.;:!?])(?:\s*\1)+", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    deduped_removed = {
+        prefix: tuple(dict.fromkeys(values))
+        for prefix, values in removed.items()
+    }
+    return cleaned.strip(), deduped_removed
+
+
 def _normalize_fact_proposal_contract(raw_text: str) -> dict:
     parsed = extract_json(raw_text)
     if isinstance(parsed, dict):
@@ -226,6 +298,125 @@ def _normalize_focus_contract(raw_text: str) -> dict:
     }
 
 
+def _structured_message_is_usable(text: str, accepted_actions: Sequence[str] = ("post_message",)) -> bool:
+    if not usable_text_output(text):
+        return False
+    parsed = _normalize_message_contract(text, accepted_actions=accepted_actions)
+    return parsed.get("parsed_ok", False) and bool(parsed.get("content", "").strip())
+
+
+def _fact_direction_output_is_usable(text: str) -> bool:
+    if not usable_text_output(text):
+        return False
+    parsed = _normalize_fact_direction_contract(text)
+    return parsed.get("parsed_ok", False)
+
+
+def _fact_list_output_is_usable(text: str) -> bool:
+    if not usable_text_output(text):
+        return False
+    parsed = _normalize_fact_proposal_contract(text)
+    return parsed.get("parsed_ok", False)
+
+
+def _normalize_clerk_fact_candidates_contract(raw_text: str) -> dict:
+    parsed = _parse_single_json_wrapper(raw_text) or extract_json(raw_text)
+    if isinstance(parsed, dict) and parsed.get("action") == "propose_fact_candidates":
+        raw_candidates = parsed.get("fact_candidates")
+        if isinstance(raw_candidates, list):
+            candidates = []
+            for item in raw_candidates:
+                if not isinstance(item, dict):
+                    continue
+                candidate_text = item.get("candidate_text")
+                source_excerpt = item.get("source_excerpt")
+                source_refs = item.get("source_refs_json") or item.get("source_refs")
+                if not isinstance(candidate_text, str) or not candidate_text.strip():
+                    continue
+                if not isinstance(source_excerpt, str) or not source_excerpt.strip():
+                    continue
+                if not isinstance(source_refs, list):
+                    continue
+                normalized_refs = [ref.strip() for ref in source_refs if isinstance(ref, str) and ref.strip()]
+                if not normalized_refs:
+                    continue
+                candidates.append(
+                    {
+                        "candidate_text": candidate_text.strip(),
+                        "candidate_type": "sourced_claim",
+                        "source_refs": normalized_refs,
+                        "source_excerpt": source_excerpt.strip(),
+                    }
+                )
+            return {"parsed_ok": True, "fact_candidates": candidates}
+    return {"parsed_ok": False, "fact_candidates": []}
+
+
+def _fact_candidates_output_is_usable(text: str) -> bool:
+    if not usable_text_output(text):
+        return False
+    parsed = _normalize_clerk_fact_candidates_contract(text)
+    return parsed.get("parsed_ok", False)
+
+
+def _normalize_clerk_claim_candidates_contract(raw_text: str) -> dict:
+    parsed = _parse_single_json_wrapper(raw_text) or extract_json(raw_text)
+    if isinstance(parsed, dict) and parsed.get("action") == "propose_claim_candidates":
+        raw_candidates = parsed.get("claim_candidates")
+        if isinstance(raw_candidates, list):
+            candidates = []
+            for item in raw_candidates:
+                if not isinstance(item, dict):
+                    continue
+                candidate_text = item.get("candidate_text")
+                rationale_short = item.get("rationale_short")
+                support_fact_ids = item.get("support_fact_ids_json") or item.get("support_fact_ids")
+                if not isinstance(candidate_text, str) or not candidate_text.strip():
+                    continue
+                if not isinstance(rationale_short, str) or not rationale_short.strip():
+                    continue
+                if not isinstance(support_fact_ids, list):
+                    continue
+                normalized_ids: list[int] = []
+                for fact_id in support_fact_ids:
+                    try:
+                        normalized_ids.append(int(fact_id))
+                    except (TypeError, ValueError):
+                        continue
+                if not normalized_ids:
+                    continue
+                candidates.append(
+                    {
+                        "candidate_text": candidate_text.strip(),
+                        "support_fact_ids": normalized_ids,
+                        "rationale_short": rationale_short.strip(),
+                    }
+                )
+            return {"parsed_ok": True, "claim_candidates": candidates}
+    return {"parsed_ok": False, "claim_candidates": []}
+
+
+def _claim_candidates_output_is_usable(text: str) -> bool:
+    if not usable_text_output(text):
+        return False
+    parsed = _normalize_clerk_claim_candidates_contract(text)
+    return parsed.get("parsed_ok", False)
+
+
+async def _call_text_with_structured_retry(
+    *,
+    stage_name: str,
+    invoke,
+    validator,
+):
+    return await retry_structured_output(
+        stage_name=stage_name,
+        invoke=invoke,
+        is_usable=validator,
+        logger=logger,
+    )
+
+
 def _decision_passes(yes_votes: int, total_votes: int) -> bool:
     if total_votes <= 0:
         return False
@@ -268,7 +459,7 @@ def _build_vote_prompt(
                 "Vote NO if it is redundant, low-value, or off-topic.",
             ]
         )
-    lines.append('Reply with strict JSON: {"vote":"yes"} or {"vote":"no"}.')
+    lines.append('Reply with strict JSON: {"vote":"yes|no","reason":"short sentence"}.')
     return "\n".join(lines)
 
 
@@ -617,6 +808,10 @@ async def _run_termination_votes(
     *,
     voters: Sequence[str],
     prompt: str,
+    topic_id: int,
+    subtopic_id: int,
+    round_number: int,
+    subject: str,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for voter in voters:
@@ -669,6 +864,33 @@ async def _run_termination_votes(
             "repair_response": repair_response,
             "parsed": parsed,
         }
+        api.insert_vote_record(
+            topic_id,
+            subtopic_id,
+            round_number,
+            "termination",
+            subject,
+            prompt,
+            voter,
+            bool(parsed["parsed_ok"]),
+            parsed["vote"] if parsed["parsed_ok"] else None,
+            parsed["override_reason"] if parsed["parsed_ok"] else None,
+            raw_response,
+            metadata_json=json.dumps(
+                {
+                    "main_branch": parsed["main_branch"],
+                    "centrality": parsed["centrality"],
+                    "recent_shift": parsed["recent_shift"],
+                    "conditional_support": parsed["conditional_support"],
+                    "untested_novelty": parsed["untested_novelty"],
+                    "override_reason": parsed["override_reason"],
+                    "invalid_reason": parsed["invalid_reason"],
+                    "repair_used": repair_used,
+                    "repair_response": repair_response,
+                },
+                ensure_ascii=True,
+            ),
+        )
         logger.info(
             "[GovVote] agent=%s parsed_ok=%s vote=%s centrality=%s recent_shift=%s conditional_support=%s untested_novelty=%s override_reason=%s invalid_reason=%s repair_used=%s raw_response=%s repair_response=%s",
             voter,
@@ -815,6 +1037,8 @@ def _seed_messages_for_rag(topic: dict | None, subtopic: dict | None, messages: 
 def should_enable_web_search(state: ChatState, actor: str, turn_kind: str) -> bool:
     if actor == state.get("spectator_web_boost_target") and turn_kind == BASE_TURN:
         return True
+    if actor == SPECTATOR:
+        return False
     phase = state.get("phase", get_phase_for_round(state.get("round_number", 1)))
     if turn_kind == TRON_REMEDIATION_TURN:
         return False
@@ -827,10 +1051,24 @@ def should_enable_web_search(state: ChatState, actor: str, turn_kind: str) -> bo
     return turn_kind in {DOG_CORRECTION_TURN, CAT_EXPANSION_TURN}
 
 
+def should_enable_web_backup(state: ChatState, actor: str, turn_kind: str) -> bool:
+    if actor == SPECTATOR:
+        return False
+    if turn_kind != BASE_TURN:
+        return False
+    phase = state.get("phase", get_phase_for_round(state.get("round_number", 1)))
+    return phase == DEBATE_PHASE
+
+
 def build_actor_system_prompt(state: ChatState, actor: str, turn_kind: str) -> str:
     phase = state.get("phase", get_phase_for_round(state.get("round_number", 1)))
     base_prompt = PROMPTS.get(actor, "")
     additions = []
+
+    additions.append(FACT_CITATION_PROTOCOL)
+
+    if actor in ordinary_deliberators():
+        additions.extend(DELIBERATION_DISCIPLINE_LINES)
 
     if actor == state.get("spectator_target") and turn_kind == BASE_TURN:
         additions.append(
@@ -853,6 +1091,9 @@ def build_actor_system_prompt(state: ChatState, actor: str, turn_kind: str) -> s
         )
 
     if actor == "contrarian":
+        additions.append(
+            "Do not just oppose the conclusion. Identify the hidden assumption the room is relying on and explain how the debate changes if it is false."
+        )
         if phase == EVIDENCE_PHASE:
             additions.append(
                 "As Contrarian in the evidence round, use concrete evidence to challenge the emerging consensus."
@@ -871,9 +1112,25 @@ def build_actor_system_prompt(state: ChatState, actor: str, turn_kind: str) -> s
             "Do not debate directly. Select exactly one ordinary deliberator for a next-round focus boost."
         )
 
+    if actor == "analyst":
+        additions.append(
+            "Do not invent exact percentages, costs, latency figures, or synthetic scores unless they are explicitly grounded in accepted facts or provided evidence. Use variables, inequalities, or relative comparisons when data is missing."
+        )
+    elif actor == "scientist":
+        additions.append(
+            "You may identify empirical uncertainty, but you may not stop there. First give the strongest theoretical conclusion justified by current facts and first-principles reasoning, then state what remains empirically unresolved."
+        )
+    elif actor == "engineer":
+        additions.append(
+            "Do not introduce hybrid, tiered, or router-heavy architectures unless you first name the concrete failure mode they solve and why a simpler design is insufficient."
+        )
+
     if actor == "dog":
         additions.append(
             "Choose exactly one target and preserve the targeting format `*growls at [Name]* ...`."
+        )
+        additions.append(
+            "Prioritize logical pressure over roleplay volume. Hunt false precision, compromise by evasion, unsupported deferment, and missing causal links."
         )
     elif actor == "cat":
         additions.append(
@@ -905,6 +1162,9 @@ def build_actor_prompt(
     subtopic: dict | None,
     messages: list[dict],
     rag_context: str,
+    *,
+    latest_summary: str = "",
+    include_output_contract: bool = True,
 ) -> str:
     phase = state.get("phase", get_phase_for_round(state.get("round_number", 1)))
     prompt = (
@@ -918,6 +1178,8 @@ def build_actor_prompt(
         prompt += f"Subtopic: {subtopic['summary']}\nDetail: {subtopic['detail']}\n"
     if rag_context:
         prompt += f"{rag_context}\n"
+    if latest_summary:
+        prompt += f"=== LATEST SUMMARY ===\n{latest_summary}\n"
 
     prompt += "=== RECENT DEBATE ===\n"
     for message in messages:
@@ -971,14 +1233,17 @@ def build_actor_prompt(
 
     prompt += (
         f"\nWEB SEARCH ENABLED: {'yes' if should_enable_web_search(state, actor, turn_kind) else 'no'}\n"
-        f"TASK: {task} "
-        "Append a `confidence_score` (0-10) in your JSON output if applicable. "
-        "Format for normal turns: {\"action\": \"post_message\", \"content\": \"...\", \"confidence_score\": 8}"
+        f"TASK: {task}"
     )
+    if include_output_contract:
+        prompt += (
+            " Append a `confidence_score` (0-10) in your JSON output if applicable. "
+            "Format for normal turns: {\"action\": \"post_message\", \"content\": \"...\", \"confidence_score\": 8}"
+        )
     return prompt
 
 
-def build_writer_prompt(
+def _build_writer_context_block(
     state: ChatState,
     topic: dict,
     messages: list[dict],
@@ -994,14 +1259,120 @@ def build_writer_prompt(
     prompt += "=== RECENT DEBATE ===\n"
     for message in messages:
         prompt += f"{_format_message_for_prompt(message)}\n"
+    return prompt
+
+
+def build_writer_diagnosis_prompt(
+    state: ChatState,
+    topic: dict,
+    messages: list[dict],
+    rag_context: str,
+) -> str:
+    prompt = _build_writer_context_block(state, topic, messages, rag_context)
+    prompt += f"\n{FACT_CITATION_PROTOCOL}\n"
+    prompt += (
+        "\nTASK: Diagnose the 2-3 most consequential reasoning failures in the recent debate. "
+        "Prefer issues such as false precision, premature compromise, empirical deferral, hidden assumptions, missing causal links, overclaiming, unsupported framing shifts, or conceptual drift. "
+        "Output plain text only using this format:\n"
+        "ISSUE 1: ...\n"
+        "WHY IT MATTERS: ...\n"
+        "ISSUE 2: ...\n"
+        "WHY IT MATTERS: ...\n"
+        "ISSUE 3: ...\n"
+        "WHY IT MATTERS: ...\n"
+        "If fewer than 3 issues matter, stop early."
+    )
+    return prompt
+
+
+def build_writer_selection_prompt(
+    state: ChatState,
+    topic: dict,
+    messages: list[dict],
+    rag_context: str,
+    diagnosis: str,
+) -> str:
+    prompt = _build_writer_context_block(state, topic, messages, rag_context)
+    prompt += f"\n{FACT_CITATION_PROTOCOL}\n"
+    prompt += (
+        "\n=== WRITER DIAGNOSIS ===\n"
+        f"{diagnosis.strip()}\n"
+        "\nTASK: Select the single most central issue for the next critique message. "
+        "Choose the issue that most affects the room's current recommendation, evidence quality, or closure readiness. "
+        "You may name one secondary issue only if it directly sharpens the main point. "
+        "Output plain text only using this format:\n"
+        "PRIMARY ISSUE: ...\n"
+        "WHY CENTRAL: ...\n"
+        "SECONDARY ISSUE: ... or none"
+    )
+    return prompt
+
+
+def build_writer_prompt(
+    state: ChatState,
+    topic: dict,
+    messages: list[dict],
+    rag_context: str,
+    diagnosis: str = "",
+    focus: str = "",
+) -> str:
+    prompt = _build_writer_context_block(state, topic, messages, rag_context)
+    prompt += f"\n{FACT_CITATION_PROTOCOL}\n"
+    if diagnosis.strip():
+        prompt += f"\n=== WRITER DIAGNOSIS ===\n{diagnosis.strip()}\n"
+    if focus.strip():
+        prompt += f"\n=== SELECTED CENTRAL ISSUE ===\n{focus.strip()}\n"
     prompt += (
         "\nTASK: Post a critique message based on the claims in the recent debate. "
+        "Center the critique on the selected primary issue. "
+        "You may mention at most one secondary issue only if it directly sharpens the same critique. "
         "Focus on weak reasoning, hallucination risk, overclaiming, missing evidence, or conceptual drift. "
-        "Do not propose facts in this step. "
+        "Do not propose facts, do not summarize the whole round, and do not judge whether the room should close. "
         "Reply with JSON using this schema: "
         "{\"action\": \"post_message\", \"content\": \"...\"}."
     )
-    return f"{PROMPTS['writer']}\n\nContext:\n{prompt}"
+    return prompt
+
+
+def _writer_text_response_is_usable(text: str) -> bool:
+    stripped = (text or "").strip()
+    return bool(stripped) and not stripped.startswith("Error:")
+
+
+def _writer_compose_response_is_usable(text: str) -> bool:
+    parsed = _normalize_message_contract(text)
+    return bool(parsed.get("parsed_ok")) and bool(parsed.get("content", "").strip())
+
+
+async def _call_writer_stage_with_retry(
+    *,
+    stage_name: str,
+    prompt: str,
+    system_instruction: str,
+    temperature: float,
+    max_tokens: int,
+    require_json: bool = False,
+    validator=None,
+) -> str:
+    validator = validator or _writer_text_response_is_usable
+    response = await retry_structured_output(
+        stage_name=stage_name,
+        logger=logger,
+        attempts=WRITER_STAGE_MAX_ATTEMPTS,
+        is_usable=validator,
+        invoke=lambda: call_text(
+            prompt,
+            provider="minimax",
+            strategy="direct",
+            allow_web=False,
+            system_instruction=system_instruction,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            fallback_role="writer",
+            require_json=require_json,
+        ),
+    )
+    return response or ""
 
 
 def build_fact_proposer_prompt(
@@ -1017,6 +1388,11 @@ def build_fact_proposer_prompt(
         f"Round: {state.get('round_number', 1)}\n"
         f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
         f"Topic: {topic['summary']}\n"
+    )
+    prompt += f"{FACT_CITATION_PROTOCOL}\n"
+    prompt += (
+        "Web evidence [W...] may be used as an unverified lead. "
+        "Only promote a [W] lead into a fact candidate when you can restate it conservatively with explicit source refs and a short source excerpt.\n"
     )
     if focus_label:
         prompt += f"Fact Stage: {fact_stage}\nFocus: {focus_label}\n"
@@ -1053,6 +1429,70 @@ def build_fact_proposer_prompt(
     return f"{PROMPTS['fact_proposer']}\n\nContext:\n{prompt}"
 
 
+def build_clerk_sourced_fact_prompt(
+    state: ChatState,
+    topic: dict,
+    messages: list[dict],
+    rag_context: str,
+    *,
+    max_facts: int,
+) -> str:
+    prompt = (
+        f"Round: {state.get('round_number', 1)}\n"
+        f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
+        f"Topic: {topic['summary']}\n"
+        f"{FACT_CITATION_PROTOCOL}\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += "=== RECENT DEBATE ===\n"
+    for message in messages:
+        prompt += f"{_format_message_for_prompt(message)}\n"
+    prompt += (
+        "\nTASK: Extract at most "
+        f"{max_facts} externally-sourced conclusion candidates that appear in the recent debate without a supporting [F...] citation. "
+        "Inspect both uncited externally-sourced statements in the debate and any retrieved [W...] items. "
+        "Only include claims that look like paper conclusions, official statistics, reputable web conclusions, or expert-source claims. "
+        "[W...] items are leads only: if a [W] item is worth keeping, rewrite it as a conservative fact candidate rather than copying raw web wording into permanent memory. "
+        "Each candidate MUST include a short source reference list and a short source excerpt. "
+        "Do not include internally-derived conclusions, summaries, or unsupported opinions. "
+        'Reply with strict JSON only: {"action":"propose_fact_candidates","fact_candidates":[{"candidate_text":"...","source_refs_json":["..."],"source_excerpt":"..."}]}.'
+    )
+    return f"{PROMPTS['fact_proposer']}\n\nContext:\n{prompt}"
+
+
+def build_clerk_claim_prompt(
+    state: ChatState,
+    topic: dict,
+    messages: list[dict],
+    rag_context: str,
+    *,
+    cited_fact_context: str,
+    max_claims: int,
+) -> str:
+    prompt = (
+        f"Round: {state.get('round_number', 1)}\n"
+        f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
+        f"Topic: {topic['summary']}\n"
+        f"{FACT_CITATION_PROTOCOL}\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += "=== VERIFIED FACTS REFERENCED THIS ROUND ===\n"
+    prompt += f"{cited_fact_context}\n"
+    prompt += "=== RECENT DEBATE ===\n"
+    for message in messages:
+        prompt += f"{_format_message_for_prompt(message)}\n"
+    prompt += (
+        "\nTASK: Extract at most "
+        f"{max_claims} derived claim candidates that are explicitly supported by cited facts [F...]. "
+        "Only propose a claim if the current messages already contain a visible evidence chain that relies on accepted facts. "
+        "Do not propose claims based only on uncited chat text. "
+        'Reply with strict JSON only: {"action":"propose_claim_candidates","claim_candidates":[{"candidate_text":"...","support_fact_ids_json":[1,2],"rationale_short":"..."}]}.'
+    )
+    return f"{PROMPTS['fact_proposer']}\n\nContext:\n{prompt}"
+
+
 def build_librarian_prompt(
     state: ChatState,
     topic: dict,
@@ -1067,15 +1507,21 @@ def build_librarian_prompt(
         f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
         f"Topic: {topic['summary']}\n"
     )
+    prompt += f"{FACT_CITATION_PROTOCOL}\n"
     if subtopic:
         prompt += f"Subtopic: {subtopic['summary']}\n"
     prompt += (
         f"Candidate ID: {candidate['id']}\n"
         f"Candidate Fact: {candidate['candidate_text']}\n"
         f"Fact Stage: {fact_stage}\n"
+        f"Candidate Type: {candidate.get('candidate_type', 'sourced_claim')}\n"
     )
     if candidate.get("evidence_note"):
         prompt += f"Evidence Note:\n{candidate['evidence_note']}\n"
+    if candidate.get("source_refs_json"):
+        prompt += f"Source Refs: {candidate['source_refs_json']}\n"
+    if candidate.get("source_excerpt"):
+        prompt += f"Source Excerpt: {candidate['source_excerpt']}\n"
     if rag_context:
         prompt += f"{rag_context}\n"
     prompt += "=== RECENT TRANSCRIPT ===\n"
@@ -1094,10 +1540,51 @@ def build_librarian_prompt(
         )
     prompt += (
         " You MUST rely on both the local context above and web-grounded verification. "
+        "If the candidate is grounded in [W...] leads, you may promote it into a durable [F...] only after verification and conservative rewriting; raw [W...] text is never permanent memory by itself. "
         "Decision rules: accept if the claim is specific and supported; soften if the core idea is supportable but the wording is too broad, too absolute, or too strong; reject if unsupported, speculative, or merely interpretive. "
+        "Use `correct` when the candidate points at a real fact but the value or wording must be repaired before storage. "
         "Absolute formulations such as `no evidence`, `always`, `never`, `proves`, or `definitively` must be softened or rejected unless the evidence explicitly supports them. "
         "Reply with STRICT JSON using this schema: "
-        "{\"action\": \"review_fact\", \"decision\": \"accept|soften|reject\", \"reviewed_text\": \"...\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"confidence_score\": 8}."
+        "{\"action\": \"review_fact\", \"decision\": \"accept|correct|soften|reject\", \"verification_status\": \"accepted|corrected|unsupported|refuted\", \"reviewed_text\": \"...\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"source_refs_json\": [\"...\"], \"source_excerpt\": \"...\", \"confidence_score\": 8}."
+    )
+    return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
+
+
+def build_claim_review_prompt(
+    state: ChatState,
+    topic: dict,
+    subtopic: dict | None,
+    candidate: dict,
+    messages: list[dict],
+    support_facts: Sequence[dict],
+    rag_context: str,
+) -> str:
+    prompt = (
+        f"Round: {state.get('round_number', 1)}\n"
+        f"Phase: {state.get('phase', get_phase_for_round(state.get('round_number', 1)))}\n"
+        f"Topic: {topic['summary']}\n"
+        f"{FACT_CITATION_PROTOCOL}\n"
+    )
+    if subtopic:
+        prompt += f"Subtopic: {subtopic['summary']}\n"
+    prompt += (
+        f"Claim Candidate ID: {candidate['id']}\n"
+        f"Claim Candidate: {candidate['candidate_text']}\n"
+    )
+    if rag_context:
+        prompt += f"{rag_context}\n"
+    prompt += "=== SUPPORT FACTS ===\n"
+    for fact in support_facts:
+        prompt += f"[F{fact['id']}] {fact['content']}\n"
+    prompt += "=== RECENT TRANSCRIPT ===\n"
+    for message in messages:
+        prompt += f"{_format_message_for_prompt(message)}\n"
+    prompt += (
+        "\nTASK: Review whether this derived claim should enter the claim table. "
+        "Accept only if the cited facts genuinely support the claim. "
+        "Soften if the direction is supportable but the wording is still too strong. "
+        "Reject if the reasoning overreaches, skips steps, or is not actually supported by the cited facts. "
+        'Reply with STRICT JSON only: {"action":"review_claim","decision":"accept|soften|reject","reviewed_text":"...","review_note":"...","supported_fact_ids":[1,2],"claim_score":7}.'
     )
     return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
 
@@ -1107,6 +1594,7 @@ def build_bootstrap_fact_direction_prompt(topic: dict, subtopic: dict) -> str:
         f"Topic: {topic['summary']}\n"
         f"Subtopic: {subtopic['summary']}\n"
         f"Subtopic Detail: {subtopic.get('detail', '')}\n"
+        f"{FACT_CITATION_PROTOCOL}\n"
         "TASK: Propose up to 3 fact directions that are worth checking before round 1 starts. "
         "These should be baseline external facts or data points that would reduce early hallucination and improve the quality of the first discussion round. "
         "Prefer directions that can be checked on reputable sources and reused later in the subtopic. "
@@ -1152,6 +1640,7 @@ def build_audience_summary_prompt(state: ChatState, topic: dict, messages: list[
         f"Round: {round_number}\n"
         f"Phase: {phase}\n"
         f"Topic: {topic['summary']}\n"
+        f"{FACT_CITATION_PROTOCOL}\n"
         "=== ROUND TRANSCRIPT ===\n"
     )
     for message in messages:
@@ -1224,6 +1713,77 @@ def _build_degraded_audience_summary(state: ChatState, messages: list[dict]) -> 
     )
 
 
+def _current_round_standard_messages(state: ChatState, *, include_npc: bool = False, limit: int = 24) -> list[dict]:
+    current_round = state.get("round_number", 1)
+    messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=limit)
+    filtered = [
+        message
+        for message in messages
+        if message.get("msg_type", "standard") == "standard"
+        and (message.get("round_number") in {None, current_round})
+    ]
+    if include_npc:
+        return filtered
+    return [
+        message
+        for message in filtered
+        if message.get("sender") not in {SKYNET, "writer", "librarian", "fact_proposer"}
+    ]
+
+
+def _extract_fact_ids_from_text(text: str) -> list[int]:
+    return [int(match.group(1)) for match in re.finditer(r"\[F(\d+)\]", text or "")]
+
+
+def _looks_like_metadata_number(token: str, context: str) -> bool:
+    normalized_context = context.lower()
+    if any(marker in normalized_context for marker in ("round ", "message ", "msg ")):
+        return True
+    digits = token.replace("$", "").replace("%", "").replace(",", "")
+    if digits.isdigit():
+        value = int(digits)
+        if 1900 <= value <= 2099:
+            return True
+    return False
+
+
+def _extract_number_fact_candidates(messages: Sequence[dict]) -> list[dict]:
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for message in messages:
+        content = message.get("content", "")
+        for line in (content or "").splitlines():
+            stripped = line.strip()
+            if not stripped or re.search(r"\[F\d+\]", stripped):
+                continue
+            for match in NUMERIC_TOKEN_PATTERN.finditer(stripped):
+                token = match.group(0)
+                if _looks_like_metadata_number(token, stripped):
+                    continue
+                candidate_text = stripped
+                normalized = " ".join(candidate_text.split())
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                candidates.append(
+                    {
+                        "candidate_text": normalized,
+                        "candidate_type": "number",
+                        "source_refs": [],
+                        "source_excerpt": normalized,
+                    }
+                )
+                break
+    return candidates
+
+
+def _render_fact_lookup_context(facts: Sequence[dict]) -> str:
+    lines: list[str] = []
+    for fact in facts:
+        lines.append(f"[F{fact['id']}] {fact['content']}")
+    return "\n".join(lines)
+
+
 async def _run_writer_critique_pass(state: ChatState) -> dict:
     current_round = state.get("round_number", 1)
     if state.get("last_writer_round") == current_round:
@@ -1246,21 +1806,43 @@ async def _run_writer_critique_pass(state: ChatState) -> dict:
         rag_messages,
         "writer",
     )
-    prompt = build_writer_prompt(state, topic, standard_messages, rag_context)
-    try:
-        resp_text = await call_text(
-            prompt,
-            provider="gemini",
-            strategy="direct",
-            allow_web=False,
-            system_instruction=PROMPTS["writer"],
-            model="gemini-3.0-flash",
-            temperature=0.7,
-            max_tokens=8192,
-            fallback_role="writer",
+    diagnosis = await _call_writer_stage_with_retry(
+        stage_name="Writer diagnosis",
+        prompt=build_writer_diagnosis_prompt(state, topic, standard_messages, rag_context),
+        system_instruction=WRITER_ANALYSIS_SYSTEM_PROMPT,
+        temperature=0.4,
+        max_tokens=1200,
+    )
+
+    focus = ""
+    if diagnosis.strip():
+        focus = await _call_writer_stage_with_retry(
+            stage_name="Writer focus selection",
+            prompt=build_writer_selection_prompt(state, topic, standard_messages, rag_context, diagnosis),
+            system_instruction=WRITER_ANALYSIS_SYSTEM_PROMPT,
+            temperature=0.2,
+            max_tokens=700,
         )
-    except Exception as exc:
-        logger.warning("[writer] All writer critique model fallbacks failed: %s", exc)
+
+    prompt = build_writer_prompt(
+        state,
+        topic,
+        standard_messages,
+        rag_context,
+        diagnosis=diagnosis,
+        focus=focus,
+    )
+    resp_text = await _call_writer_stage_with_retry(
+        stage_name="Writer compose",
+        prompt=prompt,
+        system_instruction=PROMPTS["writer"],
+        temperature=0.5,
+        max_tokens=4096,
+        require_json=True,
+        validator=_writer_compose_response_is_usable,
+    )
+    if not resp_text.strip():
+        logger.warning("[writer] All writer critique model fallbacks failed.")
         return {"last_writer_round": current_round}
 
     parsed = _normalize_message_contract(resp_text)
@@ -1284,13 +1866,12 @@ async def _run_fact_proposer_pass(state: ChatState, force: bool = False) -> dict
     elif state.get("last_fact_proposer_round") == current_round:
         return {}
 
-    logger.info("[fact_proposer] Proposing candidate facts from the round...")
+    logger.info("[fact_proposer] Clerk extracting fact and claim candidates from the round...")
     topic, subtopic = _load_context_entities(state)
     if not topic:
         return {}
 
-    messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=12)
-    standard_messages = [message for message in messages if message.get("msg_type", "standard") == "standard"]
+    standard_messages = _current_round_standard_messages(state, include_npc=False, limit=24)
     if not standard_messages:
         return {}
 
@@ -1299,69 +1880,125 @@ async def _run_fact_proposer_pass(state: ChatState, force: bool = False) -> dict
         state["topic_id"],
         state["subtopic_id"],
         rag_messages,
-        "writer",
+        "fact_proposer",
     )
-    max_facts = FINAL_WRITER_FACT_LIMIT if force else WRITER_FACT_LIMIT
-    prompt = build_fact_proposer_prompt(
+    number_limit = FINAL_NUMBER_FACT_LIMIT if force else NUMBER_FACT_LIMIT
+    sourced_limit = FINAL_SOURCED_FACT_LIMIT if force else SOURCED_FACT_LIMIT
+    claim_limit = FINAL_CLAIM_LIMIT if force else CLAIM_LIMIT
+
+    number_candidates = _extract_number_fact_candidates(standard_messages)[:number_limit]
+    if number_candidates:
+        await process_writer_output(
+            state["topic_id"],
+            state["subtopic_id"],
+            None,
+            "",
+            structured_facts=number_candidates,
+            fact_stage="synthesized",
+            round_number=current_round,
+            max_candidates=number_limit,
+        )
+
+    sourced_prompt = build_clerk_sourced_fact_prompt(
         state,
         topic,
         standard_messages,
         rag_context,
-        max_facts=max_facts,
-        fact_stage="synthesized",
+        max_facts=sourced_limit,
     )
-    try:
-        resp_text = await call_text(
-            prompt,
+    sourced_text = await _call_text_with_structured_retry(
+        stage_name="Clerk sourced fact pass",
+        validator=_fact_candidates_output_is_usable,
+        invoke=lambda: call_text(
+            sourced_prompt,
             provider="minimax",
             strategy="react",
             allow_web=True,
             system_instruction=PROMPTS["fact_proposer"],
             fallback_role="fact_proposer",
-        )
-    except Exception as exc:
-        logger.warning("[fact_proposer] MiniMax fact proposal failed: %s", exc)
-        marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
-        return {marker_key: current_round}
-
-    if (resp_text or "").strip().startswith("Error:"):
-        logger.warning("[fact_proposer] MiniMax fact proposal returned an error sentinel: %s", resp_text)
-        marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
-        return {marker_key: current_round}
-
-    parsed = _normalize_fact_proposal_contract(resp_text)
-    if not parsed["parsed_ok"]:
-        logger.warning("[fact_proposer] Invalid fact proposal contract; skipping candidate creation.")
-        marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
-        return {marker_key: current_round}
-
-    await process_writer_output(
-        state["topic_id"],
-        state["subtopic_id"],
-        None,
-        "",
-        structured_facts=parsed["facts"],
-        fact_stage="synthesized",
-        max_candidates=max_facts,
+            require_json=True,
+            topic_id=state["topic_id"],
+            subtopic_id=state["subtopic_id"],
+        ),
     )
+    if sourced_text:
+        parsed_sourced = _normalize_clerk_fact_candidates_contract(sourced_text)
+        if parsed_sourced["parsed_ok"] and parsed_sourced["fact_candidates"]:
+            await process_writer_output(
+                state["topic_id"],
+                state["subtopic_id"],
+                None,
+                "",
+                structured_facts=parsed_sourced["fact_candidates"],
+                fact_stage="synthesized",
+                round_number=current_round,
+                max_candidates=sourced_limit,
+            )
+
+    cited_fact_ids = sorted(
+        {
+            fact_id
+            for message in standard_messages
+            for fact_id in _extract_fact_ids_from_text(message.get("content", ""))
+        }
+    )
+    if cited_fact_ids:
+        support_facts = api.get_facts_by_ids(state["topic_id"], cited_fact_ids)
+        if support_facts:
+            claim_prompt = build_clerk_claim_prompt(
+                state,
+                topic,
+                standard_messages,
+                rag_context,
+                cited_fact_context=_render_fact_lookup_context(support_facts),
+                max_claims=claim_limit,
+            )
+            claim_text = await _call_text_with_structured_retry(
+                stage_name="Clerk claim pass",
+                validator=_claim_candidates_output_is_usable,
+                invoke=lambda: call_text(
+                    claim_prompt,
+                    provider="minimax",
+                    strategy="direct",
+                    allow_web=False,
+                    system_instruction=PROMPTS["fact_proposer"],
+                    fallback_role="fact_proposer",
+                    require_json=True,
+                ),
+            )
+            if claim_text:
+                parsed_claims = _normalize_clerk_claim_candidates_contract(claim_text)
+                if parsed_claims["parsed_ok"] and parsed_claims["claim_candidates"]:
+                    await process_clerk_claim_output(
+                        state["topic_id"],
+                        state["subtopic_id"],
+                        None,
+                        parsed_claims["claim_candidates"],
+                        max_candidates=claim_limit,
+                    )
+
     marker_key = "last_final_fact_proposer_round" if force else "last_fact_proposer_round"
     return {marker_key: current_round}
 
 
-async def _query_librarian_review_text(prompt: str) -> tuple[str, str]:
-    try:
-        resp_text = await call_text(
+async def _query_librarian_review_text(prompt: str, *, stage_name: str, validator) -> tuple[str, str]:
+    minimax_text = await _call_text_with_structured_retry(
+        stage_name=stage_name,
+        validator=validator,
+        invoke=lambda: call_text(
             prompt,
             provider="minimax",
             strategy="react",
             allow_web=True,
             system_instruction=PROMPTS["librarian"],
             fallback_role="librarian",
-        )
-        return resp_text, "minimax"
-    except Exception as exc:
-        logger.warning("[librarian] MiniMax review failed, escalating to Gemini Flash + Google: %s", exc)
+            require_json=True,
+        ),
+    )
+    if minimax_text:
+        return minimax_text, "minimax"
 
+    logger.warning("[librarian] MiniMax review exhausted retries, escalating to Gemini Flash + Google.")
     resp_text = await call_text(
         prompt,
         provider="gemini",
@@ -1372,6 +2009,7 @@ async def _query_librarian_review_text(prompt: str) -> tuple[str, str]:
         temperature=0.7,
         max_tokens=8192,
         fallback_role="librarian",
+        require_json=True,
     )
     return resp_text, "gemini"
 
@@ -1382,7 +2020,7 @@ async def _run_librarian_pass(
     candidate_ids: Optional[Sequence[int]] = None,
     emit_audit_message: bool = True,
 ) -> dict:
-    logger.info("[librarian] Reviewing pending fact candidates...")
+    logger.info("[librarian] Reviewing pending fact and claim candidates...")
     topic, subtopic = _load_context_entities(state)
     if not topic or not subtopic:
         return {}
@@ -1391,8 +2029,7 @@ async def _run_librarian_pass(
     if candidate_ids is not None:
         allowed_ids = set(candidate_ids)
         pending_candidates = [candidate for candidate in pending_candidates if candidate["id"] in allowed_ids]
-    if not pending_candidates:
-        return {}
+    pending_claims = api.get_pending_claim_candidates(state["topic_id"], state["subtopic_id"])
 
     messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=12)
     recent_message_ids = [message["id"] for message in messages if "id" in message]
@@ -1406,7 +2043,11 @@ async def _run_librarian_pass(
         )
         prompt = build_librarian_prompt(state, topic, subtopic, candidate, messages, rag_context)
         try:
-            resp_text, provider = await _query_librarian_review_text(prompt)
+            resp_text, provider = await _query_librarian_review_text(
+                prompt,
+                stage_name=f"Librarian fact review {candidate['id']}",
+                validator=lambda text: usable_text_output(text) and bool(extract_json(text)),
+            )
             try:
                 review = parse_librarian_review(resp_text, candidate["candidate_text"])
             except Exception:
@@ -1438,6 +2079,68 @@ async def _run_librarian_pass(
                 exc,
             )
 
+    for candidate in pending_claims:
+        support_ids = _extract_fact_ids_from_text(candidate.get("support_fact_ids_json", "")) if isinstance(candidate.get("support_fact_ids_json"), str) else []
+        try:
+            if isinstance(candidate.get("support_fact_ids_json"), str):
+                support_ids = [int(item) for item in json.loads(candidate["support_fact_ids_json"] or "[]")]
+        except Exception:
+            support_ids = []
+        support_facts = api.get_facts_by_ids(state["topic_id"], support_ids)
+        if not support_facts:
+            logger.warning("[librarian] Claim candidate %s has no valid support facts; rejecting in place.", candidate["id"])
+            api.update_claim_candidate_review(
+                candidate["id"],
+                "reject",
+                review_note="No valid support facts were available for review.",
+            )
+            review_results.append(
+                {
+                    "candidate_id": candidate["id"],
+                    "record_kind": "claim",
+                    "decision": "reject",
+                    "review_note": "No valid support facts were available for review.",
+                }
+            )
+            continue
+        rag_context, _ = await build_query_rag_context(
+            state["topic_id"],
+            candidate["candidate_text"],
+            exclude_ids=recent_message_ids,
+        )
+        prompt = build_claim_review_prompt(state, topic, subtopic, candidate, messages, support_facts, rag_context)
+        try:
+            resp_text, provider = await _query_librarian_review_text(
+                prompt,
+                stage_name=f"Librarian claim review {candidate['id']}",
+                validator=lambda text: usable_text_output(text) and bool(extract_json(text)),
+            )
+            try:
+                review = parse_claim_review(resp_text, candidate["candidate_text"], support_ids)
+            except Exception:
+                if provider != "minimax":
+                    raise
+                resp_text = await call_text(
+                    prompt,
+                    provider="gemini",
+                    strategy="direct",
+                    allow_web=True,
+                    system_instruction=PROMPTS["librarian"],
+                    model="gemini-3.0-flash",
+                    temperature=0.7,
+                    max_tokens=8192,
+                    fallback_role="librarian",
+                    require_json=True,
+                )
+                review = parse_claim_review(resp_text, candidate["candidate_text"], support_ids)
+            review_results.append(await apply_claim_review(state["topic_id"], candidate, review))
+        except Exception as exc:
+            logger.warning(
+                "[librarian] Failed to review claim candidate %s; leaving pending: %s",
+                candidate["id"],
+                exc,
+            )
+
     if not review_results or not emit_audit_message:
         return {}
 
@@ -1460,8 +2163,10 @@ async def bootstrap_fact_intake_node(state: ChatState) -> dict:
         return {}
 
     direction_prompt = build_bootstrap_fact_direction_prompt(topic, subtopic)
-    try:
-        direction_text = await call_text(
+    direction_text = await _call_text_with_structured_retry(
+        stage_name="Bootstrap fact direction generation",
+        validator=_fact_direction_output_is_usable,
+        invoke=lambda: call_text(
             direction_prompt,
             provider="gemini",
             strategy="direct",
@@ -1469,9 +2174,11 @@ async def bootstrap_fact_intake_node(state: ChatState) -> dict:
             system_instruction=PROMPTS["skynet"],
             model="gemini-3.0-flash",
             fallback_role=SKYNET,
-        )
-    except Exception as exc:
-        logger.warning("[skynet] Bootstrap fact direction generation failed: %s", exc)
+            require_json=True,
+        ),
+    )
+    if not direction_text:
+        logger.warning("[skynet] Bootstrap fact direction generation failed.")
         return {}
 
     parsed_directions = _normalize_fact_direction_contract(direction_text)
@@ -1487,6 +2194,8 @@ async def bootstrap_fact_intake_node(state: ChatState) -> dict:
                 f"Gather evidence for this bootstrap fact direction:\n{direction}",
                 max_iter=1,
                 system_prompt=PROMPTS["fact_proposer"],
+                topic_id=state["topic_id"],
+                subtopic_id=state["subtopic_id"],
             )
         except Exception as exc:
             logger.warning("[skynet] Bootstrap search failed for direction '%s': %s", direction, exc)
@@ -1521,17 +2230,20 @@ async def bootstrap_fact_intake_node(state: ChatState) -> dict:
             fact_stage="bootstrap",
             focus_label=direction,
         )
-        try:
-            proposer_text = await call_text(
+        proposer_text = await _call_text_with_structured_retry(
+            stage_name=f"Bootstrap fact proposal {direction[:48]}",
+            validator=_fact_list_output_is_usable,
+            invoke=lambda: call_text(
                 proposer_prompt,
                 provider="minimax",
                 strategy="direct",
                 allow_web=False,
                 system_instruction=PROMPTS["fact_proposer"],
                 fallback_role="fact_proposer",
-            )
-        except Exception as exc:
-            logger.warning("[fact_proposer] Bootstrap fact proposal failed for '%s': %s", direction, exc)
+                require_json=True,
+            ),
+        )
+        if not proposer_text:
             continue
 
         parsed = _normalize_fact_proposal_contract(proposer_text)
@@ -1546,6 +2258,7 @@ async def bootstrap_fact_intake_node(state: ChatState) -> dict:
             structured_facts=parsed["facts"],
             fact_stage="bootstrap",
             evidence_note=evidence_note,
+            round_number=state.get("round_number"),
             max_candidates=1,
         )
         created_candidate_ids.extend(candidate_ids)
@@ -1595,17 +2308,20 @@ async def _run_inline_fact_intake(
         fact_stage="inline",
         focus_label=f"Turn actor: {actor}",
     )
-    try:
-        proposer_text = await call_text(
+    proposer_text = await _call_text_with_structured_retry(
+        stage_name=f"Inline fact proposal {actor}",
+        validator=_fact_list_output_is_usable,
+        invoke=lambda: call_text(
             prompt,
             provider="minimax",
             strategy="direct",
             allow_web=False,
             system_instruction=PROMPTS["fact_proposer"],
             fallback_role="fact_proposer",
-        )
-    except Exception as exc:
-        logger.warning("[fact_proposer] Inline fact proposal failed for %s: %s", actor, exc)
+            require_json=True,
+        ),
+    )
+    if not proposer_text:
         return
 
     parsed = _normalize_fact_proposal_contract(proposer_text)
@@ -1620,6 +2336,7 @@ async def _run_inline_fact_intake(
         structured_facts=parsed["facts"],
         fact_stage="inline",
         evidence_note=_render_search_evidence_note(search_evidence),
+        round_number=state.get("round_number"),
         max_candidates=INLINE_FACT_LIMIT,
     )
     if candidate_ids:
@@ -1638,16 +2355,47 @@ async def expert_node(state: ChatState) -> dict:
     if not topic:
         return {"current_actor": ""}
     messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=6)
+    summary_messages = api.get_messages(
+        state["topic_id"],
+        subtopic_id=state["subtopic_id"],
+        limit=1,
+        msg_type="summary",
+    )
+    latest_summary = summary_messages[-1]["content"] if summary_messages else ""
 
     rag_messages = _seed_messages_for_rag(topic, subtopic, messages)
+    system_prompt = build_actor_system_prompt(state, actor, turn_kind)
+    planner_prompt = build_actor_prompt(
+        state,
+        actor,
+        turn_kind,
+        topic,
+        subtopic,
+        messages,
+        "",
+        latest_summary=latest_summary,
+        include_output_contract=False,
+    )
     rag_context, rag_degraded = await assemble_rag_context(
-        topic['id'],
-        subtopic['id'] if subtopic else 0,
+        topic["id"],
+        subtopic["id"] if subtopic else 0,
         rag_messages,
         actor,
+        planner_system_prompt=system_prompt,
+        planner_context=planner_prompt,
+        latest_summary=latest_summary,
+        allow_web_backup=should_enable_web_backup(state, actor, turn_kind),
     )
-    prompt = build_actor_prompt(state, actor, turn_kind, topic, subtopic, messages, rag_context)
-    system_prompt = build_actor_system_prompt(state, actor, turn_kind)
+    prompt = build_actor_prompt(
+        state,
+        actor,
+        turn_kind,
+        topic,
+        subtopic,
+        messages,
+        rag_context,
+        latest_summary=latest_summary,
+    )
 
     # Model call depending on role and phase
     search_failed = False
@@ -1655,14 +2403,26 @@ async def expert_node(state: ChatState) -> dict:
     if should_enable_web_search(state, actor, turn_kind):
         logger.info(f"[{actor}] Entering ReAct search loop...")
         try:
-            response = await call_text_with_search_evidence(
-                prompt,
-                provider="minimax",
-                strategy="react",
-                allow_web=True,
-                system_instruction=system_prompt,
-                fallback_role=actor,
+            response = await _call_text_with_structured_retry(
+                stage_name=f"{actor} web turn",
+                validator=lambda item: (
+                    bool(_normalize_focus_contract(item.text)["parsed_ok"])
+                    if actor == SPECTATOR
+                    else _structured_message_is_usable(item.text, accepted_actions=("post_message",))
+                ),
+                invoke=lambda: call_text_with_search_evidence(
+                    prompt,
+                    provider="minimax",
+                    strategy="react",
+                    allow_web=True,
+                    system_instruction=system_prompt,
+                    fallback_role=actor,
+                    topic_id=state["topic_id"],
+                    subtopic_id=state["subtopic_id"],
+                ),
             )
+            if response is None:
+                raise RuntimeError("structured retry exhausted")
             resp_text = response.text
             search_evidence = response.search_evidence
             search_failed = response.search_failed
@@ -1672,14 +2432,25 @@ async def expert_node(state: ChatState) -> dict:
             search_failed = True
     else:
         try:
-            resp_text = await call_text(
-                prompt,
-                provider=get_agent_spec(actor).default_provider,
-                strategy="direct",
-                allow_web=False,
-                system_instruction=system_prompt,
-                fallback_role=actor,
+            resp_text = await _call_text_with_structured_retry(
+                stage_name=f"{actor} direct turn",
+                validator=lambda text: (
+                    bool(_normalize_focus_contract(text)["parsed_ok"])
+                    if actor == SPECTATOR
+                    else _structured_message_is_usable(text, accepted_actions=("post_message",))
+                ),
+                invoke=lambda: call_text(
+                    prompt,
+                    provider=get_agent_spec(actor).default_provider,
+                    strategy="direct",
+                    allow_web=False,
+                    system_instruction=system_prompt,
+                    fallback_role=actor,
+                    require_json=True,
+                ),
             )
+            if resp_text is None:
+                raise RuntimeError("structured retry exhausted")
         except Exception as exc:
             logger.warning("[%s] Direct broker call failed: %s", actor, exc)
             resp_text = str(exc)
@@ -1697,7 +2468,27 @@ async def expert_node(state: ChatState) -> dict:
 
     fallback_confidence = DEGRADED_OPERATION_CONFIDENCE if (rag_degraded or search_failed) else None
     parsed = _normalize_message_contract(resp_text, fallback_confidence=fallback_confidence)
-    content = parsed["content"]
+    citation_knowledge_blocks = [rag_context] + [
+        item.rendered_results for item in search_evidence if item.rendered_results
+    ]
+    if latest_summary:
+        citation_knowledge_blocks.append(latest_summary)
+    for msg in messages:
+        if msg.get("content"):
+            citation_knowledge_blocks.append(msg["content"])
+
+    content, removed_citations = _sanitize_citations_to_allowed_ids(
+        parsed["content"],
+        knowledge_blocks=citation_knowledge_blocks,
+    )
+    if any(removed_citations.values()):
+        logger.info(
+            "[%s] Stripped citations not present in injected knowledge F=%s C=%s W=%s",
+            actor,
+            removed_citations["F"],
+            removed_citations["C"],
+            removed_citations["W"],
+        )
     confidence_score = parsed["confidence_score"]
     if not parsed["parsed_ok"]:
         confidence_score = min(confidence_score if confidence_score is not None else PARSER_FAILURE_CONFIDENCE, PARSER_FAILURE_CONFIDENCE)
@@ -1755,8 +2546,10 @@ async def audience_summary_node(state: ChatState) -> dict:
     messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=20)
 
     prompt = build_audience_summary_prompt(state, topic, messages)
-    try:
-        resp_text = await call_text(
+    resp_text = await _call_text_with_structured_retry(
+        stage_name="Round summary generation",
+        validator=lambda text: _structured_message_is_usable(text, accepted_actions=("post_summary", "post_message")),
+        invoke=lambda: call_text(
             prompt,
             provider="gemini",
             strategy="direct",
@@ -1764,9 +2557,10 @@ async def audience_summary_node(state: ChatState) -> dict:
             system_instruction=PROMPTS["skynet"],
             model="gemini-3.0-flash",
             fallback_role=SKYNET,
-        )
-    except Exception as exc:
-        logger.warning("[skynet] Summary generation degraded after all model fallbacks failed: %s", exc)
+            require_json=True,
+        ),
+    )
+    if not resp_text:
         resp_text = json.dumps({
             "action": "post_summary",
             "content": _build_degraded_audience_summary(state, messages),
@@ -1811,8 +2605,8 @@ async def audience_termination_check_node(state: ChatState) -> dict:
         logger.info("[skynet] Forcing subtopic close at round %s.", current_round)
         return {"subtopic_exhausted": True}
 
-    topic, _ = _load_context_entities(state)
-    if not topic:
+    topic, subtopic = _load_context_entities(state)
+    if not topic or not subtopic:
         return {"subtopic_exhausted": True}
     messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=20)
 
@@ -1871,6 +2665,10 @@ async def audience_termination_check_node(state: ChatState) -> dict:
             vote_records = await _run_termination_votes(
                 voters=voting_agents(),
                 prompt=decision_prompt,
+                topic_id=state["topic_id"],
+                subtopic_id=state["subtopic_id"],
+                round_number=current_round,
+                subject=subtopic["summary"],
             )
             aggregation = _aggregate_termination_votes(vote_records, current_round)
             logger.info(
@@ -1943,7 +2741,8 @@ async def writer_node(state: ChatState) -> dict:
 
 
 async def final_writer_node(state: ChatState) -> dict:
-    return await _run_writer_critique_pass(state)
+    logger.info("[writer] Final writer critique skipped because close-path work is harvest-only.")
+    return {}
 
 
 async def fact_proposer_node(state: ChatState) -> dict:
@@ -1961,10 +2760,12 @@ async def librarian_node(state: ChatState) -> dict:
 async def final_librarian_node(state: ChatState) -> dict:
     await _run_librarian_pass(state)
     pending_candidates = api.get_pending_fact_candidates(state["topic_id"], state["subtopic_id"])
-    if pending_candidates:
+    pending_claims = api.get_pending_claim_candidates(state["topic_id"], state["subtopic_id"])
+    if pending_candidates or pending_claims:
         logger.warning(
-            "[librarian] %s fact candidates remain pending; delaying subtopic close for another round.",
+            "[librarian] %s fact candidates and %s claim candidates remain pending; delaying subtopic close for another round.",
             len(pending_candidates),
+            len(pending_claims),
         )
         return {"pending_fact_reviews_remaining": True, "subtopic_exhausted": False}
     return {"pending_fact_reviews_remaining": False}
@@ -2000,7 +2801,6 @@ def build_graph():
     builder.add_node("audience_summary_node", audience_summary_node)
     builder.add_node("audience_termination_check_node", audience_termination_check_node)
     builder.add_node("setup_next_round_node", setup_next_round_node)
-    builder.add_node("final_writer_node", final_writer_node)
     builder.add_node("final_fact_proposer_node", final_fact_proposer_node)
     builder.add_node("final_librarian_node", final_librarian_node)
     builder.add_node("close_subtopic_node", close_subtopic_node)
@@ -2013,11 +2813,10 @@ def build_graph():
     builder.add_conditional_edges(
         "audience_termination_check_node", 
         route_after_round, 
-        {"close_subtopic": "final_writer_node", "setup_next_round": "setup_next_round_node"}
+        {"close_subtopic": "final_fact_proposer_node", "setup_next_round": "setup_next_round_node"}
     )
     
     builder.add_edge("setup_next_round_node", "dispatcher")
-    builder.add_edge("final_writer_node", "final_fact_proposer_node")
     builder.add_edge("final_fact_proposer_node", "final_librarian_node")
     builder.add_conditional_edges(
         "final_librarian_node",

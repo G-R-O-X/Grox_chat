@@ -1,20 +1,32 @@
 from .db import (
+    claim_candidate_exists as db_claim_candidate_exists,
     close_subtopic as db_close_subtopic,
+    create_claim_candidate as db_create_claim_candidate,
     create_fact_candidate as db_create_fact_candidate,
     fact_exists as db_fact_exists,
     fact_candidate_exists as db_fact_candidate_exists,
     get_db,
+    get_claim_candidates as db_get_claim_candidates,
     get_open_subtopic as db_get_open_subtopic,
     get_db_path,
+    get_facts_by_ids as db_get_facts_by_ids,
     get_fact_by_content as db_get_fact_by_content,
     get_fact_candidates as db_get_fact_candidates,
+    get_vote_records as db_get_vote_records,
+    insert_claim as db_insert_claim,
+    insert_vote_record as db_insert_vote_record,
+    insert_web_evidence as db_insert_web_evidence,
     insert_fact,
     insert_fact_with_embedding,
     insert_message_with_embedding,
+    search_claims_lexical,
     search_facts,
     search_facts_lexical,
     search_messages,
     search_messages_lexical,
+    search_web_evidence_cross_topic as db_search_web_evidence_cross_topic,
+    search_web_evidence_same_topic as db_search_web_evidence_same_topic,
+    update_claim_candidate_review as db_update_claim_candidate_review,
     update_fact_candidate_review as db_update_fact_candidate_review,
     update_plan_cursor,
     update_subtopic_start_msg,
@@ -31,7 +43,10 @@ __all__ = [
     'advance_plan_cursor', 'update_subtopic_start_msg', 'close_subtopic',
     'get_open_subtopic', 'get_db_path', 'persist_message', 'fact_exists', 'get_fact_by_content',
     'create_fact_candidate', 'create_fact_candidate_with_stage', 'get_pending_fact_candidates', 'get_fact_candidates', 'get_facts',
-    'fact_candidate_exists', 'update_fact_candidate_review'
+    'fact_candidate_exists', 'update_fact_candidate_review', 'create_claim_candidate', 'get_pending_claim_candidates',
+    'get_claim_candidates', 'claim_candidate_exists', 'update_claim_candidate_review', 'insert_claim', 'get_facts_by_ids',
+    'search_claims_hybrid', 'insert_web_evidence', 'search_web_evidence_same_topic', 'search_web_evidence_cross_topic',
+    'insert_vote_record', 'get_vote_records'
 ]
 
 def _dict(row):
@@ -229,8 +244,8 @@ def get_fact_by_content(topic_id: int, content: str):
     return db_get_fact_by_content(topic_id, content)
 
 
-def create_fact_candidate(topic_id: int, subtopic_id: int, writer_msg_id: int | None, candidate_text: str) -> int:
-    return db_create_fact_candidate(topic_id, subtopic_id, writer_msg_id, candidate_text)
+def create_fact_candidate(topic_id: int, subtopic_id: int, writer_msg_id: int | None, candidate_text: str, **kwargs) -> int:
+    return db_create_fact_candidate(topic_id, subtopic_id, writer_msg_id, candidate_text, **kwargs)
 
 
 def create_fact_candidate_with_stage(
@@ -240,7 +255,12 @@ def create_fact_candidate_with_stage(
     candidate_text: str,
     *,
     fact_stage: str,
+    candidate_type: str = "sourced_claim",
     evidence_note: str | None = None,
+    source_refs_json: str | None = None,
+    source_excerpt: str | None = None,
+    verification_status: str | None = None,
+    round_number: int | None = None,
 ) -> int:
     return db_create_fact_candidate(
         topic_id,
@@ -248,7 +268,31 @@ def create_fact_candidate_with_stage(
         writer_msg_id,
         candidate_text,
         fact_stage=fact_stage,
+        candidate_type=candidate_type,
         evidence_note=evidence_note,
+        source_refs_json=source_refs_json,
+        source_excerpt=source_excerpt,
+        verification_status=verification_status,
+        round_number=round_number,
+    )
+
+
+def create_claim_candidate(
+    topic_id: int,
+    subtopic_id: int,
+    clerk_msg_id: int | None,
+    candidate_text: str,
+    *,
+    support_fact_ids_json: str | None = None,
+    rationale_short: str | None = None,
+) -> int:
+    return db_create_claim_candidate(
+        topic_id,
+        subtopic_id,
+        clerk_msg_id,
+        candidate_text,
+        support_fact_ids_json=support_fact_ids_json,
+        rationale_short=rationale_short,
     )
 
 
@@ -256,8 +300,19 @@ def get_pending_fact_candidates(topic_id: int, subtopic_id: int):
     return db_get_fact_candidates(topic_id, subtopic_id=subtopic_id, status="pending")
 
 
+def get_pending_claim_candidates(topic_id: int, subtopic_id: int):
+    return db_get_claim_candidates(topic_id, subtopic_id=subtopic_id, status="pending")
+
+
 def get_fact_candidates(topic_id: int, subtopic_id: int | None = None, status: str | None = None, limit: int | None = None):
     candidates = db_get_fact_candidates(topic_id, subtopic_id=subtopic_id, status=status)
+    if limit is not None:
+        return candidates[:limit]
+    return candidates
+
+
+def get_claim_candidates(topic_id: int, subtopic_id: int | None = None, status: str | None = None, limit: int | None = None):
+    candidates = db_get_claim_candidates(topic_id, subtopic_id=subtopic_id, status=status)
     if limit is not None:
         return candidates[:limit]
     return candidates
@@ -276,6 +331,10 @@ def get_facts(topic_id: int, limit: int | None = None):
 
 def fact_candidate_exists(topic_id: int, candidate_text: str, statuses=None):
     return db_fact_candidate_exists(topic_id, candidate_text, statuses=statuses)
+
+
+def claim_candidate_exists(topic_id: int, candidate_text: str, statuses=None):
+    return db_claim_candidate_exists(topic_id, candidate_text, statuses=statuses)
 
 
 def update_fact_candidate_review(
@@ -300,13 +359,144 @@ def update_fact_candidate_review(
     )
 
 
+def update_claim_candidate_review(
+    candidate_id: int,
+    status: str,
+    reviewed_text: str | None = None,
+    review_note: str | None = None,
+    claim_score: float | None = None,
+    accepted_claim_id: int | None = None,
+):
+    db_update_claim_candidate_review(
+        candidate_id,
+        status,
+        reviewed_text=reviewed_text,
+        review_note=review_note,
+        claim_score=claim_score,
+        accepted_claim_id=accepted_claim_id,
+    )
+
+
+def insert_claim(
+    topic_id: int,
+    subtopic_id: int | None,
+    content: str,
+    *,
+    support_fact_ids_json: str | None = None,
+    rationale_short: str | None = None,
+    claim_score: float | None = None,
+    status: str = "active",
+    candidate_id: int | None = None,
+) -> int:
+    return db_insert_claim(
+        topic_id,
+        subtopic_id,
+        content,
+        support_fact_ids_json=support_fact_ids_json,
+        rationale_short=rationale_short,
+        claim_score=claim_score,
+        status=status,
+        candidate_id=candidate_id,
+    )
+
+
+def insert_web_evidence(
+    origin_topic_id: int,
+    origin_subtopic_id: int | None,
+    query_text: str,
+    title: str,
+    snippet: str,
+    url: str,
+    source_domain: str,
+    result_rank: int,
+    search_provider: str,
+    search_role: str,
+) -> int:
+    return db_insert_web_evidence(
+        origin_topic_id,
+        origin_subtopic_id,
+        query_text,
+        title,
+        snippet,
+        url,
+        source_domain,
+        result_rank,
+        search_provider,
+        search_role,
+    )
+
+
+def insert_vote_record(
+    topic_id: int,
+    subtopic_id: int | None,
+    round_number: int | None,
+    vote_kind: str,
+    subject: str,
+    prompt_text: str,
+    voter: str,
+    parsed_ok: bool,
+    decision: str | None,
+    reason: str | None,
+    raw_response: str,
+    metadata_json: str | None = None,
+) -> int:
+    return db_insert_vote_record(
+        topic_id,
+        subtopic_id,
+        round_number,
+        vote_kind,
+        subject,
+        prompt_text,
+        voter,
+        parsed_ok,
+        decision,
+        reason,
+        raw_response,
+        metadata_json,
+    )
+
+
+def get_vote_records(
+    topic_id: int,
+    *,
+    subtopic_id: int | None = None,
+    vote_kind: str | None = None,
+    round_number: int | None = None,
+    limit: int | None = None,
+):
+    return db_get_vote_records(
+        topic_id,
+        subtopic_id=subtopic_id,
+        vote_kind=vote_kind,
+        round_number=round_number,
+        limit=limit,
+    )
+
+
+def get_facts_by_ids(topic_id: int, fact_ids: list[int]):
+    return db_get_facts_by_ids(topic_id, fact_ids)
+
+
 def search_facts_hybrid(topic_id: int, query_text: str, query_embedding, top_k: int = 12):
     dense = search_facts(topic_id, query_embedding, top_k=top_k)
     lexical = search_facts_lexical(topic_id, query_text, top_k=top_k)
     return _merge_ranked_rows(dense, lexical, limit=top_k)
 
 
+def search_claims_hybrid(topic_id: int, query_text: str, query_embedding=None, top_k: int = 8):
+    _ = query_embedding
+    return search_claims_lexical(topic_id, query_text, top_k=top_k)
+
+
 def search_messages_hybrid(topic_id: int, query_text: str, query_embedding, msg_type: str = None, top_k: int = 8, exclude_ids=None):
     dense = search_messages(topic_id, query_embedding, msg_type=msg_type, top_k=top_k, exclude_ids=exclude_ids)
     lexical = search_messages_lexical(topic_id, query_text, msg_type=msg_type, top_k=top_k, exclude_ids=exclude_ids)
     return _merge_ranked_rows(dense, lexical, limit=top_k)
+
+
+def search_web_evidence_same_topic(topic_id: int, query_text: str, top_k: int = 8, max_age_days: int = 30):
+    return db_search_web_evidence_same_topic(topic_id, query_text, top_k=top_k, max_age_days=max_age_days)
+
+
+def search_web_evidence_cross_topic(topic_id: int, query_text: str, top_k: int = 8, max_age_days: int = 30):
+    return db_search_web_evidence_cross_topic(topic_id, query_text, top_k=top_k, max_age_days=max_age_days)

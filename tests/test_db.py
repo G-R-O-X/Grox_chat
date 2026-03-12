@@ -57,10 +57,15 @@ def test_db_schema_upgrades():
 
         cursor = conn.execute("PRAGMA table_info(Fact)")
         columns = [row['name'] for row in cursor.fetchall()]
+        assert 'fact_stage' in columns
         assert 'candidate_id' in columns
         assert 'review_status' in columns
         assert 'evidence_note' in columns
         assert 'confidence_score' in columns
+
+        cursor = conn.execute("PRAGMA table_info(FactCandidate)")
+        columns = [row['name'] for row in cursor.fetchall()]
+        assert 'fact_stage' in columns
         
         # Check vector tables
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vec_facts'")
@@ -151,8 +156,8 @@ def test_message_vector_search_is_topic_scoped():
         topic_b = cursor.lastrowid
 
     emb = [0.2] * 384
-    msg_a = insert_message_with_embedding(topic_a, None, "audience", "Summary A", "summary", emb)
-    insert_message_with_embedding(topic_b, None, "audience", "Summary B", "summary", emb)
+    msg_a = insert_message_with_embedding(topic_a, None, "skynet", "Summary A", "summary", emb)
+    insert_message_with_embedding(topic_b, None, "skynet", "Summary B", "summary", emb)
 
     results = search_messages(topic_a, emb, msg_type="summary", top_k=5, exclude_ids=[msg_a])
     assert results == []

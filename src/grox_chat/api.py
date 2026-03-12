@@ -30,7 +30,7 @@ __all__ = [
     'search_messages_lexical', 'search_facts_hybrid', 'search_messages_hybrid', 'get_active_plan',
     'advance_plan_cursor', 'update_subtopic_start_msg', 'close_subtopic',
     'get_open_subtopic', 'get_db_path', 'persist_message', 'fact_exists', 'get_fact_by_content',
-    'create_fact_candidate', 'get_pending_fact_candidates', 'get_fact_candidates', 'get_facts',
+    'create_fact_candidate', 'create_fact_candidate_with_stage', 'get_pending_fact_candidates', 'get_fact_candidates', 'get_facts',
     'fact_candidate_exists', 'update_fact_candidate_review'
 ]
 
@@ -231,6 +231,25 @@ def get_fact_by_content(topic_id: int, content: str):
 
 def create_fact_candidate(topic_id: int, subtopic_id: int, writer_msg_id: int | None, candidate_text: str) -> int:
     return db_create_fact_candidate(topic_id, subtopic_id, writer_msg_id, candidate_text)
+
+
+def create_fact_candidate_with_stage(
+    topic_id: int,
+    subtopic_id: int,
+    writer_msg_id: int | None,
+    candidate_text: str,
+    *,
+    fact_stage: str,
+    evidence_note: str | None = None,
+) -> int:
+    return db_create_fact_candidate(
+        topic_id,
+        subtopic_id,
+        writer_msg_id,
+        candidate_text,
+        fact_stage=fact_stage,
+        evidence_note=evidence_note,
+    )
 
 
 def get_pending_fact_candidates(topic_id: int, subtopic_id: int):

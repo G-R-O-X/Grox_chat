@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from aiohttp import web
 
 from . import api
+from .logging_utils import configure_logging
 
 
 def _parse_plan_items(plan):
@@ -406,6 +407,7 @@ def create_app():
 
 
 def main():
+    configure_logging()
     host = os.environ.get("GROX_WEB_HOST", "127.0.0.1")
     port = int(os.environ.get("GROX_WEB_PORT", "8080"))
     web.run_app(create_app(), host=host, port=port)

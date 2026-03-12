@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 
+from grox_chat.broker import BrokerResponse, SearchEvidenceItem
 from grox_chat.server import (
     CAT_EXPANSION_TURN,
     DEBATE_PHASE,
@@ -22,6 +23,7 @@ from grox_chat.server import (
     build_base_turns_for_phase,
     build_extra_turns,
     build_turn_queue_for_round,
+    bootstrap_fact_intake_node,
     expert_node,
     fact_proposer_node,
     final_fact_proposer_node,
@@ -492,11 +494,17 @@ async def test_expert_node_lowers_confidence_on_parse_failure():
         {"id": 1, "sender": "critic", "content": "Need stronger grounding.", "msg_type": "standard", "confidence_score": 7.0},
     ]
 
+    response = BrokerResponse(
+        text="plain text response",
+        search_evidence=(),
+        search_failed=False,
+    )
+
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("", True))):
-                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value="plain text response")):
+                    with patch("grox_chat.server.call_text_with_search_evidence", new=AsyncMock(return_value=response)):
                         with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
                             await expert_node(state)
 
@@ -564,11 +572,17 @@ async def test_contrarian_expert_node_uses_search_loop_response_instead_of_http_
 
     contrarian_reply = '{"action":"post_message","content":"The group is overconfident about soft-skill universals.","confidence_score":6}'
 
+    response = BrokerResponse(
+        text=contrarian_reply,
+        search_evidence=(),
+        search_failed=False,
+    )
+
     with patch("grox_chat.server.api.get_topic", return_value={"id": 1, "summary": "topic", "detail": "detail"}):
         with patch("grox_chat.server.api.get_subtopic", return_value={"id": 1, "summary": "subtopic", "detail": "detail"}):
             with patch("grox_chat.server.api.get_messages", return_value=messages):
                 with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
-                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=contrarian_reply)):
+                    with patch("grox_chat.server.call_text_with_search_evidence", new=AsyncMock(return_value=response)):
                         with patch("grox_chat.server.api.persist_message", new=AsyncMock()) as persist_message:
                             await expert_node(state)
 
@@ -834,3 +848,224 @@ async def test_audience_summary_node_uses_degraded_summary_when_all_model_fallba
     assert "AGENT POSITIONS:" in stored_summary
     assert "dreamer" in stored_summary
     assert "scientist" in stored_summary
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_fact_intake_searches_each_direction_independently():
+    state = {
+        "topic_id": 1,
+        "subtopic_id": 1,
+        "round_number": 1,
+    }
+    topic = {"id": 1, "summary": "topic", "detail": "detail"}
+    subtopic = {"id": 1, "summary": "subtopic", "detail": "detail"}
+    direction_reply = '{"action":"propose_fact_directions","directions":["dir one","dir two","dir three"]}'
+    proposer_reply = '{"action":"propose_facts","facts":["Fact"]}'
+    evidence = BrokerResponse(
+        text="",
+        search_evidence=(SearchEvidenceItem(query="q", rendered_results="=== WEB SEARCH RESULTS ===\nTitle: A\nSnippet: B\n"),),
+        search_failed=False,
+    )
+
+    with patch("grox_chat.server.api.get_topic", return_value=topic):
+        with patch("grox_chat.server.api.get_subtopic", return_value=subtopic):
+            with patch(
+                "grox_chat.server.call_text",
+                new=AsyncMock(side_effect=[direction_reply, proposer_reply, proposer_reply, proposer_reply]),
+            ) as call_text:
+                with patch(
+                    "grox_chat.server.collect_search_evidence_bundle",
+                    new=AsyncMock(return_value=evidence),
+                ) as collect_search:
+                    with patch(
+                        "grox_chat.server.build_query_rag_context",
+                        new=AsyncMock(return_value=("RAG", False)),
+                    ):
+                        with patch(
+                            "grox_chat.server.process_writer_output",
+                            new=AsyncMock(side_effect=[[11], [12], [13]]),
+                        ) as process_writer_output:
+                            with patch(
+                                "grox_chat.server._run_librarian_pass",
+                                new=AsyncMock(return_value={}),
+                            ) as run_librarian:
+                                await bootstrap_fact_intake_node(state)
+
+    assert call_text.await_count == 4
+    assert collect_search.await_count == 3
+    assert process_writer_output.await_count == 3
+    for call in process_writer_output.await_args_list:
+        assert call.kwargs["fact_stage"] == "bootstrap"
+        assert call.kwargs["max_candidates"] == 1
+    run_librarian.assert_awaited_once()
+    assert run_librarian.await_args.kwargs["candidate_ids"] == [11, 12, 13]
+    assert run_librarian.await_args.kwargs["emit_audit_message"] is False
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_fact_intake_skips_zero_hit_placeholder_search_results():
+    state = {
+        "topic_id": 1,
+        "subtopic_id": 1,
+        "round_number": 1,
+    }
+    topic = {"id": 1, "summary": "topic", "detail": "detail"}
+    subtopic = {"id": 1, "summary": "subtopic", "detail": "detail"}
+    direction_reply = '{"action":"propose_fact_directions","directions":["dir one"]}'
+    evidence = BrokerResponse(
+        text="",
+        search_evidence=(SearchEvidenceItem(query="q", rendered_results="=== WEB SEARCH RESULTS ===\nNo useful results found.\n\n"),),
+        search_failed=False,
+    )
+
+    with patch("grox_chat.server.api.get_topic", return_value=topic):
+        with patch("grox_chat.server.api.get_subtopic", return_value=subtopic):
+            with patch("grox_chat.server.call_text", new=AsyncMock(return_value=direction_reply)) as call_text:
+                with patch(
+                    "grox_chat.server.collect_search_evidence_bundle",
+                    new=AsyncMock(return_value=evidence),
+                ) as collect_search:
+                    with patch("grox_chat.server.process_writer_output", new=AsyncMock()) as process_writer_output:
+                        with patch("grox_chat.server._run_librarian_pass", new=AsyncMock()) as run_librarian:
+                            await bootstrap_fact_intake_node(state)
+
+    assert call_text.await_count == 1
+    collect_search.assert_awaited_once()
+    process_writer_output.assert_not_awaited()
+    run_librarian.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expert_node_runs_inline_fact_intake_after_web_enabled_turn():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "current_actor": "contrarian",
+        "current_turn_kind": "base",
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "phase": DEBATE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 3,
+    }
+    topic = {"id": 1, "summary": "topic", "detail": "detail"}
+    subtopic = {"id": 1, "summary": "subtopic", "detail": "detail"}
+    messages = [
+        {"id": 1, "sender": "critic", "content": "Need evidence", "msg_type": "standard", "confidence_score": 7.0},
+    ]
+    response = BrokerResponse(
+        text='{"action":"post_message","content":"Contrarian response","confidence_score":6}',
+        search_evidence=(SearchEvidenceItem(query="q", rendered_results="=== WEB SEARCH RESULTS ===\nTitle: A\nSnippet: B\n"),),
+        search_failed=False,
+    )
+    fact_reply = '{"action":"propose_facts","facts":["Inline fact"]}'
+
+    with patch("grox_chat.server.api.get_topic", return_value=topic):
+        with patch("grox_chat.server.api.get_subtopic", return_value=subtopic):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
+                    with patch("grox_chat.server.call_text_with_search_evidence", new=AsyncMock(return_value=response)):
+                        with patch("grox_chat.server.call_text", new=AsyncMock(return_value=fact_reply)) as call_text:
+                            with patch("grox_chat.server.api.persist_message", new=AsyncMock(return_value=55)) as persist_message:
+                                with patch("grox_chat.server.process_writer_output", new=AsyncMock(return_value=[21])) as process_writer_output:
+                                    with patch("grox_chat.server._run_librarian_pass", new=AsyncMock(return_value={})) as run_librarian:
+                                        await expert_node(state)
+
+    persist_message.assert_awaited_once()
+    process_writer_output.assert_awaited_once()
+    inline_prompt = call_text.await_args.args[0]
+    assert "=== SEARCH EVIDENCE: q ===" in inline_prompt
+    assert "Title: A" in inline_prompt
+    assert process_writer_output.await_args.kwargs["fact_stage"] == "inline"
+    assert process_writer_output.await_args.kwargs["max_candidates"] == 1
+    run_librarian.assert_awaited_once()
+    assert run_librarian.await_args.kwargs["candidate_ids"] == [21]
+    assert run_librarian.await_args.kwargs["emit_audit_message"] is False
+
+
+@pytest.mark.asyncio
+async def test_inline_fact_intake_skips_zero_hit_placeholder_search_results():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "current_actor": "contrarian",
+        "current_turn_kind": "base",
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "phase": DEBATE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 3,
+    }
+    topic = {"id": 1, "summary": "topic", "detail": "detail"}
+    subtopic = {"id": 1, "summary": "subtopic", "detail": "detail"}
+    messages = [
+        {"id": 1, "sender": "critic", "content": "Need evidence", "msg_type": "standard", "confidence_score": 7.0},
+    ]
+    response = BrokerResponse(
+        text='{"action":"post_message","content":"Contrarian response","confidence_score":6}',
+        search_evidence=(SearchEvidenceItem(query="q", rendered_results="=== WEB SEARCH RESULTS ===\nNo useful results found.\n\n"),),
+        search_failed=False,
+    )
+
+    with patch("grox_chat.server.api.get_topic", return_value=topic):
+        with patch("grox_chat.server.api.get_subtopic", return_value=subtopic):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
+                    with patch("grox_chat.server.call_text_with_search_evidence", new=AsyncMock(return_value=response)):
+                        with patch("grox_chat.server.call_text", new=AsyncMock()) as call_text:
+                            with patch("grox_chat.server.api.persist_message", new=AsyncMock(return_value=55)):
+                                with patch("grox_chat.server.process_writer_output", new=AsyncMock()) as process_writer_output:
+                                    with patch("grox_chat.server._run_librarian_pass", new=AsyncMock()) as run_librarian:
+                                        await expert_node(state)
+
+    call_text.assert_not_awaited()
+    process_writer_output.assert_not_awaited()
+    run_librarian.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fact_proposer_node_marks_synthesized_stage():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "phase": DEBATE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 3,
+        "last_fact_proposer_round": None,
+    }
+    topic = {"id": 1, "summary": "topic", "detail": "detail"}
+    subtopic = {"id": 1, "summary": "subtopic", "detail": "detail"}
+    messages = [
+        {"id": 1, "sender": "critic", "content": "claim", "msg_type": "standard", "confidence_score": 7.0},
+    ]
+    proposer_reply = '{"action":"propose_facts","facts":["Fact 1"]}'
+
+    with patch("grox_chat.server.api.get_topic", return_value=topic):
+        with patch("grox_chat.server.api.get_subtopic", return_value=subtopic):
+            with patch("grox_chat.server.api.get_messages", return_value=messages):
+                with patch("grox_chat.server.assemble_rag_context", new=AsyncMock(return_value=("RAG", False))):
+                    with patch("grox_chat.server.call_text", new=AsyncMock(return_value=proposer_reply)):
+                        with patch("grox_chat.server.process_writer_output", new=AsyncMock(return_value=[1])) as process_writer_output:
+                            await fact_proposer_node(state)
+
+    process_writer_output.assert_awaited_once()
+    assert process_writer_output.await_args.kwargs["fact_stage"] == "synthesized"

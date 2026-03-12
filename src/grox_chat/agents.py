@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from .broker import call_text
+from .broker import PROFILE_GEMINI_FLASH, PROFILE_MINIMAX, llm_call
 from .prompts import PROMPTS
+
+logger = logging.getLogger(__name__)
 
 ORCHESTRATOR = "orchestrator"
 DELIBERATOR = "deliberator"
@@ -35,7 +38,7 @@ class AgentSpec:
     name: str
     agent_class: str
     role_prompt: str
-    default_provider: str = "minimax"
+    default_provider: str = PROFILE_MINIMAX
     default_strategy: str = "direct"
     default_tools: tuple[str, ...] = ()
     can_vote: bool = False
@@ -49,7 +52,7 @@ def _build_registry() -> dict[str, AgentSpec]:
             name=SKYNET,
             agent_class=ORCHESTRATOR,
             role_prompt=PROMPTS["skynet"],
-            default_provider="gemini",
+            default_provider=PROFILE_GEMINI_FLASH,
             default_strategy="direct",
             can_vote=True,
         ),
@@ -127,7 +130,7 @@ def _build_registry() -> dict[str, AgentSpec]:
             name="writer",
             agent_class=NPC,
             role_prompt=PROMPTS["writer"],
-            default_provider="gemini",
+            default_provider=PROFILE_GEMINI_FLASH,
         ),
         "fact_proposer": AgentSpec(
             name="fact_proposer",
@@ -235,20 +238,32 @@ class Agent:
         boost: Optional[str] = None,
     ) -> str:
         del require_json
-        role_prompt = self.spec.role_prompt
-        if boost:
-            role_prompt = f"{role_prompt}\n\nBOOST:\n{boost}"
-        return await call_text(
+        if allow_web:
+            from .broker import llm_call_with_web
+
+            result = await llm_call_with_web(
+                prompt,
+                system_prompt=self.spec.role_prompt,
+                provider_profile=self.spec.default_provider,
+                require_json=False,
+                role=self.spec.name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                boost=boost or "",
+            )
+            return result.text
+        result = await llm_call(
             prompt,
-            system_instruction=role_prompt,
-            provider=self.spec.default_provider,
-            strategy=self.spec.default_strategy,
-            allow_web=allow_web,
+            system_prompt=self.spec.role_prompt,
+            provider_profile=self.spec.default_provider,
+            require_json=False,
+            role=self.spec.name,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
-            fallback_role=self.spec.name,
+            boost=boost or "",
         )
+        return result.text
 
     async def vote(self, prompt: str, *, allow_web: bool = False) -> Optional[bool]:
         vote_instruction = (
@@ -257,17 +272,23 @@ class Agent:
             "You are not posting a normal debate message. "
             'You must reply with strict JSON only: {"vote":"yes"} or {"vote":"no"}.'
         )
-        text = await call_text(
+        result = await llm_call(
             prompt,
-            system_instruction=vote_instruction,
-            provider=self.spec.default_provider,
-            strategy=self.spec.default_strategy,
-            allow_web=allow_web,
+            system_prompt=vote_instruction,
+            provider_profile=self.spec.default_provider,
+            require_json=True,
+            role=self.spec.name,
             temperature=0.7,
             max_tokens=8192,
-            fallback_role=self.spec.name,
         )
-        return parse_vote_response(text)
+        parsed_vote = parse_vote_response(result.text)
+        logger.info(
+            "[Vote] agent=%s parsed=%s raw_response=%s",
+            self.spec.name,
+            parsed_vote,
+            result.text,
+        )
+        return parsed_vote
 
 
 def get_agent(name: str) -> Agent:

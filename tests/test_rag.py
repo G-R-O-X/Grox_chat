@@ -1,5 +1,7 @@
 import pytest
 from unittest.mock import patch, AsyncMock
+
+from grox_chat.broker import BrokerResponse
 from grox_chat.rag import assemble_rag_context
 
 @pytest.mark.asyncio
@@ -12,7 +14,7 @@ async def test_assemble_rag_context_empty():
 async def test_assemble_rag_context():
     recent_messages = [{"id": 9, "content": "This is a test message", "sender": "critic"}]
     
-    mock_call_text = AsyncMock(return_value="test query")
+    mock_llm_call = AsyncMock(return_value=BrokerResponse(text="test query", provider_used="minimax"))
     mock_embedding = AsyncMock(return_value=[0.1] * 384)
     
     mock_facts = [
@@ -20,8 +22,8 @@ async def test_assemble_rag_context():
         {"id": 2, "content": "Fact 2", "source": "Writer"}
     ]
     mock_summaries = [
-        {"id": 3, "content": "Summary 1", "source": "Audience"},
-        {"id": 4, "content": "Summary 2", "source": "Audience"},
+        {"id": 3, "content": "Summary 1", "source": "Skynet"},
+        {"id": 4, "content": "Summary 2", "source": "Skynet"},
     ]
     mock_messages = [
         {"id": 5, "content": "Historical message 1", "source": "engineer"},
@@ -35,7 +37,7 @@ async def test_assemble_rag_context():
         [(0, 0.7), (1, 0.1)],
     ])
     
-    with patch("grox_chat.rag.call_text", new=mock_call_text):
+    with patch("grox_chat.rag.llm_call", new=mock_llm_call):
         with patch("grox_chat.rag.aget_embedding", new=mock_embedding):
             with patch("grox_chat.rag.api.search_facts_hybrid", return_value=mock_facts):
                 with patch("grox_chat.rag.api.search_messages_hybrid", side_effect=[mock_summaries, mock_messages]):
@@ -58,7 +60,7 @@ async def test_assemble_rag_context():
 async def test_assemble_rag_context_falls_back_to_last_message_when_query_distillation_raises():
     recent_messages = [{"id": 9, "content": "Fallback me", "sender": "critic"}]
 
-    with patch("grox_chat.rag.call_text", new=AsyncMock(side_effect=RuntimeError("pseudo-tool"))):
+    with patch("grox_chat.rag.llm_call", new=AsyncMock(side_effect=RuntimeError("pseudo-tool"))):
         with patch("grox_chat.rag.build_query_rag_context", new=AsyncMock(return_value=("RAG", False))) as build_rag:
             res, degraded = await assemble_rag_context(1, 1, recent_messages, "dreamer")
 

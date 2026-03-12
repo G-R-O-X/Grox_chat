@@ -24,6 +24,8 @@ async def _store_fact_candidates(
     subtopic_id: int,
     writer_msg_id: Optional[int],
     facts: Iterable[str],
+    fact_stage: str = "synthesized",
+    evidence_note: Optional[str] = None,
     max_candidates: int | None = None,
 ) -> list[int]:
     seen: set[str] = set()
@@ -41,7 +43,14 @@ async def _store_fact_candidates(
         if api.fact_candidate_exists(topic_id, normalized, statuses=("pending",)):
             logger.info("[Writer Processor] Skipping pending fact candidate duplicate: %s...", normalized[:50])
             continue
-        candidate_id = api.create_fact_candidate(topic_id, subtopic_id, writer_msg_id, normalized)
+        candidate_id = api.create_fact_candidate_with_stage(
+            topic_id,
+            subtopic_id,
+            writer_msg_id,
+            normalized,
+            fact_stage=fact_stage,
+            evidence_note=evidence_note,
+        )
         created_ids.append(candidate_id)
         logger.info("[Writer Processor] Created FactCandidate ID: %s", candidate_id)
         if max_candidates is not None and len(created_ids) >= max_candidates:
@@ -55,6 +64,8 @@ async def process_writer_output(
     writer_msg_id: Optional[int],
     writer_text: str,
     structured_facts: List[str] | None = None,
+    fact_stage: str = "synthesized",
+    evidence_note: Optional[str] = None,
     max_candidates: int | None = None,
 ) -> list[int]:
     """
@@ -67,5 +78,7 @@ async def process_writer_output(
         subtopic_id,
         writer_msg_id,
         facts,
+        fact_stage=fact_stage,
+        evidence_note=evidence_note,
         max_candidates=max_candidates,
     )

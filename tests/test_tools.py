@@ -122,6 +122,7 @@ async def test_react_search_loop_normalizes_quoted_no_search():
 async def test_react_search_loop_falls_back_to_final_answer_on_query_decision_error():
     mock_query = AsyncMock(side_effect=[
         ("Error: 400", []),
+        ("NO_SEARCH", []),
         ("final answer after fallback", []),
     ])
 
@@ -131,4 +132,5 @@ async def test_react_search_loop_falls_back_to_final_answer_on_query_decision_er
 
     assert result == "final answer after fallback"
     assert search_failed is False
+    assert mock_query.await_count == 3
     mock_search.assert_not_awaited()

@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from grox_chat.master_graph import (
+    ask_gemini_cli,
     node_inspect_topic_state,
     node_open_next_subtopic,
     node_plan_generation,
@@ -11,6 +12,23 @@ from grox_chat.master_graph import (
     route_after_replan,
     route_after_open_next_subtopic,
 )
+
+
+@pytest.mark.asyncio
+async def test_ask_gemini_cli_defaults_to_flash_first():
+    mock_result = AsyncMock()
+    mock_result.text = '{"ok": true}'
+    mock_result.provider_used = "gemini_flash"
+    mock_result.fallback_used = False
+    mock_result.search_used = False
+    with patch("grox_chat.master_graph.llm_call_with_web", new=AsyncMock(return_value=mock_result)) as llm_call_with_web:
+        result = await ask_gemini_cli("System", "Context", "skynet")
+
+    assert result == {"ok": True}
+    assert llm_call_with_web.await_args.kwargs["provider_profile"] == "gemini_flash"
+    assert llm_call_with_web.await_args.kwargs["model"] == "gemini-3.0-flash"
+    assert llm_call_with_web.await_args.kwargs["require_json"] is True
+    assert llm_call_with_web.await_args.kwargs["search_budget"] == 2
 
 
 @pytest.mark.asyncio

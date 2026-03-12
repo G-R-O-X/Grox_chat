@@ -29,7 +29,7 @@ def test_parse_librarian_review_accept_defaults_reviewed_text():
 
 @pytest.mark.asyncio
 async def test_apply_librarian_review_accepts_and_inserts_fact():
-    candidate = {"id": 5, "candidate_text": "Verified fact"}
+    candidate = {"id": 5, "candidate_text": "Verified fact", "fact_stage": "bootstrap"}
 
     with patch("grox_chat.librarian_processor.api.get_fact_by_content", return_value=None):
         with patch("grox_chat.librarian_processor.aget_embedding", new=AsyncMock(return_value=[0.1] * 384)):
@@ -53,6 +53,7 @@ async def test_apply_librarian_review_accepts_and_inserts_fact():
         "Verified fact",
         source="Librarian",
         embedding=[0.1] * 384,
+        fact_stage="bootstrap",
         candidate_id=5,
         review_status="accept",
         evidence_note="Matched search result.",
@@ -63,7 +64,7 @@ async def test_apply_librarian_review_accepts_and_inserts_fact():
 
 @pytest.mark.asyncio
 async def test_apply_librarian_review_softens_and_inserts_plain_fact_when_embedding_fails():
-    candidate = {"id": 6, "candidate_text": "There is no evidence at all"}
+    candidate = {"id": 6, "candidate_text": "There is no evidence at all", "fact_stage": "inline"}
 
     with patch("grox_chat.librarian_processor.api.get_fact_by_content", return_value=None):
         with patch("grox_chat.librarian_processor.aget_embedding", new=AsyncMock(return_value=None)):
@@ -86,6 +87,7 @@ async def test_apply_librarian_review_softens_and_inserts_plain_fact_when_embedd
         1,
         "No supporting empirical evidence was found in the current retrieval set.",
         source="Librarian",
+        fact_stage="inline",
         candidate_id=6,
         review_status="soften",
         evidence_note="Current retrieval set was limited.",
@@ -96,7 +98,7 @@ async def test_apply_librarian_review_softens_and_inserts_plain_fact_when_embedd
 
 @pytest.mark.asyncio
 async def test_apply_librarian_review_rejects_without_inserting_fact():
-    candidate = {"id": 7, "candidate_text": "Unsupported claim"}
+    candidate = {"id": 7, "candidate_text": "Unsupported claim", "fact_stage": "synthesized"}
 
     with patch("grox_chat.librarian_processor.api.insert_fact") as insert_fact:
         with patch("grox_chat.librarian_processor.api.insert_fact_with_embedding") as insert_fact_with_embedding:

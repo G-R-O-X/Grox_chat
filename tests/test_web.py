@@ -41,7 +41,7 @@ def test_dashboard_snapshot_includes_plan_messages_facts_and_pending_candidates(
     assert plan_id is not None
 
     subtopic_id = api.create_subtopic(topic_id, "Subtopic A", "Detail A")
-    api.post_message(topic_id, subtopic_id, "audience", "Grounding brief", round_number=1, turn_kind="base")
+    api.post_message(topic_id, subtopic_id, "skynet", "Grounding brief", round_number=1, turn_kind="base")
     api.post_message(topic_id, subtopic_id, "dog", "Please narrow the claim", round_number=2, turn_kind="base")
     api.insert_fact(topic_id, "Accepted fact", "Librarian")
     api.create_fact_candidate(topic_id, subtopic_id, None, "Pending fact")
@@ -52,7 +52,7 @@ def test_dashboard_snapshot_includes_plan_messages_facts_and_pending_candidates(
     assert snapshot["plan"]["current_index"] == 1
     assert len(snapshot["plan"]["items"]) == 2
     assert snapshot["current_subtopic"]["id"] == subtopic_id
-    assert [message["sender"] for message in snapshot["messages"]] == ["audience", "dog"]
+    assert [message["sender"] for message in snapshot["messages"]] == ["skynet", "dog"]
     assert snapshot["status"]["current_round"] == 2
     assert snapshot["status"]["current_phase"] == "evidence"
     assert snapshot["facts"][0]["content"] == "Accepted fact"

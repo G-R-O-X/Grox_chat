@@ -5,17 +5,17 @@ import re
 from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv
 import asyncio
-from .api_throttle import wait_for_slot
+from .api_throttle import wait_after_minimax_response, wait_for_minimax_slot
 
 load_dotenv()
 
-TIMEOUT = 120.0
+TIMEOUT = 300.0
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 # Reusable httpx client for connection pooling
 _http_client: Optional[httpx.AsyncClient] = None
+_request_semaphore: Optional[asyncio.Semaphore] = None
 MINIMAX_TOOL_BLOCK_RE = re.compile(r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL)
 MINIMAX_INVOKE_RE = re.compile(r'<invoke name="([^"]+)">(.*?)</invoke>', re.DOTALL)
 MINIMAX_PARAM_RE = re.compile(r'<parameter name="([^"]+)">(.*?)</parameter>', re.DOTALL)
@@ -46,6 +46,13 @@ def _get_http_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(timeout=TIMEOUT)
     return _http_client
+
+
+def _get_request_semaphore() -> asyncio.Semaphore:
+    global _request_semaphore
+    if _request_semaphore is None:
+        _request_semaphore = asyncio.Semaphore(1)
+    return _request_semaphore
 
 
 async def close_minimax_client() -> None:
@@ -148,6 +155,14 @@ async def query_minimax(
         return "Error: No API key.", []
 
     system_prompt, question = _reinforce_minimax_prompt(system_prompt, question)
+    logger.info(
+        "[MiniMax] Request start model=%s prompt_chars=%s system_chars=%s max_tokens=%s recover_pseudo_tool_query=%s",
+        model,
+        len(question or ""),
+        len(system_prompt or ""),
+        max_tokens,
+        recover_pseudo_tool_query,
+    )
 
     headers = {
         "Content-Type": "application/json",
@@ -162,44 +177,59 @@ async def query_minimax(
         "system": system_prompt,
         "messages": [{"role": "user", "content": question}],
     }
-    
-    for attempt in range(max_retries):
-        await wait_for_slot()
-        try:
-            client = _get_http_client()
-            resp = await client.post(_get_minimax_message_url(), headers=headers, json=payload)
-            
-            if resp.status_code == 429:
-                logger.warning(f"[MiniMax] Rate limited (429). Retrying {attempt+1}/{max_retries}...")
+
+    async with _get_request_semaphore():
+        for attempt in range(max_retries):
+            await wait_for_minimax_slot()
+            try:
+                client = _get_http_client()
+                resp = await client.post(_get_minimax_message_url(), headers=headers, json=payload)
+
+                if resp.status_code == 429:
+                    logger.warning(f"[MiniMax] Rate limited (429). Retrying {attempt+1}/{max_retries}...")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                text, tool_calls = _extract_text_and_tools(data)
+                if not text and tool_calls and recover_pseudo_tool_query:
+                    recovered_query = _recover_queries_from_tools(tool_calls)
+                    if recovered_query:
+                        await wait_after_minimax_response()
+                        logger.info(
+                            "[MiniMax] Request success via pseudo-tool recovery model=%s recovered_query_chars=%s tool_calls=%s",
+                            model,
+                            len(recovered_query),
+                            len(tool_calls),
+                        )
+                        return recovered_query, tool_calls
+                if not text and tool_calls:
+                    return "Error: MiniMax emitted pseudo-tool markup in text-only mode", tool_calls
+                if not text and not tool_calls:
+                    return "Error: Empty response", []
+                await wait_after_minimax_response()
+                logger.info(
+                    "[MiniMax] Request success model=%s text_chars=%s tool_calls=%s",
+                    model,
+                    len(text or ""),
+                    len(tool_calls),
+                )
+                return text, tool_calls
+
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code >= 500:
+                    logger.warning(f"[MiniMax] Server error ({e.response.status_code}). Retrying {attempt+1}/{max_retries}...")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.error(f"HTTP Error: {e.response.text}")
+                return f"Error: {e.response.status_code}", []
+            except Exception as e:
+                logger.error(f"Request Error: {e}")
+                if attempt == max_retries - 1:
+                    return f"Error: {str(e)}", []
                 await asyncio.sleep(2 ** attempt)
-                continue
-                
-            resp.raise_for_status()
-            data = resp.json()
-            
-            text, tool_calls = _extract_text_and_tools(data)
-            if not text and tool_calls and recover_pseudo_tool_query:
-                recovered_query = _recover_queries_from_tools(tool_calls)
-                if recovered_query:
-                    return recovered_query, tool_calls
-            if not text and tool_calls:
-                return "Error: MiniMax emitted pseudo-tool markup in text-only mode", tool_calls
-            if not text and not tool_calls:
-                return "Error: Empty response", []
-            return text, tool_calls
-            
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code >= 500:
-                logger.warning(f"[MiniMax] Server error ({e.response.status_code}). Retrying {attempt+1}/{max_retries}...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            logger.error(f"HTTP Error: {e.response.text}")
-            return f"Error: {e.response.status_code}", []
-        except Exception as e:
-            logger.error(f"Request Error: {e}")
-            if attempt == max_retries - 1:
-                return f"Error: {str(e)}", []
-            await asyncio.sleep(2 ** attempt)
 
     return "Error: Max retries exceeded.", []
 
@@ -208,6 +238,7 @@ async def minimax_search(query: str, timeout: float = 60.0, max_retries: int = 3
     api_key = _get_minimax_api_key()
     if not api_key:
         return {"error": "No MiniMax API key."}
+    logger.info("[MiniMax Search] Request start query=%r timeout=%s", query, timeout)
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -215,29 +246,36 @@ async def minimax_search(query: str, timeout: float = 60.0, max_retries: int = 3
         "Content-Type": "application/json",
     }
 
-    for attempt in range(max_retries):
-        await wait_for_slot()
-        try:
-            client = _get_http_client()
-            resp = await client.post(
-                f"{_get_minimax_coding_plan_base()}/v1/coding_plan/search",
-                headers=headers,
-                json={"q": query},
-                timeout=timeout
-            )
-            
-            if resp.status_code == 429:
-                logger.warning(f"[MiniMax Search] Rate limited (429). Retrying {attempt+1}/{max_retries}...")
+    async with _get_request_semaphore():
+        for attempt in range(max_retries):
+            await wait_for_minimax_slot()
+            try:
+                client = _get_http_client()
+                resp = await client.post(
+                    f"{_get_minimax_coding_plan_base()}/v1/coding_plan/search",
+                    headers=headers,
+                    json={"q": query},
+                    timeout=timeout
+                )
+
+                if resp.status_code == 429:
+                    logger.warning(f"[MiniMax Search] Rate limited (429). Retrying {attempt+1}/{max_retries}...")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                await wait_after_minimax_response()
+                logger.info(
+                    "[MiniMax Search] Request success query=%r organic_results=%s",
+                    query,
+                    len(data.get("organic", []) or []),
+                )
+                return data
+            except Exception as e:
+                logger.error(f"Search Error: {e}")
+                if attempt == max_retries - 1:
+                    return {"error": str(e)}
                 await asyncio.sleep(2 ** attempt)
-                continue
-                
-            resp.raise_for_status()
-            data = resp.json()
-            return data
-        except Exception as e:
-            logger.error(f"Search Error: {e}")
-            if attempt == max_retries - 1:
-                return {"error": str(e)}
-            await asyncio.sleep(2 ** attempt)
-            
+
     return {"error": "Max retries exceeded"}

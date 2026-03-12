@@ -7,7 +7,12 @@ from typing_extensions import TypedDict
 
 from . import api
 from .agents import SKYNET, get_agent, voting_agents
-from .broker import call_text
+from .broker import (
+    PROFILE_GEMINI_FLASH,
+    PROFILE_GEMINI_PRO,
+    llm_call,
+    llm_call_with_web,
+)
 from .embedding import aget_embedding
 from .server import run_subtopic_graph
 
@@ -76,24 +81,50 @@ def _sanitize_subtopics(raw_subtopics: Any, limit: int) -> List[Dict[str, str]]:
     return cleaned
 
 
-async def ask_gemini_cli(system_prompt: str, context: str, role: str, model: str = "gemini-3.1-pro-preview") -> Dict[str, Any]:
+async def ask_gemini_cli(system_prompt: str, context: str, role: str, model: str = "gemini-3.0-flash") -> Dict[str, Any]:
     prompt = f"{system_prompt}\n\nHere is the context of the chatroom:\n{context}"
-    logger.info(f"[{role}] Asking Gemini CLI ({model})...")
+    provider_profile = (
+        PROFILE_GEMINI_PRO if "pro" in (model or "").lower() else PROFILE_GEMINI_FLASH
+    )
+    logger.info(
+        "[%s] Starting orchestration call profile=%s model=%s allow_web=%s prompt_chars=%s context_chars=%s",
+        role,
+        provider_profile,
+        model,
+        True,
+        len(prompt),
+        len(context),
+    )
 
     try:
-        output = await call_text(
+        result = await llm_call_with_web(
             prompt,
-            provider="gemini",
-            strategy="direct",
-            allow_web=True,
+            provider_profile=provider_profile,
+            role=role,
+            require_json=True,
             model=model,
+            search_budget=2,
             temperature=0.7,
-            system_instruction=system_prompt,
-            fallback_role=role,
+            system_prompt=system_prompt,
         )
-        return _parse_json_object(output)
+        output = result.text
+        logger.info(
+            "[%s] Orchestration broker call succeeded provider_used=%s fallback_used=%s search_used=%s text_chars=%s; attempting JSON parse.",
+            role,
+            result.provider_used,
+            result.fallback_used,
+            result.search_used,
+            len(output or ""),
+        )
+        parsed = _parse_json_object(output)
+        logger.info(
+            "[%s] Orchestration JSON parse succeeded keys=%s",
+            role,
+            sorted(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__,
+        )
+        return parsed
     except Exception as e:
-        logger.error(f"[{role}] Gemini CLI exception: {e}")
+        logger.error("[%s] Orchestration call failed: %s", role, e)
         return {"error": str(e)}
 
 

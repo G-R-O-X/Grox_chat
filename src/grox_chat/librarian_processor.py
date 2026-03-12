@@ -103,6 +103,7 @@ async def apply_librarian_review(
         else:
             embedding = await aget_embedding(stored_text)
             insert_kwargs = {
+                "fact_stage": candidate.get("fact_stage", "synthesized"),
                 "candidate_id": candidate_id,
                 "review_status": decision,
                 "evidence_note": evidence_note or None,

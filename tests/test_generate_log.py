@@ -51,7 +51,7 @@ def test_render_log_includes_topic_level_messages():
     api.create_plan(topic_id, '[{"summary":"Plan item","detail":"Plan detail"}]', current_index=0)
     subtopic_id = api.create_subtopic(topic_id, "Subtopic", "Subtopic detail")
     api.post_message(topic_id, subtopic_id, "dreamer", "Subtopic message")
-    api.post_message(topic_id, None, "audience", "Final topic summary", msg_type="summary")
+    api.post_message(topic_id, None, "skynet", "Final topic summary", msg_type="summary")
 
     topic, plan, subtopics, messages = generate_log.get_data(Path(get_db_path()), topic_id)
     rendered = generate_log.render_log(topic, plan, subtopics, messages)

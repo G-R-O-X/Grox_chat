@@ -2,7 +2,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import api
-from .broker import call_text
+from .broker import PROFILE_MINIMAX, llm_call
 from .embedding import aget_embedding
 from .reranker import arerank
 
@@ -80,17 +80,15 @@ async def assemble_rag_context(
     
     logger.info(f"[RAG] Formulating query for {current_speaker}...")
     try:
-        query_ch = await call_text(
+        result = await llm_call(
             distill_context,
-            system_instruction=distill_prompt,
-            provider="minimax",
-            strategy="direct",
-            allow_web=False,
+            system_prompt=distill_prompt,
+            provider_profile=PROFILE_MINIMAX,
+            role=current_speaker,
             max_tokens=8192,
-            fallback_role=current_speaker,
             recover_pseudo_tool_query=True,
         )
-        query_ch = query_ch.strip()
+        query_ch = result.text.strip()
     except Exception:
         query_ch = ""
 

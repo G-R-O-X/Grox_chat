@@ -168,6 +168,7 @@ def init_db():
                 subtopic_id INTEGER,
                 writer_msg_id INTEGER,
                 candidate_text TEXT NOT NULL,
+                fact_stage TEXT NOT NULL DEFAULT 'synthesized',
                 status TEXT NOT NULL DEFAULT 'pending',
                 reviewed_text TEXT,
                 review_note TEXT,
@@ -188,6 +189,7 @@ def init_db():
                 topic_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 source TEXT NOT NULL,
+                fact_stage TEXT NOT NULL DEFAULT 'synthesized',
                 candidate_id INTEGER,
                 review_status TEXT,
                 evidence_note TEXT,
@@ -230,9 +232,11 @@ def init_db():
         _ensure_column(conn, "Message", "round_number", "INTEGER")
         _ensure_column(conn, "Message", "turn_kind", "TEXT")
         _ensure_column(conn, "Fact", "candidate_id", "INTEGER")
+        _ensure_column(conn, "Fact", "fact_stage", "TEXT NOT NULL DEFAULT 'synthesized'")
         _ensure_column(conn, "Fact", "review_status", "TEXT")
         _ensure_column(conn, "Fact", "evidence_note", "TEXT")
         _ensure_column(conn, "Fact", "confidence_score", "REAL")
+        _ensure_column(conn, "FactCandidate", "fact_stage", "TEXT NOT NULL DEFAULT 'synthesized'")
         _backfill_fts(conn)
 
 def _insert_fact_row(
@@ -240,6 +244,7 @@ def _insert_fact_row(
     topic_id: int,
     content: str,
     source: str,
+    fact_stage: str = "synthesized",
     candidate_id: Optional[int] = None,
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
@@ -247,10 +252,10 @@ def _insert_fact_row(
 ) -> int:
     cursor = conn.execute(
         """
-        INSERT INTO Fact (topic_id, content, source, candidate_id, review_status, evidence_note, confidence_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO Fact (topic_id, content, source, fact_stage, candidate_id, review_status, evidence_note, confidence_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (topic_id, content, source, candidate_id, review_status, evidence_note, confidence_score),
+        (topic_id, content, source, fact_stage, candidate_id, review_status, evidence_note, confidence_score),
     )
     fact_id = cursor.lastrowid
     _insert_fact_fts(conn, fact_id, topic_id, content, source)
@@ -261,6 +266,7 @@ def insert_fact(
     topic_id: int,
     content: str,
     source: str,
+    fact_stage: str = "synthesized",
     candidate_id: Optional[int] = None,
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
@@ -272,6 +278,7 @@ def insert_fact(
             topic_id,
             content,
             source,
+            fact_stage=fact_stage,
             candidate_id=candidate_id,
             review_status=review_status,
             evidence_note=evidence_note,
@@ -284,6 +291,7 @@ def insert_fact_with_embedding(
     content: str,
     source: str,
     embedding: List[float],
+    fact_stage: str = "synthesized",
     candidate_id: Optional[int] = None,
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
@@ -296,6 +304,7 @@ def insert_fact_with_embedding(
             topic_id,
             content,
             source,
+            fact_stage=fact_stage,
             candidate_id=candidate_id,
             review_status=review_status,
             evidence_note=evidence_note,
@@ -307,14 +316,21 @@ def insert_fact_with_embedding(
         )
         return fact_id
 
-def create_fact_candidate(topic_id: int, subtopic_id: int, writer_msg_id: Optional[int], candidate_text: str) -> int:
+def create_fact_candidate(
+    topic_id: int,
+    subtopic_id: int,
+    writer_msg_id: Optional[int],
+    candidate_text: str,
+    fact_stage: str = "synthesized",
+    evidence_note: Optional[str] = None,
+) -> int:
     with get_db() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO FactCandidate (topic_id, subtopic_id, writer_msg_id, candidate_text)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO FactCandidate (topic_id, subtopic_id, writer_msg_id, candidate_text, fact_stage, evidence_note)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (topic_id, subtopic_id, writer_msg_id, candidate_text),
+            (topic_id, subtopic_id, writer_msg_id, candidate_text, fact_stage, evidence_note),
         )
         return cursor.lastrowid
 

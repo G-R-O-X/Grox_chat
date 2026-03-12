@@ -9,6 +9,7 @@ from typing import Optional
 import aiohttp
 
 from .gemini_cli_auth import get_valid_access_token
+from ..api_throttle import wait_after_gemini_response, wait_for_gemini_slot
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ _MODEL_MAP = {
 
 def _map_model(model: str) -> str:
     return _MODEL_MAP.get(model, model)
+
+
+def _supports_thinking(model: str) -> bool:
+    return model != CLI_FLASH_25
 
 
 # Cached project ID (discovered via loadCodeAssist)
@@ -128,6 +133,7 @@ async def _discover_project_id(max_retries: int = 3) -> str:
         for attempt in range(max_retries):
             headers = await _build_headers()
             try:
+                await wait_for_gemini_slot()
                 async with session.post(
                     url,
                     headers=headers,
@@ -140,6 +146,7 @@ async def _discover_project_id(max_retries: int = 3) -> str:
                             resp.status,
                         )
                         headers = await _invalidate_and_rebuild_headers()
+                        await wait_for_gemini_slot()
                         async with session.post(
                             url,
                             headers=headers,
@@ -268,6 +275,11 @@ async def _query_gemini_cli_uncached(
         last_error = None
         for current_model in models_to_try:
             try:
+                logger.info(
+                    "[GeminiCLI] Trying model=%s use_google_search=%s",
+                    current_model,
+                    use_google_search,
+                )
                 result = await _call_gemini_rest(
                     prompt=prompt,
                     model=current_model,
@@ -277,6 +289,14 @@ async def _query_gemini_cli_uncached(
                     thinking_level=thinking_level,
                     use_google_search=use_google_search,
                 )
+                if current_model != model:
+                    logger.info(
+                        "[GeminiCLI] Fallback success original_model=%s resolved_model=%s",
+                        model,
+                        current_model,
+                    )
+                else:
+                    logger.info("[GeminiCLI] Primary model succeeded model=%s", current_model)
                 return result
             except Exception as e:
                 error_str = str(e)
@@ -293,6 +313,11 @@ async def _query_gemini_cli_uncached(
                     )
                     last_error = e
                     continue
+                logger.error(
+                    "[GeminiCLI] Non-retryable model failure model=%s error=%s",
+                    current_model,
+                    error_str[:200],
+                )
                 raise
 
         raise RuntimeError("All models in fallback chain failed") from last_error
@@ -315,6 +340,15 @@ async def query_gemini_cli(
         model = CLI_DEFAULT
     else:
         model = _map_model(model)
+
+    logger.info(
+        "[GeminiCLI] Request start model=%s use_google_search=%s prompt_chars=%s system_chars=%s max_tokens=%s",
+        model,
+        use_google_search,
+        len(prompt or ""),
+        len(system_instruction or ""),
+        max_tokens,
+    )
 
     request_key = _request_cache_key(
         prompt=prompt,
@@ -349,7 +383,14 @@ async def query_gemini_cli(
             logger.info("[GeminiCLI] Coalescing duplicate in-flight Gemini request.")
 
     try:
-        return await asyncio.shield(task)
+        result = await asyncio.shield(task)
+        logger.info(
+            "[GeminiCLI] Request success model=%s use_google_search=%s text_chars=%s",
+            model,
+            use_google_search,
+            len(result or ""),
+        )
+        return result
     finally:
         if created_task:
             async with _get_broker_lock():
@@ -385,7 +426,7 @@ async def _call_gemini_rest(
             "parts": [{"text": system_instruction}],
         }
 
-    if thinking_level and thinking_level.upper() != "NONE":
+    if thinking_level and thinking_level.upper() != "NONE" and _supports_thinking(model):
         inner_request["generationConfig"]["thinkingConfig"] = {
             "thinkingLevel": thinking_level.upper(),
         }
@@ -404,17 +445,27 @@ async def _call_gemini_rest(
     
     for attempt in range(max_retries):
         headers = await _build_headers()
+        await wait_for_gemini_slot()
         async with session.post(
             url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=300)
         ) as resp:
             if resp.status in (401, 403):
                 logger.warning(f"[GeminiCLI] Got {resp.status}, refreshing token and retrying...")
                 headers = await _invalidate_and_rebuild_headers()
-                async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=300)) as retry_resp:
+                await wait_for_gemini_slot()
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=300),
+                ) as retry_resp:
                     if retry_resp.status != 200:
                         error_body = await retry_resp.text()
-                        raise RuntimeError(f"Gemini API error {retry_resp.status} after token refresh: {error_body[:500]}")
+                        raise RuntimeError(
+                            f"Gemini API error {retry_resp.status} after token refresh: {error_body[:500]}"
+                        )
                     data = await retry_resp.json()
+                    await wait_after_gemini_response()
                     return _extract_text(data)
 
             if resp.status == 429 or resp.status >= 500:
@@ -432,6 +483,7 @@ async def _call_gemini_rest(
                 raise RuntimeError(f"Gemini API error {resp.status}: {error_body[:500]}")
 
             data = await resp.json()
+            await wait_after_gemini_response()
             return _extract_text(data)
             
     raise RuntimeError("Unexpected end of retry loop")

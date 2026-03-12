@@ -45,13 +45,13 @@ flowchart TD
 
 ## Role Classes
 
-The chatroom now has explicit role classes.
+The chatroom has explicit role classes.
 
 ### 1. Orchestration
 
 - `Skynet`
 
-`Skynet` replaces the old `audience` role. It is the orchestrator of the base chatroom:
+`Skynet` is the orchestrator of the base chatroom:
 
 - proposes candidate subtopics
 - writes grounding briefs
@@ -109,7 +109,7 @@ The outer topic graph owns the full lifecycle:
 
 ## Initial Subtopic Selection
 
-Initial subtopic formation is no longer a single-role decision.
+Initial subtopic formation uses room-level voting.
 
 ### Step 1: Skynet proposes candidates
 
@@ -198,7 +198,7 @@ Each selected subtopic runs as a round-based debate arena.
 
 ### Spectator
 
-`Spectator` is a new special role.
+`Spectator` is a special role.
 
 It does **not** speak publicly as a normal debater. Starting in round 2, it acts together with the other special roles and selects one ordinary deliberator for the **next** round.
 
@@ -285,7 +285,7 @@ Replan should also be allowed to produce zero new subtopics if the room decides 
 
 Every speaking turn uses local retrieval before generation.
 
-Current retrieval stack:
+Retrieval stack:
 
 - query formulation
 - dense retrieval
@@ -333,7 +333,7 @@ MiniMax is used for:
 
 ## Agent Abstraction
 
-The base chatroom now needs a dedicated `Agent` abstraction. The role system is complex enough that scattered prompt and provider calls will keep getting more brittle.
+The base chatroom uses a dedicated `Agent` abstraction. The role system is complex enough that scattered prompt and provider calls become brittle.
 
 At minimum, the long-term `Agent` model should separate:
 
@@ -358,7 +358,7 @@ This is needed not for conference mode, but for the base chatroom itself:
 - `cat / dog / tron / spectator`
 - `writer / fact proposer / librarian`
 
-all now have materially different capabilities and governance rights.
+all have materially different capabilities and governance rights.
 
 ## Scope Boundary
 

@@ -700,7 +700,7 @@ def _has_required_summary_sections(content: str) -> bool:
     lines = (content or "").splitlines()
     for header in SUMMARY_SECTION_HEADERS:
         position = next(
-            (index for index, line in enumerate(lines) if index > line_cursor and line.strip() == header),
+            (index for index, line in enumerate(lines) if index > line_cursor and line.strip().startswith(header)),
             -1,
         )
         if position < 0:

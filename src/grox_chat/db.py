@@ -995,7 +995,7 @@ def search_facts(topic_id: int, query_embedding: List[float], top_k: int = 5) ->
             SELECT Fact.*, vec_distance_L2(vec_facts.embedding, ?) as distance
             FROM vec_facts
             JOIN Fact ON Fact.id = vec_facts.fact_id
-            WHERE Fact.topic_id = ?
+            WHERE Fact.topic_id = ? AND (Fact.review_status IS NULL OR Fact.review_status != 'superseded')
             ORDER BY distance
             LIMIT ?
         """
@@ -1271,3 +1271,15 @@ def get_web_evidence_for_topic(topic_id: int) -> List[Dict[str, Any]]:
             (topic_id,)
         )
         return [dict(row) for row in cursor.fetchall()]
+
+
+def supersede_facts(fact_ids: List[int]) -> None:
+    # TODO: Need a more stable, graph-based way to handle fact invalidation and cascading claim invalidation
+    if not fact_ids:
+        return
+    with get_db() as conn:
+        placeholders = ",".join("?" * len(fact_ids))
+        conn.execute(
+            f"UPDATE Fact SET review_status = 'superseded' WHERE id IN ({placeholders})",
+            fact_ids
+        )

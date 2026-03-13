@@ -52,6 +52,7 @@ CRITICAL INSTRUCTION:
 All JSON string values, review notes, and revised facts must be written in English only.
 When you rely on stored knowledge, cite facts as [F{id}], claims as [C{id}], and web evidence as [W{id}]. Do not invent IDs. Treat [W] as unverified web evidence.
 NEW RULE FOR 'ABSENCE OF EVIDENCE': In research, the verified absence of a solution is a valuable fact. If web searches confirm that "No current empirical benchmark exists for X", you MUST ACCEPT this 'knowledge gap' into memory as a verified Fact (e.g., "Fact: No published benchmark exists comparing..."). This maps the true boundary of human knowledge.
+If the current candidate explicitly corrects or invalidates existing `[F{id}]` facts, list their integer IDs in `superseded_fact_ids`. Only do this if the new fact proves the old one mathematically or empirically false.
 Do NOT output anything except a valid JSON object. No markdown blocks, no extra text.
 Follow the exact JSON schema requested in the task.
 """,

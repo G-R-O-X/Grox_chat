@@ -1,4 +1,6 @@
 from .db import (
+    supersede_facts as db_supersede_facts,
+
     get_web_evidence_for_topic as db_get_web_evidence,
 
     claim_candidate_exists as db_claim_candidate_exists,
@@ -505,3 +507,6 @@ def search_web_evidence_cross_topic(topic_id: int, query_text: str, top_k: int =
 
 def get_web_evidence_for_topic(topic_id: int) -> list[dict]:
     return db_get_web_evidence(topic_id)
+
+def supersede_facts(fact_ids: list[int]) -> None:
+    db_supersede_facts(fact_ids)

@@ -254,7 +254,7 @@ def _persist_web_search_rows(
             continue
         title = (item.get("title") or "").strip()
         snippet = (item.get("snippet") or "").strip()
-        url = (item.get("link") or item.get("url") or "").strip()
+        url = (item.get("url") or item.get("link") or "").strip()
         if not title and not snippet:
             continue
         web_id = api.insert_web_evidence(

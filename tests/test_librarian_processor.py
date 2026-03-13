@@ -115,8 +115,8 @@ async def test_apply_librarian_review_rejects_without_inserting_fact():
                             },
                         )
 
-    assert result["accepted_fact_id"] == 22
-    assert "No reliable source was found" in insert_fact.call_args.args[1]
+    assert result["accepted_fact_id"] is None
+    insert_fact.assert_not_called()
     insert_fact_with_embedding.assert_not_called()
     update_candidate.assert_called_once()
 

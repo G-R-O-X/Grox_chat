@@ -167,46 +167,6 @@ async def apply_librarian_review(
                     source="Librarian",
                     **insert_kwargs,
                 )
-    elif verification_status in {"unsupported", "refuted"}:
-        if verification_status == "unsupported":
-            base_msg = f'No reliable source was found for claim "{candidate["candidate_text"]}" during this verification pass.'
-            stored_text = f'{base_msg} Reason: {review_note}' if review_note else base_msg
-        else:
-            base_msg = f'Claim "{candidate["candidate_text"]}" is treated as refuted during this verification pass.'
-            stored_text = f'{base_msg} Reason: {review_note}' if review_note else base_msg
-        existing_fact = api.get_fact_by_content(topic_id, stored_text)
-        if existing_fact:
-            accepted_fact_id = existing_fact["id"]
-        else:
-            embedding = await aget_embedding(stored_text)
-            insert_kwargs = {
-                "subtopic_id": candidate.get("subtopic_id"),
-                "fact_stage": candidate.get("fact_stage", "synthesized"),
-                "fact_type": "verification_note",
-                "verification_status": verification_status,
-                "source_kind": "internal_verification",
-                "source_refs_json": json.dumps(source_refs, ensure_ascii=True) if source_refs else candidate.get("source_refs_json"),
-                "source_excerpt": source_excerpt or candidate.get("source_excerpt"),
-                "candidate_id": candidate_id,
-                "review_status": decision,
-                "evidence_note": evidence_note or None,
-                "confidence_score": confidence_score,
-            }
-            if embedding:
-                accepted_fact_id = api.insert_fact_with_embedding(
-                    topic_id,
-                    stored_text,
-                    source="Librarian",
-                    embedding=embedding,
-                    **insert_kwargs,
-                )
-            else:
-                accepted_fact_id = api.insert_fact(
-                    topic_id,
-                    stored_text,
-                    source="Librarian",
-                    **insert_kwargs,
-                )
 
     api.update_fact_candidate_review(
         candidate_id,

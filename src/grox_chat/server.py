@@ -608,14 +608,18 @@ def _build_termination_question(stage_guidance: str) -> str:
         "- `recent_shift`: use `yes`, `no`, or `unclear` based on whether the framing, governing metric, or recommendation changed in the last 1-2 rounds.\n"
         "- `conditional_support`: use `yes` if the current recommendation still relies on softened, caveated, or weakly validated facts.\n"
         "- `untested_novelty`: use `yes` if a new framework, router, metric, or failure model affecting the recommendation has not yet been stress-tested.\n"
+        "A subtopic can be legitimately CLOSED if it reaches ONE of the following end states:\n"
+        "1. [Hard Consensus]: A logically sound conclusion supported by evidence with no remaining central blockers.\n"
+        "2. [Constructive Suspension - Empirical Gap]: The team hits the boundary of non-executable constraints (e.g., requires physical testing), BUT has generated a rigorous, falsifiable [EXPERIMENTAL BLUEPRINT] (must include exact variables/metrics) to resolve the unknown.\n"
+        "3. [Constructive Suspension - Trade-off]: The team hits an unresolvable value conflict and produces a detailed [DECISION MATRIX] showing under what specific conditions Path A or Path B should be chosen.\n"
         "Default voting policy:\n"
-        "- If `centrality` is `central` or `mixed`, default to `continue`.\n"
+        "- If `centrality` is `central` or `mixed`, default to `continue`, UNLESS a Constructive Suspension state has been reached.\n"
         "- If `recent_shift` is `yes` or `unclear`, default to `continue`.\n"
         "- If `conditional_support` is `yes`, default to `continue`.\n"
         "- If `untested_novelty` is `yes`, default to `continue`.\n"
-        "- Vote `close` only when blockers are gone and another round would mostly repeat the same ground.\n"
-        "- If you vote `close` while any blocker is present, `override_reason` must be a short non-empty sentence.\n"
-        'Reply with strict JSON only: {"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","override_reason":"... or null"}.'
+        "- If you vote `close`, `reason` MUST contain a short explanation of WHICH end state was reached (Hard Consensus, Empirical Gap, or Trade-off) and why.\n"
+        "- If you vote `continue`, `reason` MUST explain what specific blocker or untested novelty remains.\n"
+        'Reply with strict JSON only: {"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","reason":"... (Mandatory explanation for your vote)"}.'
     )
 
 
@@ -639,7 +643,7 @@ def _build_termination_vote_repair_prompt(*, original_prompt: str, invalid_text:
         f"{invalid_text}\n\n"
         f"Validation failure: {invalid_reason}\n\n"
         "Rewrite the response into valid JSON using exactly this schema:\n"
-        '{"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","override_reason":"... or null"}\n'
+        '{"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","reason":"... (Mandatory)"}\n'
         "Preserve the original intent when possible.\n"
         "Output JSON only. Do not add markdown fences, commentary, or extra keys."
     )
@@ -779,7 +783,7 @@ def _empty_termination_vote(reason: str) -> dict[str, Any]:
         "conditional_support": "no",
         "untested_novelty": "no",
         "vote": "continue",
-        "override_reason": None,
+        "reason": None,
         "central_blocker": False,
         "volatility_blocker": True,
         "support_blocker": False,
@@ -1721,8 +1725,8 @@ def build_audience_summary_prompt(state: ChatState, topic: dict, messages: list[
         "AGENT DELTAS:\n"
         "Section rules:\n"
         "- `TRAJECTORY`: 1-2 short sentences stating whether the room changed framing, governing metric, or recommendation this round.\n"
-        "- `CONSENSUS`: state the strongest current agreement and include the main caveats from recent Librarian rulings or softened facts.\n"
-        "- `BLOCKERS`: name the main unresolved branch blocking closure; write `None` only if no meaningful blocker remains.\n"
+        "- `CONSENSUS`: state the strongest agreement. If the room is in an empirical impasse, explicitly state that 'Consensus is that empirical data is required' and record any specific experimental blueprints or decision matrices proposed.\n"
+        "- `BLOCKERS`: name the main unresolved branch. If the blocker is a pure lack of empirical data that cannot be simulated, state this clearly.\n"
         "- `EVIDENCE GAPS`: list only the gaps that could justify another round. Prefix each line with `[Central]` or `[Peripheral]`.\n"
         f"- `AGENT DELTAS`: include one bullet for each participant in this order: {participant_block}. State only what changed, what was conceded, or what new attack/correction was introduced this round.\n"
         "Do not state whether the subtopic is ready to close."

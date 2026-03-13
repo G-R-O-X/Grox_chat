@@ -58,7 +58,7 @@ def build_dashboard_snapshot(subtopic_id=None):
     facts = api.get_facts(topic_id, limit=80)
     fact_candidates = []
     if current_subtopic:
-        fact_candidates = api.get_fact_candidates(topic_id, subtopic_id=current_subtopic["id"], status="pending", limit=40)
+        fact_candidates = api.get_fact_candidates(topic_id, subtopic_id=current_subtopic["id"], limit=40)
 
     last_round = None
     for message in reversed(messages):
@@ -478,14 +478,19 @@ def render_dashboard_html():
       factsNode.innerHTML = html;
       
       if (!snapshot.fact_candidates || !snapshot.fact_candidates.length) {
-        renderEmpty(candidatesNode, 'No pending fact reviews.');
+        renderEmpty(candidatesNode, 'No fact candidates in this subtopic yet.');
       } else {
-        candidatesNode.innerHTML = '<h3>Pending Facts</h3>' + snapshot.fact_candidates.map((candidate) => (
-          '<div class="item">' +
+        candidatesNode.innerHTML = '<h3>Fact Candidates</h3>' + snapshot.fact_candidates.map((candidate) => {
+          let extraHtml = '';
+          if (candidate.status !== 'pending' && candidate.review_note) {
+              extraHtml = '<details id="cand-det-' + candidate.id + '"><summary>View Audit Reason</summary><div class="message-meta">' + esc(candidate.review_note) + '</div></details>';
+          }
+          return '<div class="item">' +
           '<div><span class="label">cand #' + candidate.id + '</span><span class="label">' + esc(candidate.status) + '</span></div>' +
           '<div class="candidate-content">' + esc(candidate.candidate_text) + '</div>' +
-          '</div>'
-        )).join('');
+          extraHtml +
+          '</div>';
+        }).join('');
       }
     }
 

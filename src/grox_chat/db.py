@@ -1262,3 +1262,12 @@ def get_open_subtopic(topic_id: int) -> Optional[Dict[str, Any]]:
             (topic_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_web_evidence_for_topic(topic_id: int) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        cursor = conn.execute(
+            "SELECT id, query_text, title, snippet, source_domain, url FROM WebEvidence WHERE origin_topic_id = ? ORDER BY id DESC",
+            (topic_id,)
+        )
+        return [dict(row) for row in cursor.fetchall()]

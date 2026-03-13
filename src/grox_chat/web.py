@@ -28,7 +28,7 @@ def _phase_for_round(round_number):
     return "debate"
 
 
-def build_dashboard_snapshot():
+def build_dashboard_snapshot(subtopic_id=None):
     topic = api.get_current_topic()
     if not topic:
         return {
@@ -50,7 +50,10 @@ def build_dashboard_snapshot():
     topic_id = topic["id"]
     plan = api.get_active_plan(topic_id)
     subtopics = api.get_current_subtopics(topic_id)
-    current_subtopic = api.get_open_subtopic(topic_id) or api.get_latest_subtopic(topic_id)
+    if subtopic_id:
+        current_subtopic = api.get_subtopic(int(subtopic_id))
+    else:
+        current_subtopic = api.get_open_subtopic(topic_id) or api.get_latest_subtopic(topic_id)
     messages = api.get_messages(topic_id, subtopic_id=current_subtopic["id"] if current_subtopic else None, limit=120)
     facts = api.get_facts(topic_id, limit=80)
     fact_candidates = []
@@ -75,6 +78,7 @@ def build_dashboard_snapshot():
         "messages": messages,
         "facts": facts,
         "fact_candidates": fact_candidates,
+        "web_evidence": api.get_web_evidence_for_topic(topic_id),
         "status": {
             "db_path": api.get_db_path(),
             "refreshed_at": datetime.now(timezone.utc).isoformat(),
@@ -104,6 +108,10 @@ def render_dashboard_html():
       --pending: #7a3e00;
       --mono: "IBM Plex Mono", "SFMono-Regular", monospace;
       --serif: "Iowan Old Style", "Palatino Linotype", serif;
+      --chat-sys-bg: #e6eef5;
+      --chat-usr-bg: #eef5e6;
+      --chat-dog-border: #cc444b;
+      --chat-cat-border: #44cc77;
     }
     * { box-sizing: border-box; }
     body {
@@ -118,51 +126,63 @@ def render_dashboard_html():
       padding: 20px;
     }
     .header {
-      border: 1px solid var(--line);
-      background: var(--panel);
-      padding: 16px 18px;
-      margin-bottom: 18px;
-      display: grid;
-      gap: 10px;
+      margin-bottom: 24px;
     }
     .eyebrow {
       font-family: var(--mono);
       font-size: 12px;
-      letter-spacing: 0.08em;
-      color: var(--muted);
       text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 8px;
     }
     h1 {
-      margin: 0;
+      margin: 0 0 12px 0;
       font-size: 28px;
-      line-height: 1.15;
+      line-height: 1.2;
     }
     .meta {
       display: flex;
       flex-wrap: wrap;
-      gap: 14px;
+      gap: 12px;
       font-family: var(--mono);
-      font-size: 12px;
+      font-size: 13px;
       color: var(--muted);
+    }
+    .nav-bar {
+      margin-bottom: 20px;
+      padding: 10px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 14px;
+    }
+    .nav-bar select {
+      padding: 4px;
+      font-family: var(--mono);
+      margin-left: 10px;
     }
     .grid {
       display: grid;
-      grid-template-columns: 280px minmax(0, 1fr) 320px;
-      gap: 18px;
+      grid-template-columns: 320px 1fr 320px;
+      gap: 24px;
+      align-items: start;
     }
     .panel {
-      border: 1px solid var(--line);
       background: var(--panel);
-      min-height: 200px;
+      border: 1px solid var(--line);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+      border-radius: 6px;
       overflow: hidden;
     }
     .panel h2 {
       margin: 0;
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-      font-size: 14px;
+      padding: 12px 16px;
+      font-size: 13px;
       font-family: var(--mono);
-      letter-spacing: 0.08em;
+      border-bottom: 1px solid var(--line);
+      background: rgba(0,0,0,0.02);
       text-transform: uppercase;
     }
     .panel-body {
@@ -172,6 +192,56 @@ def render_dashboard_html():
       display: grid;
       gap: 12px;
     }
+    /* Timeline Chat Styles */
+    .timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .chat-bubble {
+      padding: 12px;
+      border-radius: 8px;
+      max-width: 90%;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .chat-bubble.system {
+      max-width: 100%;
+      background: var(--chat-sys-bg);
+      border-color: #c0d4e6;
+      margin: 0 auto;
+      text-align: left;
+    }
+    .chat-bubble.special-dog { border: 2px solid var(--chat-dog-border); }
+    .chat-bubble.special-cat { border: 2px solid var(--chat-cat-border); }
+    
+    .chat-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .chat-sender { font-weight: bold; text-transform: uppercase; }
+    .chat-meta { color: var(--muted); }
+    
+    .chat-content {
+      white-space: pre-wrap;
+      line-height: 1.5;
+      font-size: 14.5px;
+    }
+    
+    details > summary {
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+    
+    /* Small items for side panels */
     .item {
       padding-bottom: 12px;
       border-bottom: 1px solid var(--line);
@@ -190,27 +260,13 @@ def render_dashboard_html():
       margin-right: 6px;
       margin-bottom: 6px;
     }
-    .message-sender {
-      font-weight: 700;
-      margin-bottom: 4px;
-    }
-    .message-meta {
-      font-family: var(--mono);
-      color: var(--muted);
-      font-size: 11px;
-      margin-bottom: 6px;
-    }
-    .message-content, .fact-content, .candidate-content {
-      white-space: pre-wrap;
-      line-height: 1.45;
-      font-size: 15px;
-    }
+    .message-sender { font-weight: 700; margin-bottom: 4px; }
+    .message-meta { font-family: var(--mono); color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+    .message-content, .fact-content, .candidate-content { white-space: pre-wrap; line-height: 1.45; font-size: 14px; }
     .fact-content { color: var(--fact); }
     .candidate-content { color: var(--pending); }
-    .empty {
-      color: var(--muted);
-      font-style: italic;
-    }
+    .empty { color: var(--muted); font-style: italic; }
+    
     @media (max-width: 1100px) {
       .grid { grid-template-columns: 1fr; }
     }
@@ -223,6 +279,13 @@ def render_dashboard_html():
       <h1 id="topic-title">Loading...</h1>
       <div class="meta" id="topic-meta"></div>
     </div>
+    
+    <div class="nav-bar" id="nav-bar" style="display:none;">
+      <label for="subtopic-select">View Subtopic:</label>
+      <select id="subtopic-select" onchange="changeSubtopic(this.value)">
+      </select>
+    </div>
+
     <div class="grid">
       <section class="panel">
         <h2>Plan & Subtopics</h2>
@@ -230,10 +293,10 @@ def render_dashboard_html():
       </section>
       <section class="panel">
         <h2>Timeline</h2>
-        <div class="panel-body stack" id="messages-panel"></div>
+        <div class="panel-body timeline" id="messages-panel"></div>
       </section>
       <section class="panel">
-        <h2>Facts & Pending Reviews</h2>
+        <h2>Knowledge Base</h2>
         <div class="panel-body">
           <div class="stack" id="facts-panel"></div>
           <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
@@ -243,6 +306,16 @@ def render_dashboard_html():
     </div>
   </div>
   <script>
+    let currentSubtopicId = new URLSearchParams(window.location.search).get("subtopic_id");
+
+    function changeSubtopic(id) {
+        if(id) {
+            window.location.href = "?subtopic_id=" + id;
+        } else {
+            window.location.href = "/";
+        }
+    }
+
     function esc(value) {
       return String(value ?? '')
         .replace(/&/g, '&amp;')
@@ -259,6 +332,9 @@ def render_dashboard_html():
     function renderTopic(snapshot) {
       const title = document.getElementById('topic-title');
       const meta = document.getElementById('topic-meta');
+      const navBar = document.getElementById('nav-bar');
+      const subSelect = document.getElementById('subtopic-select');
+      
       if (!snapshot.topic) {
         title.textContent = 'No active topic';
         meta.innerHTML = '<span>' + esc('No data in database') + '</span>';
@@ -273,6 +349,16 @@ def render_dashboard_html():
         'refreshed=' + snapshot.status.refreshed_at,
       ];
       meta.innerHTML = bits.map(bit => '<span>' + esc(bit) + '</span>').join('');
+      
+      if(snapshot.subtopics && snapshot.subtopics.length > 0) {
+          navBar.style.display = "block";
+          let opts = "<option value=''>-- Latest --</option>";
+          snapshot.subtopics.forEach(st => {
+              let selected = (currentSubtopicId && st.id == currentSubtopicId) || (!currentSubtopicId && snapshot.current_subtopic && st.id == snapshot.current_subtopic.id) ? "selected" : "";
+              opts += "<option value='" + st.id + "' " + selected + ">#" + st.id + " " + esc(st.summary) + "</option>";
+          });
+          subSelect.innerHTML = opts;
+      }
     }
 
     function renderPlan(snapshot) {
@@ -316,22 +402,46 @@ def render_dashboard_html():
         renderEmpty(node, 'No messages yet.');
         return;
       }
+      
+      const adminRoles = ["skynet", "librarian", "writer", "tron"];
+      
       node.innerHTML = snapshot.messages.map((message) => {
-        const labels = [
-          '<span class="label">' + esc(message.sender) + '</span>',
-          '<span class="label">' + esc(message.msg_type) + '</span>'
-        ];
+        let classes = "chat-bubble";
+        if(adminRoles.includes(message.sender.toLowerCase())) {
+            classes += " system";
+        } else if (message.sender.toLowerCase() === "dog") {
+            classes += " special-dog";
+        } else if (message.sender.toLowerCase() === "cat") {
+            classes += " special-cat";
+        }
+        
+        const isLongText = message.content.length > 400 || message.msg_type === "summary" || message.turn_kind === "librarian_audit";
+        
+        let contentHtml = "";
+        if(isLongText) {
+            let previewText = esc(message.content.substring(0, 150)) + "...";
+            if (message.msg_type === "summary") previewText = "Summary Content";
+            if (message.turn_kind === "librarian_audit") previewText = "Librarian Audit Log";
+            
+            contentHtml = '<details><summary>Expand: ' + previewText + '</summary><div class="chat-content">' + esc(message.content) + '</div></details>';
+        } else {
+            contentHtml = '<div class="chat-content">' + esc(message.content) + '</div>';
+        }
+
+        const metaLabels = [];
         if (message.round_number !== null && message.round_number !== undefined) {
-          labels.push('<span class="label">' + esc('round ' + message.round_number) + '</span>');
+          metaLabels.push('R' + message.round_number);
         }
-        if (message.turn_kind) {
-          labels.push('<span class="label">' + esc(message.turn_kind) + '</span>');
-        }
+        if (message.turn_kind) metaLabels.push(message.turn_kind);
+        if (message.msg_type !== "standard") metaLabels.push(message.msg_type);
+
         return (
-          '<div class="item">' +
-          '<div>' + labels.join('') + '</div>' +
-          '<div class="message-meta">' + esc('id=' + message.id + (message.confidence_score != null ? ' confidence=' + message.confidence_score : '')) + '</div>' +
-          '<div class="message-content">' + esc(message.content) + '</div>' +
+          '<div class="' + classes + '">' +
+          '<div class="chat-header">' +
+          '<span class="chat-sender">' + esc(message.sender) + '</span>' +
+          '<span class="chat-meta">' + esc(metaLabels.join(' | ')) + ' (id=' + message.id + ')</span>' +
+          '</div>' +
+          contentHtml +
           '</div>'
         );
       }).join('');
@@ -340,22 +450,39 @@ def render_dashboard_html():
     function renderFacts(snapshot) {
       const factsNode = document.getElementById('facts-panel');
       const candidatesNode = document.getElementById('candidates-panel');
-      if (!snapshot.facts.length) {
-        renderEmpty(factsNode, 'No accepted facts yet.');
+      
+      let html = '';
+      if (!snapshot.facts || !snapshot.facts.length) {
+        html += '<div class="empty">No accepted facts yet.</div>';
       } else {
-        factsNode.innerHTML = snapshot.facts.map((fact) => (
+        html += '<h3>[F] Facts</h3>' + snapshot.facts.map((fact) => (
           '<div class="item">' +
-          '<div><span class="label">' + esc('fact #' + fact.id) + '</span><span class="label">' + esc(fact.review_status || 'accepted') + '</span></div>' +
+          '<div><span class="label">[F' + fact.id + ']</span><span class="label">' + esc(fact.review_status || 'accepted') + '</span></div>' +
           '<div class="fact-content">' + esc(fact.content) + '</div>' +
           '</div>'
         )).join('');
       }
-      if (!snapshot.fact_candidates.length) {
+      
+      if (snapshot.web_evidence && snapshot.web_evidence.length) {
+        html += '<hr style="border:none;border-top:1px solid var(--line);margin:16px 0;"><h3>[W] Web Evidence</h3>';
+        html += '<details><summary>View ' + snapshot.web_evidence.length + ' stored web sources</summary>';
+        html += snapshot.web_evidence.map((we) => (
+          '<div class="item" style="margin-top:12px;">' +
+          '<div><span class="label">[W' + we.id + ']</span><a href="' + esc(we.url) + '" target="_blank" class="message-meta">' + esc(we.source_domain) + '</a></div>' +
+          '<div class="message-sender">' + esc(we.title) + '</div>' +
+          '<div class="candidate-content">' + esc(we.snippet) + '</div>' +
+          '</div>'
+        )).join('');
+        html += '</details>';
+      }
+      factsNode.innerHTML = html;
+      
+      if (!snapshot.fact_candidates || !snapshot.fact_candidates.length) {
         renderEmpty(candidatesNode, 'No pending fact reviews.');
       } else {
-        candidatesNode.innerHTML = snapshot.fact_candidates.map((candidate) => (
+        candidatesNode.innerHTML = '<h3>Pending Facts</h3>' + snapshot.fact_candidates.map((candidate) => (
           '<div class="item">' +
-          '<div><span class="label">' + esc('candidate #' + candidate.id) + '</span><span class="label">' + esc(candidate.status) + '</span></div>' +
+          '<div><span class="label">cand #' + candidate.id + '</span><span class="label">' + esc(candidate.status) + '</span></div>' +
           '<div class="candidate-content">' + esc(candidate.candidate_text) + '</div>' +
           '</div>'
         )).join('');
@@ -363,7 +490,9 @@ def render_dashboard_html():
     }
 
     async function refresh() {
-      const response = await fetch('/api/dashboard', { cache: 'no-store' });
+      let url = '/api/dashboard';
+      if(currentSubtopicId) url += '?subtopic_id=' + currentSubtopicId;
+      const response = await fetch(url, { cache: 'no-store' });
       const snapshot = await response.json();
       renderTopic(snapshot);
       renderPlan(snapshot);
@@ -372,7 +501,7 @@ def render_dashboard_html():
     }
 
     refresh();
-    setInterval(refresh, 1500);
+    setInterval(refresh, 2000);
   </script>
 </body>
 </html>"""
@@ -383,7 +512,8 @@ async def index(request):
 
 
 async def dashboard(request):
-    return web.json_response(build_dashboard_snapshot())
+    subtopic_id = request.query.get('subtopic_id')
+    return web.json_response(build_dashboard_snapshot(subtopic_id=subtopic_id))
 
 
 async def health(request):

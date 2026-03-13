@@ -1,4 +1,6 @@
 from .db import (
+    get_web_evidence_for_topic as db_get_web_evidence,
+
     claim_candidate_exists as db_claim_candidate_exists,
     close_subtopic as db_close_subtopic,
     create_claim_candidate as db_create_claim_candidate,
@@ -500,3 +502,6 @@ def search_web_evidence_same_topic(topic_id: int, query_text: str, top_k: int = 
 
 def search_web_evidence_cross_topic(topic_id: int, query_text: str, top_k: int = 8, max_age_days: int = 30):
     return db_search_web_evidence_cross_topic(topic_id, query_text, top_k=top_k, max_age_days=max_age_days)
+
+def get_web_evidence_for_topic(topic_id: int) -> list[dict]:
+    return db_get_web_evidence(topic_id)

@@ -197,10 +197,12 @@ def render_dashboard_html():
       display: flex;
       flex-direction: column;
       gap: 16px;
+      align-items: flex-start;
     }
     .chat-bubble {
       padding: 12px;
       border-radius: 8px;
+      width: 100%;
       max-width: 90%;
       border: 1px solid var(--line);
       background: #fff;
@@ -209,8 +211,6 @@ def render_dashboard_html():
       max-width: 100%;
       background: var(--chat-sys-bg);
       border-color: #c0d4e6;
-      margin: 0 auto;
-      text-align: left;
     }
     .chat-bubble.special-dog { border: 2px solid var(--chat-dog-border); }
     .chat-bubble.special-cat { border: 2px solid var(--chat-cat-border); }
@@ -423,7 +423,7 @@ def render_dashboard_html():
             if (message.msg_type === "summary") previewText = "Summary Content";
             if (message.turn_kind === "librarian_audit") previewText = "Librarian Audit Log";
             
-            contentHtml = '<details><summary>Expand: ' + previewText + '</summary><div class="chat-content">' + esc(message.content) + '</div></details>';
+            contentHtml = '<details id="msg-det-' + message.id + '"><summary>Expand: ' + previewText + '</summary><div class="chat-content">' + esc(message.content) + '</div></details>';
         } else {
             contentHtml = '<div class="chat-content">' + esc(message.content) + '</div>';
         }
@@ -465,7 +465,7 @@ def render_dashboard_html():
       
       if (snapshot.web_evidence && snapshot.web_evidence.length) {
         html += '<hr style="border:none;border-top:1px solid var(--line);margin:16px 0;"><h3>[W] Web Evidence</h3>';
-        html += '<details><summary>View ' + snapshot.web_evidence.length + ' stored web sources</summary>';
+        html += '<details id="web-evidence-det"><summary>View ' + snapshot.web_evidence.length + ' stored web sources</summary>';
         html += snapshot.web_evidence.map((we) => (
           '<div class="item" style="margin-top:12px;">' +
           '<div><span class="label">[W' + we.id + ']</span><a href="' + esc(we.url) + '" target="_blank" class="message-meta">' + esc(we.source_domain) + '</a></div>' +
@@ -494,14 +494,33 @@ def render_dashboard_html():
       if(currentSubtopicId) url += '?subtopic_id=' + currentSubtopicId;
       const response = await fetch(url, { cache: 'no-store' });
       const snapshot = await response.json();
+      
+      // Save state of <details> tags
+      const detailsState = {};
+      document.querySelectorAll('details').forEach(el => {
+         if(el.id) detailsState[el.id] = el.open;
+      });
+
       renderTopic(snapshot);
       renderPlan(snapshot);
       renderMessages(snapshot);
       renderFacts(snapshot);
+      
+      // Restore state
+      document.querySelectorAll('details').forEach(el => {
+         if(el.id && detailsState[el.id]) el.open = true;
+      });
+      
+      // If the topic is closed, we can stop hammering the server
+      if (snapshot.topic && snapshot.topic.status === 'Closed') {
+          if (window.refreshInterval) {
+              clearInterval(window.refreshInterval);
+          }
+      }
     }
 
     refresh();
-    setInterval(refresh, 2000);
+    window.refreshInterval = setInterval(refresh, 2000);
   </script>
 </body>
 </html>"""

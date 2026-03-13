@@ -72,6 +72,6 @@ def test_dashboard_html_escapes_dynamic_content_in_client_renderer():
     html = render_dashboard_html()
 
     assert "function esc(value)" in html
-    assert "esc(message.content)" in html
-    assert "esc(fact.content)" in html
-    assert "esc(candidate.candidate_text)" in html
+    assert "linkCitations(message.content)" in html
+    assert "linkCitations(f.content)" in html
+    assert "esc(c.candidate_text)" in html

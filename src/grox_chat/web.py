@@ -96,7 +96,7 @@ def build_dashboard_snapshot(subtopic_id=None):
 
 
 def render_dashboard_html():
-    return """<!doctype html>
+    return r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -363,9 +363,43 @@ def render_dashboard_html():
     .tab-content { display: none; }
     .tab-content.active { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
 
+    /* Tooltip styles */
+    .citation {
+      color: var(--accent);
+      text-decoration: underline dotted;
+      cursor: help;
+      font-weight: bold;
+      position: relative;
+    }
+    #global-tooltip {
+      position: fixed;
+      display: none;
+      background: var(--panel);
+      border: 1px solid var(--accent);
+      padding: 12px;
+      border-radius: 4px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      z-index: 10000;
+      max-width: 400px;
+      font-size: 13px;
+      line-height: 1.5;
+      pointer-events: none;
+      color: #fff;
+    }
+    #global-tooltip .tt-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 4px;
+      display: block;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 4px;
+    }
   </style>
 </head>
 <body>
+  <div id="global-tooltip"></div>
   <div class="header">
     <div class="header-left">
       <div class="eyebrow">GROX Chat Monitor</div>
@@ -416,6 +450,45 @@ def render_dashboard_html():
   </div>
 
   <script>
+    const KNOWLEDGE_MAP = {};
+
+    function updateKnowledgeMap(snapshot) {
+      if (snapshot.facts) snapshot.facts.forEach(f => KNOWLEDGE_MAP['F' + f.id] = { type: 'Fact', content: f.content });
+      if (snapshot.claims) snapshot.claims.forEach(c => KNOWLEDGE_MAP['C' + c.id] = { type: 'Claim', content: c.content });
+      if (snapshot.web_evidence) snapshot.web_evidence.forEach(w => KNOWLEDGE_MAP['W' + w.id] = { type: 'Web Source', content: w.title + ': ' + w.snippet });
+    }
+
+    function linkCitations(text) {
+      return esc(text).replace(/\[([FWC])(\d+)\]/g, (match, type, id) => {
+        const key = type + id;
+        return '<span class="citation" onmouseover="showTooltip(event, \'' + key + '\')" onmouseout="hideTooltip()">[' + key + ']</span>';
+      });
+    }
+
+    function showTooltip(e, key) {
+      const tt = document.getElementById('global-tooltip');
+      const data = KNOWLEDGE_MAP[key];
+      if (!data) return;
+      
+      tt.innerHTML = '<span class="tt-label">' + esc(data.type) + ' [' + key + ']</span>' + esc(data.content);
+      tt.style.display = 'block';
+      
+      // Positioning
+      const x = e.clientX + 15;
+      const y = e.clientY + 15;
+      tt.style.left = x + 'px';
+      tt.style.top = y + 'px';
+      
+      // Flip if overflow
+      const rect = tt.getBoundingClientRect();
+      if (rect.right > window.innerWidth) tt.style.left = (e.clientX - rect.width - 15) + 'px';
+      if (rect.bottom > window.innerHeight) tt.style.top = (e.clientY - rect.height - 15) + 'px';
+    }
+
+    function hideTooltip() {
+      document.getElementById('global-tooltip').style.display = 'none';
+    }
+
     let currentSubtopicId = new URLSearchParams(window.location.search).get("subtopic_id");
 
     function changeSubtopic(id) {
@@ -569,9 +642,9 @@ def render_dashboard_html():
             if (message.msg_type === "summary") previewText = "Summary Content";
             if (message.turn_kind === "librarian_audit") previewText = "Librarian Audit Log";
 
-            contentHtml = '<details id="msg-det-' + message.id + '"><summary>Expand: ' + previewText + '</summary><div class="chat-content">' + esc(message.content) + '</div></details>';
+            contentHtml = '<details id="msg-det-' + message.id + '"><summary>Expand: ' + previewText + '</summary><div class="chat-content">' + linkCitations(message.content) + '</div></details>';
         } else {
-            contentHtml = '<div class="chat-content">' + esc(message.content) + '</div>';
+            contentHtml = '<div class="chat-content">' + linkCitations(message.content) + '</div>';
         }
 
         const metaLabels = [];
@@ -621,7 +694,7 @@ def render_dashboard_html():
         factsNode.innerHTML = snapshot.facts.map(f => 
           '<div class="card">' +
           '<div><span class="label">[F' + f.id + ']</span><span class="label" style="color:var(--fact)">' + esc(f.review_status) + '</span></div>' +
-          '<div class="fact-content">' + esc(f.content) + '</div>' +
+          '<div class="fact-content">' + linkCitations(f.content) + '</div>' +
           '</div>'
         ).join('');
       }
@@ -634,7 +707,7 @@ def render_dashboard_html():
         claimsNode.innerHTML = snapshot.claims.map(c => 
           '<div class="card">' +
           '<div><span class="label">[C' + c.id + ']</span></div>' +
-          '<div class="card-content">' + esc(c.content) + '</div>' +
+          '<div class="card-content">' + linkCitations(c.content) + '</div>' +
           '</div>'
         ).join('');
       }
@@ -702,6 +775,7 @@ def render_dashboard_html():
       // Remember scroll position of timeline
       const timelineScroll = document.getElementById('scroll-timeline').scrollTop;
 
+      updateKnowledgeMap(snapshot);
       renderTopic(snapshot);
       renderPlan(snapshot);
       renderMessages(snapshot);

@@ -510,3 +510,13 @@ def get_web_evidence_for_topic(topic_id: int) -> list[dict]:
 
 def supersede_facts(fact_ids: list[int]) -> None:
     db_supersede_facts(fact_ids)
+
+
+def get_claims(topic_id: int, limit: int | None = None):
+    with get_db() as conn:
+        params = [topic_id]
+        query = "SELECT * FROM Claim WHERE topic_id = ? ORDER BY id DESC"
+        if limit is not None:
+            query += f" LIMIT {limit}"
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]

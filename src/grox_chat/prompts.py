@@ -159,6 +159,7 @@ All JSON string values, target names, and message content must be written in Eng
 When you rely on stored knowledge, cite facts as [F{id}], claims as [C{id}], and web evidence as [W{id}]. Do not invent IDs. Treat [W] as unverified web evidence.
 You must ONLY target one of these ordinary deliberators: dreamer, scientist, engineer, analyst, critic, contrarian.
 Your responses must ONLY be valid JSON. No markdown blocks, no extra text.
-Format: {"action": "focus", "target": "scientist", "reason": "why this person is most likely to unlock the next step", "grant_web_search": true}
+If you are taking your normal turn, use this Format: {"action": "focus", "target": "scientist", "reason": "why this person is most likely to unlock the next step", "grant_web_search": true}
+If you are voting in a governance round, IGNORE the above format and STRICTLY follow the JSON format requested in the prompt.
 """
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -337,12 +338,16 @@ class Agent:
         return parsed_vote
 
     async def governance_vote(self, prompt: str) -> str:
+        # Strip out standard JSON format instructions from the base role prompt
+        # to prevent conflicts with the specific governance voting schema
+        base_prompt = re.sub(r'Format: \{.*?\}', '', self.spec.role_prompt, flags=re.DOTALL)
+
         vote_instruction = (
-            f"{self.spec.role_prompt}\n\n"
+            f"{base_prompt}\n\n"
             "GOVERNANCE VOTING MODE:\n"
             "You are not posting a normal debate message. "
             "You must analyze governance state and reply with strict JSON only using the exact schema requested in the user prompt. "
-            "Do not output markdown, prose outside JSON, or extra keys."
+            "Do not output markdown, prose outside JSON, or extra keys. IGNORE any previous JSON format instructions."
         )
         result = await retry_structured_output(
             stage_name=f"{self.spec.name} governance_vote",

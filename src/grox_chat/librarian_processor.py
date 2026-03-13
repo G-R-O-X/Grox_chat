@@ -169,14 +169,11 @@ async def apply_librarian_review(
                 )
     elif verification_status in {"unsupported", "refuted"}:
         if verification_status == "unsupported":
-            stored_text = (
-                f'No reliable source was found for claim "{candidate["candidate_text"]}" '
-                "during this verification pass."
-            )
+            base_msg = f'No reliable source was found for claim "{candidate["candidate_text"]}" during this verification pass.'
+            stored_text = f'{base_msg} Reason: {review_note}' if review_note else base_msg
         else:
-            stored_text = (
-                f'Claim "{candidate["candidate_text"]}" is treated as refuted during this verification pass.'
-            )
+            base_msg = f'Claim "{candidate["candidate_text"]}" is treated as refuted during this verification pass.'
+            stored_text = f'{base_msg} Reason: {review_note}' if review_note else base_msg
         existing_fact = api.get_fact_by_content(topic_id, stored_text)
         if existing_fact:
             accepted_fact_id = existing_fact["id"]

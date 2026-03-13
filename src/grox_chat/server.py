@@ -918,6 +918,9 @@ async def _run_termination_votes(
             "repair_response": repair_response,
             "parsed": parsed,
         }
+        # Extract reason safely, defaulting to empty string if missing or None
+        vote_reason = parsed.get("reason") or parsed.get("override_reason") or ""
+        
         api.insert_vote_record(
             topic_id,
             subtopic_id,
@@ -928,7 +931,7 @@ async def _run_termination_votes(
             voter,
             bool(parsed["parsed_ok"]),
             parsed["vote"] if parsed["parsed_ok"] else None,
-            parsed["override_reason"] if parsed["parsed_ok"] else None,
+            vote_reason,
             raw_response,
             metadata_json=json.dumps(
                 {

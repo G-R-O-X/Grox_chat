@@ -17,7 +17,7 @@ from .server import run_subtopic_graph
 from .structured_retry import retry_structured_output, usable_text_output
 
 logger = logging.getLogger(__name__)
-SUBTOPIC_CANDIDATE_COUNT = 4
+SUBTOPIC_CANDIDATE_COUNT = 3
 SUBTOPIC_VOTE_CYCLE_LIMIT = 3
 DECISION_PASS_RATIO = 2 / 3
 

@@ -2659,7 +2659,7 @@ async def audience_summary_node(state: ChatState) -> dict:
 async def audience_termination_check_node(state: ChatState) -> dict:
     logger.info("[skynet] Checking termination and cyclicality...")
     current_round = state.get("round_number", 1)
-    if current_round >= 10:
+    if current_round >= 7:
         logger.info("[skynet] Forcing subtopic close at round %s.", current_round)
         return {"subtopic_exhausted": True}
 

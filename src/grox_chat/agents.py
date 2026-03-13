@@ -340,7 +340,7 @@ class Agent:
     async def governance_vote(self, prompt: str) -> str:
         # Strip out standard JSON format instructions from the base role prompt
         # to prevent conflicts with the specific governance voting schema
-        base_prompt = re.sub(r'Format: \{.*?\}', '', self.spec.role_prompt, flags=re.DOTALL)
+        base_prompt = re.sub(r'(Format: \{.*?\}|【MANDATORY REASONING DRAFTING】.*)', '', self.spec.role_prompt, flags=re.DOTALL)
 
         vote_instruction = (
             f"{base_prompt}\n\n"

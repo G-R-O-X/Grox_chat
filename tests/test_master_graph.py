@@ -123,7 +123,7 @@ async def test_collect_votes_persists_reasoned_vote_records():
 
 
 @pytest.mark.asyncio
-async def test_node_plan_generation_truncates_to_four_subtopics():
+async def test_node_plan_generation_truncates_to_three_subtopics():
     state = {"topic_id": 1}
     model_subtopics = [
         {"summary": f"Subtopic {idx}", "detail": f"Detail {idx}"}
@@ -146,9 +146,8 @@ async def test_node_plan_generation_truncates_to_four_subtopics():
                     new_state = await node_plan_generation(state)
 
     stored_subtopics = json.loads(create_plan.call_args.args[1])
-    assert len(stored_subtopics) == 4
+    assert len(stored_subtopics) == 3
     assert new_state["plan_id"] == 7
-
 
 @pytest.mark.asyncio
 async def test_node_plan_generation_closes_after_three_empty_cycles():

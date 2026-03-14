@@ -694,7 +694,8 @@ def render_dashboard_html():
         factsNode.innerHTML = snapshot.facts.map(f => 
           '<div class="card">' +
           '<div><span class="label">[F' + f.id + ']</span><span class="label" style="color:var(--fact)">' + esc(f.review_status) + '</span></div>' +
-          '<div class="fact-content">' + linkCitations(f.content) + '</div>' +
+          '<div class="fact-content" style="font-weight:bold; margin-bottom:8px;">' + linkCitations(f.summary || f.content) + '</div>' +
+          (f.summary ? '<details id="f-det-' + f.id + '"><summary>View Full Text</summary><div class="card-content" style="margin-top:8px; font-size:12px; border-top:1px solid var(--line); padding-top:8px;">' + linkCitations(f.content) + '</div></details>' : '') +
           '</div>'
         ).join('');
       }
@@ -707,7 +708,8 @@ def render_dashboard_html():
         claimsNode.innerHTML = snapshot.claims.map(c => 
           '<div class="card">' +
           '<div><span class="label">[C' + c.id + ']</span></div>' +
-          '<div class="card-content">' + linkCitations(c.content) + '</div>' +
+          '<div class="fact-content" style="font-weight:bold; margin-bottom:8px;">' + linkCitations(c.summary || c.content) + '</div>' +
+          (c.summary ? '<details id="c-det-' + c.id + '"><summary>View Full Text</summary><div class="card-content" style="margin-top:8px; font-size:12px; border-top:1px solid var(--line); padding-top:8px;">' + linkCitations(c.content) + '</div></details>' : '') +
           '</div>'
         ).join('');
       }

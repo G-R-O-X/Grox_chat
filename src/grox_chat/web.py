@@ -154,6 +154,12 @@ def render_dashboard_html():
       font-size: 20px;
       letter-spacing: -0.02em;
       color: #fff;
+      display: -webkit-box;
+      -webkit-line-clamp: 2; /* Limit to 2 lines */
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      max-width: 900px;
+      line-height: 1.3;
     }
     
     .eyebrow {
@@ -236,6 +242,23 @@ def render_dashboard_html():
       gap: 16px;
     }
     
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--muted);
+    }
+    .controls select, .controls input {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      font-family: var(--mono);
+      border-radius: 4px;
+      padding: 2px 4px;
+      outline: none;
+    }
     /* Chat Timeline Styles */
     .timeline {
       padding: 24px;
@@ -254,7 +277,6 @@ def render_dashboard_html():
     }
     
     .chat-bubble.system {
-      max-width: 100%;
       background: var(--chat-sys-bg);
       border-color: var(--chat-sys-border);
     }
@@ -425,9 +447,18 @@ def render_dashboard_html():
     
     <!-- Middle Column: Timeline -->
     <div class="column" id="scroll-timeline">
-      <div class="panel-header">
-        <span>Timeline</span>
-        <span id="timeline-stats" style="color:var(--muted);font-weight:normal;"></span>
+      <div class="panel-header" style="flex-wrap: wrap; gap: 8px;">
+        <div>
+            <span>Timeline</span>
+            <span id="timeline-stats" style="color:var(--muted);font-weight:normal; margin-left: 8px;"></span>
+        </div>
+        <div class="controls">
+            <label><input type="checkbox" id="auto-refresh-toggle" checked onchange="toggleAutoRefresh(this)"> Auto-Refresh</label>
+            <select id="sort-toggle" onchange="toggleSort(this.value)">
+                <option value="asc">Oldest First</option>
+                <option value="desc">Newest First</option>
+            </select>
+        </div>
       </div>
       <div class="panel-body timeline" id="messages-panel"></div>
     </div>
@@ -489,6 +520,20 @@ def render_dashboard_html():
       document.getElementById('global-tooltip').style.display = 'none';
     }
 
+    
+    let isAutoRefresh = true;
+    let sortOrder = 'asc';
+
+    function toggleAutoRefresh(el) {
+        isAutoRefresh = el.checked;
+        if(isAutoRefresh) refresh();
+    }
+    
+    function toggleSort(val) {
+        sortOrder = val;
+        refresh(); // force re-render immediately
+    }
+
     let currentSubtopicId = new URLSearchParams(window.location.search).get("subtopic_id");
 
     function changeSubtopic(id) {
@@ -534,9 +579,8 @@ def render_dashboard_html():
         return;
       }
       
-      // Truncate title if too long
+      // Let CSS handle text wrapping instead of hard truncation
       let displayTitle = snapshot.topic.summary;
-      if (displayTitle.length > 70) displayTitle = displayTitle.substring(0, 70) + "...";
       title.textContent = displayTitle;
       title.title = snapshot.topic.summary; // full text on hover
       
@@ -630,7 +674,20 @@ def render_dashboard_html():
           return vHtml;
       }
 
-      snapshot.messages.forEach((message) => {
+      
+      // Messages come from API usually newest first (DESC) because of `ORDER BY id DESC LIMIT`.
+      // The API reverses them to chronological order (ASC).
+      let msgsToRender = [...snapshot.messages];
+      
+      // If we want newest first, we reverse them back.
+      if (sortOrder === 'desc') {
+          msgsToRender.reverse();
+      }
+
+      msgsToRender.forEach((message, index) => {
+        const trueIndex = sortOrder === 'asc' ? index + 1 : msgsToRender.length - index;
+        const timeStr = message.created_at ? message.created_at.substring(11, 16) : '';
+
         if (currentRound !== null && message.round_number !== null && message.round_number !== currentRound) {
             html += renderVotesForRound(currentRound);
         }
@@ -667,8 +724,8 @@ def render_dashboard_html():
 
         html += '<div class="' + classes + '">' +
           '<div class="chat-header">' +
-          '<span class="chat-sender">' + esc(message.sender) + '</span>' +
-          '<span class="chat-meta">' + esc(metaLabels.join(' | ')) + '</span>' +
+          '<span class="chat-sender"><span style="color:var(--muted); font-weight:normal; margin-right:6px;">#' + trueIndex + '</span>' + esc(message.sender) + '</span>' +
+          '<span class="chat-meta">' + (timeStr ? timeStr + ' | ' : '') + esc(metaLabels.join(' | ')) + '</span>' +
           '</div>' +
           contentHtml +
           '</div>';
@@ -807,7 +864,7 @@ def render_dashboard_html():
     }
 
     refresh();
-    window.refreshInterval = setInterval(refresh, 2000);
+    window.refreshInterval = setInterval(() => { if(isAutoRefresh) refresh(); }, 2000);
   </script>
 </body>
 </html>"""

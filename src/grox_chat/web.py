@@ -54,16 +54,16 @@ def build_dashboard_snapshot(subtopic_id=None):
         current_subtopic = api.get_subtopic(int(subtopic_id))
     else:
         current_subtopic = api.get_open_subtopic(topic_id) or api.get_latest_subtopic(topic_id)
-    messages = api.get_messages(topic_id, subtopic_id=current_subtopic["id"] if current_subtopic else None, limit=120)
-    facts = api.get_facts(topic_id, limit=80)
-    claims = api.get_claims(topic_id, limit=80)
+    messages = api.get_messages(topic_id, subtopic_id=current_subtopic["id"] if current_subtopic else None, limit=2000)
+    facts = api.get_facts(topic_id, limit=2000)
+    claims = api.get_claims(topic_id, limit=2000)
     fact_candidates = []
     claim_candidates = []
     votes = []
     if current_subtopic:
-        fact_candidates = api.get_fact_candidates(topic_id, subtopic_id=current_subtopic["id"], limit=40)
-        claim_candidates = api.get_claim_candidates(topic_id, subtopic_id=current_subtopic["id"], limit=40)
-        votes = api.get_vote_records(topic_id, subtopic_id=current_subtopic["id"], limit=100)
+        fact_candidates = api.get_fact_candidates(topic_id, subtopic_id=current_subtopic["id"], limit=10000)
+        claim_candidates = api.get_claim_candidates(topic_id, subtopic_id=current_subtopic["id"], limit=10000)
+        votes = api.get_vote_records(topic_id, subtopic_id=current_subtopic["id"], limit=1000)
 
     last_round = None
     for message in reversed(messages):
@@ -540,7 +540,20 @@ def render_dashboard_html():
       title.textContent = displayTitle;
       title.title = snapshot.topic.summary; // full text on hover
       
-      detail.textContent = snapshot.topic.detail;
+      
+      
+      let detailHtml = esc(snapshot.topic.detail);
+      if (snapshot.topic.conclusion) {
+          detailHtml += '<div style="margin-top: 16px; padding-top: 16px; border-top: 1px dashed var(--line);">';
+          detailHtml += '<span class="eyebrow" style="display:block; margin-bottom:8px; color:var(--warning);">Final Topic Conclusion:</span>';
+          detailHtml += '<strong style="color:#fff;">' + esc(snapshot.topic.conclusion) + '</strong></div>';
+      } else if (snapshot.current_subtopic && snapshot.current_subtopic.conclusion) {
+          detailHtml += '<div style="margin-top: 16px; padding-top: 16px; border-top: 1px dashed var(--line);">';
+          detailHtml += '<span class="eyebrow" style="display:block; margin-bottom:8px;">Subtopic Conclusion:</span>';
+          detailHtml += '<strong>' + esc(snapshot.current_subtopic.conclusion) + '</strong></div>';
+      }
+      detail.innerHTML = detailHtml;
+
       
       const bits = [
         'STATUS:' + snapshot.topic.status,

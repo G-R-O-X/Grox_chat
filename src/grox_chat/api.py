@@ -34,6 +34,7 @@ from .db import (
     update_fact_candidate_review as db_update_fact_candidate_review,
     update_plan_cursor,
     update_subtopic_start_msg,
+    update_topic_conclusion as db_update_topic_conclusion,
 )
 from .embedding import aget_embedding
 
@@ -522,3 +523,7 @@ def get_claims(topic_id: int, limit: int | None = None):
             query += f" LIMIT {limit}"
         rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
+
+
+def update_topic_conclusion(topic_id: int, conclusion: str) -> None:
+    db_update_topic_conclusion(topic_id, conclusion)

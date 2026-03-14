@@ -649,6 +649,50 @@ def route_after_open_next_subtopic(state: TopicState) -> str:
     return "run_subtopic"
 
 
+
+async def node_topic_conclusion(state: TopicState) -> TopicState:
+    logger.info("[skynet] Generating final topic conclusion...")
+    topic = api.get_topic(state["topic_id"])
+    subtopics = api.get_current_subtopics(state["topic_id"])
+    if not topic:
+        return {"topic_complete": True, "next_action": "close_topic"}
+        
+    ctx = f"Topic: {topic['summary']}\nDetail: {topic['detail']}\n\n"
+    for st in subtopics:
+        conclusion = st.get("conclusion") or "(No conclusion recorded)"
+        ctx += f"Subtopic: {st['summary']}\nConclusion:\n{conclusion}\n\n"
+        
+    prompt = (
+        f"{PROMPTS['skynet']}\n\n"
+        "Context:\n"
+        f"{ctx}\n"
+        "TASK: The debate on this topic is now complete. Synthesize the conclusions of all subtopics into a single, comprehensive, final conclusion for the entire topic. Address the original topic details. Do not use markdown fences in the final JSON.\n"
+        'Reply with strict JSON only: {"action":"conclude_topic", "conclusion":"your comprehensive final conclusion"}.'
+    )
+    
+    resp_text = await _call_text_with_structured_retry(
+        stage_name="Topic conclusion generation",
+        validator=lambda text: _structured_message_is_usable(text, accepted_actions=("conclude_topic",)),
+        invoke=lambda: call_text(
+            prompt,
+            provider="gemini",
+            strategy="direct",
+            allow_web=False,
+            system_instruction=PROMPTS["skynet"],
+            model="gemini-3.0-flash",
+            fallback_role=SKYNET,
+            require_json=True,
+        ),
+    )
+    
+    if resp_text:
+        parsed = _normalize_message_contract(resp_text, accepted_actions=("conclude_topic",))
+        conclusion_text = parsed.get("content", "").strip()
+        if conclusion_text:
+            api.update_topic_conclusion(state["topic_id"], conclusion_text)
+            
+    return {"topic_complete": True, "next_action": "close_topic"}
+
 def close_topic_node(state: TopicState) -> TopicState:
     logger.info("[skynet] Topic complete.")
     return {"topic_complete": True}

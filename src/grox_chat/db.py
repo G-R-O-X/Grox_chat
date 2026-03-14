@@ -384,6 +384,7 @@ def init_db():
         _ensure_column(conn, "Fact", "source_kind", "TEXT")
         _ensure_column(conn, "Fact", "source_refs_json", "TEXT")
         _ensure_column(conn, "Fact", "source_excerpt", "TEXT")
+        _ensure_column(conn, "Topic", "conclusion", "TEXT")
         _ensure_column(conn, "Fact", "review_status", "TEXT")
         _ensure_column(conn, "Fact", "summary", "TEXT")
         _ensure_column(conn, "Claim", "summary", "TEXT")
@@ -1305,3 +1306,8 @@ def supersede_facts(fact_ids: List[int]) -> None:
             f"UPDATE Fact SET review_status = 'superseded' WHERE id IN ({placeholders})",
             fact_ids
         )
+
+
+def update_topic_conclusion(topic_id: int, conclusion: str) -> None:
+    with get_db() as conn:
+        conn.execute("UPDATE Topic SET conclusion = ? WHERE id = ?", (conclusion, topic_id))

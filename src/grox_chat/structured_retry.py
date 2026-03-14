@@ -72,3 +72,25 @@ async def retry_structured_output(
 def usable_text_output(text: str) -> bool:
     stripped = (text or "").strip()
     return bool(stripped) and not stripped.startswith("Error:")
+
+
+async def generate_summary(text: str, *, max_words: int = 40) -> str | None:
+    """Call Gemini Flash to produce a short summary for RAG embedding."""
+    if not text or not text.strip():
+        return None
+    from .broker import call_text
+    try:
+        resp = await call_text(
+            f"Summarize the following in ≤{max_words} words for semantic search indexing. "
+            f"Output ONLY the summary text, no JSON, no preamble.\n\n{text[:2000]}",
+            provider="gemini",
+            model="gemini-3.0-flash",
+            strategy="direct",
+            temperature=0.2,
+            max_tokens=256,
+        )
+        if resp and resp.strip():
+            return resp.strip()[:500]
+    except Exception as e:
+        logging.getLogger(__name__).warning("[generate_summary] Failed: %s", e)
+    return None

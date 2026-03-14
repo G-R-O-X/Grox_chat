@@ -626,6 +626,42 @@ def insert_fact_with_embedding(
         )
         return fact_id
 
+
+def update_fact_summary_and_embedding(fact_id: int, summary: str, embedding: List[float]) -> None:
+    summary = _truncate(summary, MAX_SUMMARY_LEN)
+    with get_db() as conn:
+        conn.execute("UPDATE Fact SET summary = ? WHERE id = ?", (summary, fact_id))
+        row = conn.execute("SELECT content, topic_id, source FROM Fact WHERE id = ?", (fact_id,)).fetchone()
+        if not row:
+            logger.warning("[update_fact_summary_and_embedding] Fact %s not found; skipping.", fact_id)
+            return
+        fts_content = f"{summary}\n\n{row['content']}" if summary else row["content"]
+        conn.execute("DELETE FROM facts_fts WHERE rowid = ?", (fact_id,))
+        conn.execute(
+            "INSERT INTO facts_fts(rowid, content, topic_id, source) VALUES (?, ?, ?, ?)",
+            (fact_id, fts_content, str(row["topic_id"]), row["source"]),
+        )
+        conn.execute("DELETE FROM vec_facts WHERE fact_id = ?", (fact_id,))
+        conn.execute(
+            "INSERT INTO vec_facts(fact_id, embedding) VALUES (?, ?)",
+            (fact_id, serialize_f32(embedding)),
+        )
+
+
+def update_claim_summary(claim_id: int, summary: str) -> None:
+    summary = _truncate(summary, MAX_SUMMARY_LEN)
+    with get_db() as conn:
+        conn.execute("UPDATE Claim SET summary = ? WHERE id = ?", (summary, claim_id))
+        row = conn.execute("SELECT content, topic_id FROM Claim WHERE id = ?", (claim_id,)).fetchone()
+        if row:
+            fts_content = f"{summary}\n\n{row['content']}" if summary else row["content"]
+            conn.execute("DELETE FROM claims_fts WHERE rowid = ?", (claim_id,))
+            conn.execute(
+                "INSERT INTO claims_fts(rowid, content, topic_id) VALUES (?, ?, ?)",
+                (claim_id, fts_content, str(row["topic_id"])),
+            )
+
+
 def create_fact_candidate(
     topic_id: int,
     subtopic_id: int,

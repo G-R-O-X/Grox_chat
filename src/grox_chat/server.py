@@ -43,7 +43,7 @@ from .librarian_processor import (
 )
 from .embedding import aget_embedding
 from .json_utils import extract_json_object as extract_json
-from .structured_retry import retry_structured_output, usable_text_output
+from .structured_retry import generate_summary, retry_structured_output, usable_text_output
 
 logger = logging.getLogger(__name__)
 
@@ -1603,7 +1603,7 @@ def build_librarian_prompt(
         "Use `correct` when the candidate points at a real fact but the value or wording must be repaired before storage. "
         "Absolute formulations such as `no evidence`, `always`, `never`, `proves`, or `definitively` must be softened or rejected unless the evidence explicitly supports them. "
         "Reply with STRICT JSON using this schema: "
-        "{\"action\": \"review_fact\", \"decision\": \"accept|correct|soften|reject\", \"verification_status\": \"accepted|corrected|unsupported|refuted\", \"reviewed_text\": \"...\", \"summary\": \"high-density technical summary (max 40 words) for RAG embedding\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"source_refs_json\": [\"...\"], \"source_excerpt\": \"...\", \"confidence_score\": 8}."
+        "{\"action\": \"review_fact\", \"decision\": \"accept|correct|soften|reject\", \"verification_status\": \"accepted|corrected|unsupported|refuted\", \"reviewed_text\": \"...\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"source_refs_json\": [\"...\"], \"source_excerpt\": \"...\", \"confidence_score\": 8}."
     )
     return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
 
@@ -1642,7 +1642,7 @@ def build_claim_review_prompt(
         "Accept only if the cited facts genuinely support the claim. "
         "Soften if the direction is supportable but the wording is still too strong. "
         "Reject if the reasoning overreaches, skips steps, or is not actually supported by the cited facts. "
-        'Reply with STRICT JSON only: {"action":"review_claim","decision":"accept|soften|reject","reviewed_text":"...","summary":"high-density claim summary for RAG (max 30 words)","review_note":"...","supported_fact_ids":[1,2],"claim_score":7}.'
+        'Reply with STRICT JSON only: {"action":"review_claim","decision":"accept|soften|reject","reviewed_text":"...","review_note":"...","supported_fact_ids":[1,2],"claim_score":7}.'
     )
     return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
 
@@ -2127,15 +2127,30 @@ async def _run_librarian_pass(
                     fallback_role="librarian",
                 )
                 review = parse_librarian_review(resp_text, candidate["candidate_text"])
-            review_results.append(
-                await apply_librarian_review(state["topic_id"], candidate, review)
-            )
+            result = await apply_librarian_review(state["topic_id"], candidate, review)
+            review_results.append(result)
         except Exception as exc:
             logger.warning(
                 "[librarian] Failed to review candidate %s; leaving pending: %s",
                 candidate["id"],
                 exc,
             )
+            continue
+        fact_id = result.get("accepted_fact_id")
+        stored_text = result.get("stored_text")
+        if fact_id and stored_text:
+            try:
+                summary = await generate_summary(stored_text)
+                if summary:
+                    emb = await aget_embedding(summary)
+                    if emb:
+                        api.update_fact_summary_and_embedding(fact_id, summary, emb)
+            except Exception as exc:
+                logger.warning(
+                    "[librarian] Post-hoc summary generation failed for fact %s: %s",
+                    fact_id,
+                    exc,
+                )
 
     for candidate in pending_claims:
         support_ids = _extract_fact_ids_from_text(candidate.get("support_fact_ids_json", "")) if isinstance(candidate.get("support_fact_ids_json"), str) else []
@@ -2191,13 +2206,28 @@ async def _run_librarian_pass(
                     require_json=True,
                 )
                 review = parse_claim_review(resp_text, candidate["candidate_text"], support_ids)
-            review_results.append(await apply_claim_review(state["topic_id"], candidate, review))
+            result = await apply_claim_review(state["topic_id"], candidate, review)
+            review_results.append(result)
         except Exception as exc:
             logger.warning(
                 "[librarian] Failed to review claim candidate %s; leaving pending: %s",
                 candidate["id"],
                 exc,
             )
+            continue
+        claim_id = result.get("accepted_claim_id")
+        stored_text = result.get("stored_text")
+        if claim_id and stored_text:
+            try:
+                summary = await generate_summary(stored_text, max_words=30)
+                if summary:
+                    api.update_claim_summary(claim_id, summary)
+            except Exception as exc:
+                logger.warning(
+                    "[librarian] Post-hoc summary generation failed for claim %s: %s",
+                    claim_id,
+                    exc,
+                )
 
     if not review_results or not emit_audit_message:
         return {}

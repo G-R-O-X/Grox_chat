@@ -4,7 +4,6 @@ import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from . import api
-from .embedding import aget_embedding
 from .json_utils import extract_json_object as _extract_json
 
 logger = logging.getLogger(__name__)
@@ -116,7 +115,6 @@ async def apply_librarian_review(
     decision = review["decision"]
     verification_status = review.get("verification_status")
     reviewed_text = review.get("reviewed_text")
-    summary = review.get("summary")
     review_note = review.get("review_note")
     evidence_note = review.get("evidence_note")
     source_refs = review.get("source_refs") or []
@@ -130,14 +128,10 @@ async def apply_librarian_review(
         stored_text = _normalize_fact_text(reviewed_text or candidate["candidate_text"])
         existing_fact = api.get_fact_by_content(topic_id, stored_text)
         
-        # Fallback to candidate summary if review summary is missing
-        final_summary = summary or candidate.get("summary")
-        
         if existing_fact:
             accepted_fact_id = existing_fact["id"]
             logger.info("[Librarian] Reusing existing fact %s for candidate %s", accepted_fact_id, candidate_id)
         else:
-            embedding = await aget_embedding(final_summary or stored_text)
             insert_kwargs = {
                 "subtopic_id": candidate.get("subtopic_id"),
                 "fact_stage": candidate.get("fact_stage", "synthesized"),
@@ -153,24 +147,14 @@ async def apply_librarian_review(
                 "evidence_note": evidence_note or None,
                 "confidence_score": confidence_score,
             }
-            if embedding:
-                accepted_fact_id = api.insert_fact_with_embedding(
-                    topic_id,
-                    stored_text,
-                    source="Librarian",
-                    embedding=embedding,
-                    summary=final_summary,
-                    **insert_kwargs,
-                )
-            else:
-                logger.warning("[Librarian] Embedding unavailable for candidate %s; fact will lack dense retrieval.", candidate_id)
-                accepted_fact_id = api.insert_fact(
-                    topic_id,
-                    stored_text,
-                    source="Librarian",
-                    summary=final_summary,
-                    **insert_kwargs,
-                )
+            # Insert without embedding; post-hoc summary generation in server.py
+            # will compute the summary-based embedding and update it.
+            accepted_fact_id = api.insert_fact(
+                topic_id,
+                stored_text,
+                source="Librarian",
+                **insert_kwargs,
+            )
 
     api.update_fact_candidate_review(
         candidate_id,
@@ -190,6 +174,7 @@ async def apply_librarian_review(
         "decision": decision,
         "verification_status": verification_status,
         "reviewed_text": stored_text,
+        "stored_text": stored_text,
         "review_note": review_note or "",
         "evidence_note": evidence_note or "",
         "confidence_score": confidence_score,
@@ -303,6 +288,7 @@ async def apply_claim_review(
         "candidate_text": candidate["candidate_text"],
         "decision": decision,
         "reviewed_text": stored_text,
+        "stored_text": stored_text,
         "review_note": review_note or "",
         "claim_score": claim_score,
         "accepted_claim_id": accepted_claim_id,

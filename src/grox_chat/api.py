@@ -1,5 +1,7 @@
 from .db import (
     supersede_facts as db_supersede_facts,
+    update_fact_summary_and_embedding as db_update_fact_summary_and_embedding,
+    update_claim_summary as db_update_claim_summary,
 
     get_web_evidence_for_topic as db_get_web_evidence,
 
@@ -543,3 +545,11 @@ def get_claims(topic_id: int, limit: int | None = None):
 
 def update_topic_conclusion(topic_id: int, conclusion: str) -> None:
     db_update_topic_conclusion(topic_id, conclusion)
+
+
+def update_fact_summary_and_embedding(fact_id: int, summary: str, embedding: list[float]) -> None:
+    db_update_fact_summary_and_embedding(fact_id, summary, embedding)
+
+
+def update_claim_summary(claim_id: int, summary: str) -> None:
+    db_update_claim_summary(claim_id, summary)

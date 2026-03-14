@@ -875,7 +875,13 @@ async def index(request):
 
 
 async def dashboard(request):
-    subtopic_id = request.query.get('subtopic_id')
+    raw_id = request.query.get('subtopic_id')
+    subtopic_id = None
+    if raw_id:
+        try:
+            subtopic_id = str(int(raw_id))
+        except (ValueError, TypeError):
+            return web.json_response({"error": "Invalid subtopic_id"}, status=400)
     return web.json_response(build_dashboard_snapshot(subtopic_id=subtopic_id))
 
 
@@ -884,7 +890,6 @@ async def health(request):
     return web.json_response(
         {
             "ok": True,
-            "db_path": snapshot["status"]["db_path"],
             "topic_id": snapshot["topic"]["id"] if snapshot["topic"] else None,
             "current_subtopic_id": snapshot["current_subtopic"]["id"] if snapshot["current_subtopic"] else None,
         }

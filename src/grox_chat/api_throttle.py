@@ -13,15 +13,17 @@ class GlobalThrottle:
 
     async def acquire(self):
         """Wait until it is safe to make an API call, maintaining global pacing."""
+        wait_time = 0.0
         async with self._lock:
             target_delay = self.delay_seconds
             if self.jitter_max_seconds > 0.0:
                 target_delay += random.uniform(self.jitter_min_seconds, self.jitter_max_seconds)
             now = time.time()
             elapsed = now - self._last_call_time
-            if elapsed < target_delay:
-                await asyncio.sleep(target_delay - elapsed)
-            self._last_call_time = time.time()
+            wait_time = max(0.0, target_delay - elapsed)
+            self._last_call_time = now + wait_time
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
 
 
 async def _wait_with_jitter(base_seconds: float, jitter_min_seconds: float, jitter_max_seconds: float):

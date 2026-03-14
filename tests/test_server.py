@@ -683,7 +683,7 @@ async def test_expert_node_lowers_confidence_on_parse_failure():
                             await expert_node(state)
 
     persist_message.assert_awaited_once()
-    assert persist_message.await_args.kwargs["confidence_score"] == 2.5
+    assert persist_message.await_args.kwargs["confidence_score"] == 3.0
     assert persist_message.await_args.kwargs["round_number"] == 2
     assert persist_message.await_args.kwargs["turn_kind"] == "base"
 

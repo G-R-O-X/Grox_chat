@@ -186,7 +186,7 @@ async def query_minimax(
                 resp = await client.post(_get_minimax_message_url(), headers=headers, json=payload)
 
                 if resp.status_code == 429:
-                    logger.warning(f"[MiniMax] Rate limited (429). Retrying {attempt+1}/{max_retries}...")
+                    logger.warning("[MiniMax] Rate limited (429). Retrying %s/%s...", attempt + 1, max_retries)
                     await asyncio.sleep(2 ** attempt)
                     continue
 
@@ -220,15 +220,15 @@ async def query_minimax(
 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code >= 500:
-                    logger.warning(f"[MiniMax] Server error ({e.response.status_code}). Retrying {attempt+1}/{max_retries}...")
+                    logger.warning("[MiniMax] Server error (%s). Retrying %s/%s...", e.response.status_code, attempt + 1, max_retries)
                     await asyncio.sleep(2 ** attempt)
                     continue
-                logger.error(f"HTTP Error: {e.response.text}")
-                return f"Error: {e.response.status_code}", []
+                logger.error("[MiniMax] HTTP error %s (response body omitted for safety)", e.response.status_code)
+                return f"Error: HTTP {e.response.status_code}", []
             except Exception as e:
-                logger.error(f"Request Error: {e}")
+                logger.error("[MiniMax] Request error: %s", type(e).__name__)
                 if attempt == max_retries - 1:
-                    return f"Error: {str(e)}", []
+                    return f"Error: request failed after {max_retries} attempts", []
                 await asyncio.sleep(2 ** attempt)
 
     return "Error: Max retries exceeded.", []
@@ -259,7 +259,7 @@ async def minimax_search(query: str, timeout: float = 60.0, max_retries: int = 3
                 )
 
                 if resp.status_code == 429:
-                    logger.warning(f"[MiniMax Search] Rate limited (429). Retrying {attempt+1}/{max_retries}...")
+                    logger.warning("[MiniMax Search] Rate limited (429). Retrying %s/%s...", attempt + 1, max_retries)
                     await asyncio.sleep(2 ** attempt)
                     continue
 
@@ -273,9 +273,9 @@ async def minimax_search(query: str, timeout: float = 60.0, max_retries: int = 3
                 )
                 return data
             except Exception as e:
-                logger.error(f"Search Error: {e}")
+                logger.error("[MiniMax Search] Request error: %s", type(e).__name__)
                 if attempt == max_retries - 1:
-                    return {"error": str(e)}
+                    return {"error": f"request failed after {max_retries} attempts"}
                 await asyncio.sleep(2 ** attempt)
 
     return {"error": "Max retries exceeded"}

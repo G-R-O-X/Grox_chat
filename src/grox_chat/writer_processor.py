@@ -1,5 +1,6 @@
 import logging
 import json
+import unicodedata
 from typing import Iterable, List, Optional
 
 from . import api
@@ -8,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_fact_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "")
     return " ".join(text.split())
 
 
@@ -15,8 +17,10 @@ def _extract_fact_lines(writer_text: str) -> List[str]:
     fact_lines = []
     for line in writer_text.split('\n'):
         stripped = line.strip()
-        if stripped.startswith("FACT:") or stripped.startswith("VERIFIED:"):
-            fact_lines.append(stripped.replace("FACT:", "").replace("VERIFIED:", "").strip())
+        if stripped.startswith("VERIFIED:"):
+            fact_lines.append(stripped[9:].strip())
+        elif stripped.startswith("FACT:"):
+            fact_lines.append(stripped[5:].strip())
     return fact_lines
 
 
@@ -35,12 +39,14 @@ async def _store_fact_candidates(
     for fact_item in facts:
         if isinstance(fact_item, dict):
             fact_content = fact_item.get("candidate_text") or fact_item.get("text") or ""
+            summary = fact_item.get("summary")
             candidate_type = fact_item.get("candidate_type", "sourced_claim")
-            source_refs_json = json.dumps(fact_item.get("source_refs", []), ensure_ascii=True)
+            source_refs_json = json.dumps(fact_item.get("source_refs", []), ensure_ascii=False)
             source_excerpt = fact_item.get("source_excerpt")
             verification_status = fact_item.get("verification_status")
         else:
             fact_content = fact_item
+            summary = None
             candidate_type = "sourced_claim"
             source_refs_json = None
             source_excerpt = None
@@ -63,6 +69,7 @@ async def _store_fact_candidates(
             subtopic_id,
             writer_msg_id,
             normalized,
+            summary=summary,
             fact_stage=fact_stage,
             candidate_type=candidate_type,
             evidence_note=evidence_note,

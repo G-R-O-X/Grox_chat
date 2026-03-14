@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
 from typing import Optional
 
 from .broker import PROFILE_GEMINI_FLASH, PROFILE_MINIMAX, llm_call
+from .json_utils import extract_json_object as _extract_json_vote
 from .prompts import PROMPTS
 from .structured_retry import retry_structured_output, usable_text_output
 
@@ -181,26 +181,6 @@ def is_special(name: str) -> bool:
 
 def is_npc(name: str) -> bool:
     return AGENT_REGISTRY.get(name, AgentSpec("", "", "")).agent_class == NPC
-
-
-def _extract_json_vote(text: str) -> Optional[dict]:
-    stripped = (text or "").strip()
-    if not stripped:
-        return None
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-    import re
-
-    match = re.search(r"\{.*\}", stripped, re.DOTALL)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
 
 
 def parse_vote_response(text: str) -> Optional[bool]:

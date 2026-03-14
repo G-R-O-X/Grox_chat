@@ -60,7 +60,11 @@ def rerank(
     """
     model = get_reranker_model()
     if model is None:
-        return []
+        logger.warning("[Reranker] Model unavailable, returning documents unranked.")
+        results = [(i, 0.5) for i in range(len(documents))]
+        if top_k is not None and top_k > 0:
+            results = results[:top_k]
+        return results
 
     if not documents or not query or not query.strip():
         return []

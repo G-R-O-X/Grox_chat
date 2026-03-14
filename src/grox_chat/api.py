@@ -32,7 +32,6 @@ from .db import (
     search_web_evidence_same_topic as db_search_web_evidence_same_topic,
     update_claim_candidate_review as db_update_claim_candidate_review,
     update_fact_candidate_review as db_update_fact_candidate_review,
-    update_plan_cursor,
     update_subtopic_start_msg,
     update_topic_conclusion as db_update_topic_conclusion,
 )
@@ -172,18 +171,24 @@ def post_message(
     confidence_score=None,
     round_number=None,
     turn_kind=None,
+    summary=None,
 ):
     with get_db() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO Message (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO Message (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind, summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
+            (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind, summary)
         )
+        # For FTS, we combine content and summary
+        fts_content = content
+        if summary:
+            fts_content = f"{summary}\n\n{content}"
+            
         conn.execute(
             "INSERT OR REPLACE INTO messages_fts(rowid, content, topic_id, msg_type, sender) VALUES (?, ?, ?, ?, ?)",
-            (cursor.lastrowid, content, str(topic_id), msg_type, sender),
+            (cursor.lastrowid, fts_content, str(topic_id), msg_type, sender),
         )
         return cursor.lastrowid
 
@@ -197,6 +202,7 @@ async def persist_message(
     confidence_score=None,
     round_number=None,
     turn_kind=None,
+    summary=None,
 ):
     if msg_type == 'standard':
         embedding = await aget_embedding(content)
@@ -211,6 +217,7 @@ async def persist_message(
                 confidence_score,
                 round_number,
                 turn_kind,
+                summary=summary,
             )
     return post_message(
         topic_id,
@@ -221,16 +228,18 @@ async def persist_message(
         confidence_score,
         round_number,
         turn_kind,
+        summary=summary,
     )
 
 
 def advance_plan_cursor(plan_id: int):
-    plan = None
     with get_db() as conn:
-        plan = conn.execute("SELECT current_index FROM Plan WHERE id = ?", (plan_id,)).fetchone()
-    if plan is None:
-        raise ValueError(f"Plan {plan_id} not found")
-    update_plan_cursor(plan_id, plan["current_index"] + 1)
+        cursor = conn.execute(
+            "UPDATE Plan SET current_index = current_index + 1 WHERE id = ?",
+            (plan_id,),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError(f"Plan {plan_id} not found")
 
 
 def close_subtopic(subtopic_id: int, conclusion: str):
@@ -259,6 +268,7 @@ def create_fact_candidate_with_stage(
     writer_msg_id: int | None,
     candidate_text: str,
     *,
+    summary: str | None = None,
     fact_stage: str,
     candidate_type: str = "sourced_claim",
     evidence_note: str | None = None,
@@ -272,6 +282,7 @@ def create_fact_candidate_with_stage(
         subtopic_id,
         writer_msg_id,
         candidate_text,
+        summary=summary,
         fact_stage=fact_stage,
         candidate_type=candidate_type,
         evidence_note=evidence_note,
@@ -288,6 +299,7 @@ def create_claim_candidate(
     clerk_msg_id: int | None,
     candidate_text: str,
     *,
+    summary: str | None = None,
     support_fact_ids_json: str | None = None,
     rationale_short: str | None = None,
 ) -> int:
@@ -296,6 +308,7 @@ def create_claim_candidate(
         subtopic_id,
         clerk_msg_id,
         candidate_text,
+        summary=summary,
         support_fact_ids_json=support_fact_ids_json,
         rationale_short=rationale_short,
     )
@@ -387,6 +400,7 @@ def insert_claim(
     subtopic_id: int | None,
     content: str,
     *,
+    summary: str | None = None,
     support_fact_ids_json: str | None = None,
     rationale_short: str | None = None,
     claim_score: float | None = None,
@@ -397,6 +411,7 @@ def insert_claim(
         topic_id,
         subtopic_id,
         content,
+        summary=summary,
         support_fact_ids_json=support_fact_ids_json,
         rationale_short=rationale_short,
         claim_score=claim_score,
@@ -520,8 +535,9 @@ def get_claims(topic_id: int, limit: int | None = None):
         params = [topic_id]
         query = "SELECT * FROM Claim WHERE topic_id = ? ORDER BY id DESC"
         if limit is not None:
-            query += f" LIMIT {limit}"
-        rows = conn.execute(query, tuple(params)).fetchall()
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
 

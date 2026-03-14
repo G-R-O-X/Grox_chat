@@ -1,11 +1,10 @@
-import json
 import logging
-import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import api
 from .broker import PROFILE_MINIMAX, get_or_collect_search_evidence_item, llm_call
 from .embedding import aget_embedding
+from .json_utils import extract_json_object as _extract_json_object
 from .reranker import arerank
 from .structured_retry import retry_structured_output, usable_text_output
 
@@ -13,34 +12,6 @@ logger = logging.getLogger(__name__)
 
 RERANK_THRESHOLD = 0.3
 WEB_BACKUP_SEARCH_FAILURE_SENTINEL = "No useful results found."
-
-
-def _strip_markdown_fences(text: str) -> str:
-    stripped = (text or "").strip()
-    if not stripped.startswith("```"):
-        return stripped
-    lines = stripped.splitlines()
-    if len(lines) >= 3 and lines[-1].strip().startswith("```"):
-        return "\n".join(lines[1:-1]).strip()
-    return stripped
-
-
-def _extract_json_object(text: str) -> Optional[dict]:
-    stripped = _strip_markdown_fences(text)
-    candidates = [stripped]
-    match = re.search(r"\{.*\}", stripped, re.DOTALL)
-    if match:
-        candidates.append(match.group(0))
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
 
 
 def _normalize_query_planner_contract(raw_text: str) -> dict:

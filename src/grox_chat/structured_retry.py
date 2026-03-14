@@ -18,7 +18,10 @@ async def retry_structured_output(
 ) -> Optional[T]:
     last_exception: Exception | None = None
 
-    for attempt in range(1, max(1, attempts) + 1):
+    if attempts <= 0:
+        logger.warning("[structured_retry] %s called with attempts=%d, returning None.", stage_name, attempts)
+        return None
+    for attempt in range(1, attempts + 1):
         try:
             result = await invoke()
         except Exception as exc:

@@ -33,7 +33,9 @@ class ChatState(TypedDict):
     last_writer_round: NotRequired[Optional[int]]
     last_fact_proposer_round: NotRequired[Optional[int]]
     last_final_fact_proposer_round: NotRequired[Optional[int]]
+    last_summary_round: NotRequired[Optional[int]]
     pending_fact_reviews_remaining: NotRequired[bool]
+    final_librarian_reentry_count: NotRequired[int]
     subtopic_vote_cycle: NotRequired[int]
 
 def dispatcher_node(state: ChatState) -> dict:

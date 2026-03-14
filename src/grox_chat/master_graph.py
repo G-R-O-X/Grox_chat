@@ -7,11 +7,13 @@ from typing_extensions import TypedDict
 
 from . import api
 from .agents import SKYNET, get_agent, voting_agents
+from .json_utils import extract_json_object
 from .broker import (
     PROFILE_GEMINI_FLASH,
     PROFILE_GEMINI_PRO,
     llm_call_with_web,
 )
+from .db import MAX_CONTENT_LEN
 from .embedding import aget_embedding
 from .server import run_subtopic_graph
 from .structured_retry import retry_structured_output, usable_text_output
@@ -47,14 +49,9 @@ class VoteTally(TypingTypedDict):
 
 
 def _parse_json_object(output: str) -> Dict[str, Any]:
-    import re
-
-    match = re.search(r"\{.*\}", output, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
+    result = extract_json_object(output)
+    if isinstance(result, dict):
+        return result
     return json.loads(output)
 
 
@@ -84,7 +81,7 @@ def _sanitize_subtopics(raw_subtopics: Any, limit: int) -> List[Dict[str, str]]:
             continue
         if not isinstance(detail, str) or not detail.strip():
             continue
-        cleaned.append({"summary": summary.strip(), "detail": detail.strip()})
+        cleaned.append({"summary": summary.strip()[:200], "detail": detail.strip()[:500]})
         if len(cleaned) >= limit:
             break
     return cleaned
@@ -656,41 +653,61 @@ async def node_topic_conclusion(state: TopicState) -> TopicState:
     subtopics = api.get_current_subtopics(state["topic_id"])
     if not topic:
         return {"topic_complete": True, "next_action": "close_topic"}
-        
+
     ctx = f"Topic: {topic['summary']}\nDetail: {topic['detail']}\n\n"
     for st in subtopics:
         conclusion = st.get("conclusion") or "(No conclusion recorded)"
         ctx += f"Subtopic: {st['summary']}\nConclusion:\n{conclusion}\n\n"
-        
-    prompt = (
-        f"{PROMPTS['skynet']}\n\n"
-        "Context:\n"
-        f"{ctx}\n"
-        "TASK: The debate on this topic is now complete. Synthesize the conclusions of all subtopics into a single, comprehensive, final conclusion for the entire topic. Address the original topic details. Do not use markdown fences in the final JSON.\n"
-        'Reply with strict JSON only: {"action":"conclude_topic", "conclusion":"your comprehensive final conclusion"}.'
+
+    system_prompt = (
+        "You are Skynet. Synthesize the conclusions of all subtopics into a single, "
+        "comprehensive, final conclusion for the entire topic. Address the original topic details. "
+        "All JSON string values must be written in English only. "
+        "Output strictly JSON using this schema: "
+        '{"action":"conclude_topic","content":"your comprehensive final conclusion"}'
     )
-    
-    resp_text = await _call_text_with_structured_retry(
-        stage_name="Topic conclusion generation",
-        validator=lambda text: _structured_message_is_usable(text, accepted_actions=("conclude_topic",)),
-        invoke=lambda: call_text(
-            prompt,
-            provider="gemini",
-            strategy="direct",
-            allow_web=False,
-            system_instruction=PROMPTS["skynet"],
-            model="gemini-3.0-flash",
-            fallback_role=SKYNET,
-            require_json=True,
-        ),
+    data = await ask_gemini_cli(
+        system_prompt,
+        ctx,
+        SKYNET,
+        model="gemini-3.0-flash",
+        topic_id=state["topic_id"],
     )
-    
-    if resp_text:
-        parsed = _normalize_message_contract(resp_text, accepted_actions=("conclude_topic",))
-        conclusion_text = parsed.get("content", "").strip()
-        if conclusion_text:
-            api.update_topic_conclusion(state["topic_id"], conclusion_text)
-            
+    if isinstance(data, dict) and data.get("error"):
+        logger.warning("[skynet] Topic conclusion LLM call failed: %s; using fallback", data["error"])
+    conclusion_text = data.get("content") if isinstance(data, dict) else None
+    if not conclusion_text or not isinstance(conclusion_text, str) or not conclusion_text.strip():
+        # Fallback: synthesize from subtopic conclusions deterministically
+        parts = []
+        for st in subtopics:
+            c = st.get("conclusion")
+            if c and isinstance(c, str) and c.strip():
+                parts.append(f"- {st['summary']}: {c.strip()[:300]}")
+        conclusion_text = (
+            f"Topic '{topic['summary']}' concluded.\n"
+            + ("\n".join(parts) if parts else "No subtopic conclusions were recorded.")
+        )
+    else:
+        conclusion_text = conclusion_text.strip()
+
+    conclusion_text = conclusion_text[:MAX_CONTENT_LEN]
+
+    # Store as Message with embedding (matching subtopic pattern)
+    emb = await aget_embedding(conclusion_text)
+    if emb:
+        api.insert_message_with_embedding(
+            state["topic_id"], None, SKYNET,
+            conclusion_text, msg_type="summary", embedding=emb,
+        )
+    else:
+        api.post_message(
+            state["topic_id"], None, SKYNET,
+            conclusion_text, msg_type="summary",
+        )
+
+    # Also store in Topic.conclusion column
+    api.update_topic_conclusion(state["topic_id"], conclusion_text)
+
     return {"topic_complete": True, "next_action": "close_topic"}
 
 def close_topic_node(state: TopicState) -> TopicState:
@@ -714,6 +731,7 @@ def build_master_graph():
     builder.add_node("replan_or_close", node_topic_replan_or_close)
     builder.add_node("defer_topic", defer_topic_node)
     builder.add_node("close_topic", close_topic_node)
+    builder.add_node("conclude_topic", node_topic_conclusion)
 
     builder.add_edge(START, "inspect_topic_state")
     builder.add_conditional_edges(
@@ -732,7 +750,7 @@ def build_master_graph():
         {
             "open_next_subtopic": "open_next_subtopic",
             "defer_topic": "defer_topic",
-            "close_topic": "close_topic",
+            "close_topic": "conclude_topic",
         },
     )
     builder.add_conditional_edges(
@@ -751,9 +769,10 @@ def build_master_graph():
         {
             "open_next_subtopic": "open_next_subtopic",
             "defer_topic": "defer_topic",
-            "close_topic": "close_topic",
+            "close_topic": "conclude_topic",
         },
     )
+    builder.add_edge("conclude_topic", "close_topic")
     builder.add_edge("defer_topic", END)
     builder.add_edge("close_topic", END)
 

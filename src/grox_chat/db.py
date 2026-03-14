@@ -8,6 +8,15 @@ from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
+MAX_CONTENT_LEN = 8000
+MAX_SUMMARY_LEN = 500
+
+
+def _truncate(text: str | None, max_len: int) -> str | None:
+    if text is None:
+        return None
+    return text[:max_len] if len(text) > max_len else text
+
 def get_db_path() -> str:
     base_dir = os.path.join(os.path.dirname(__file__), "..", "..")
     if os.environ.get("TESTING") == "1":
@@ -28,17 +37,18 @@ def get_db():
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
     except Exception as e:
-        print(f"Warning: Failed to load sqlite-vec extension: {e}")
+        logger.warning("Failed to load sqlite-vec extension: %s", e)
 
     conn.row_factory = sqlite3.Row
     try:
         # Enable Write-Ahead Logging for better concurrency
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
         yield conn
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        raise e
+        raise
     finally:
         conn.close()
 
@@ -47,14 +57,28 @@ def serialize_f32(vector: List[float]) -> bytes:
     return struct.pack(f"{len(vector)}f", *vector)
 
 
+_VALID_TABLES = frozenset({
+    "Topic", "Plan", "Subtopic", "Message", "FactCandidate",
+    "Fact", "ClaimCandidate", "Claim", "WebEvidence", "VoteRecord",
+})
+_VALID_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    if table_name not in _VALID_TABLES:
+        raise ValueError(f"Invalid table name: {table_name!r}")
     rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     return {row["name"] for row in rows}
 
 
 def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_def: str) -> None:
-    if column_name not in _table_columns(conn, table_name):
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+    if table_name not in _VALID_TABLES:
+        raise ValueError(f"Invalid table name: {table_name!r}")
+    if not _VALID_COLUMN_RE.match(column_name):
+        raise ValueError(f"Invalid column name: {column_name!r}")
+    if column_name in _table_columns(conn, table_name):
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
 
 
 def _insert_fact_fts(conn: sqlite3.Connection, fact_id: int, topic_id: int, content: str, source: str) -> None:
@@ -101,13 +125,26 @@ def _insert_web_evidence_fts(
 def _backfill_fts(conn: sqlite3.Connection) -> None:
     fact_count = conn.execute("SELECT COUNT(*) FROM Fact").fetchone()[0]
     if fact_count:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO facts_fts(rowid, content, topic_id, source)
-            SELECT Fact.id, Fact.content, CAST(Fact.topic_id AS TEXT), Fact.source
-            FROM Fact
-            """
-        )
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO facts_fts(rowid, content, topic_id, source)
+                SELECT
+                    Fact.id,
+                    CASE
+                        WHEN Fact.summary IS NOT NULL AND Fact.summary != '' THEN Fact.summary || char(10) || char(10) || Fact.content
+                        ELSE Fact.content
+                    END,
+                    CAST(Fact.topic_id AS TEXT), Fact.source
+                FROM Fact
+                """
+            )
+        except sqlite3.OperationalError as exc:
+            logger.warning("facts_fts backfill failed; attempting FTS rebuild fallback: %s", exc)
+            try:
+                conn.execute("INSERT INTO facts_fts(facts_fts) VALUES ('rebuild')")
+            except sqlite3.OperationalError as rebuild_exc:
+                logger.warning("facts_fts rebuild fallback also failed; continuing without legacy backfill: %s", rebuild_exc)
 
     message_count = conn.execute("SELECT COUNT(*) FROM Message").fetchone()[0]
     if not message_count:
@@ -117,7 +154,13 @@ def _backfill_fts(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             INSERT OR REPLACE INTO messages_fts(rowid, content, topic_id, msg_type, sender)
-            SELECT Message.id, Message.content, CAST(Message.topic_id AS TEXT), Message.msg_type, Message.sender
+            SELECT 
+                Message.id, 
+                CASE 
+                    WHEN Message.summary IS NOT NULL AND Message.summary != '' THEN Message.summary || char(10) || char(10) || Message.content 
+                    ELSE Message.content 
+                END, 
+                CAST(Message.topic_id AS TEXT), Message.msg_type, Message.sender
             FROM Message
             """
         )
@@ -130,39 +173,68 @@ def _backfill_fts(conn: sqlite3.Connection) -> None:
 
     claim_count = conn.execute("SELECT COUNT(*) FROM Claim").fetchone()[0]
     if claim_count:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO claims_fts(rowid, content, topic_id)
-            SELECT Claim.id, Claim.content, CAST(Claim.topic_id AS TEXT)
-            FROM Claim
-            """
-        )
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO claims_fts(rowid, content, topic_id)
+                SELECT Claim.id,
+                    CASE
+                        WHEN Claim.summary IS NOT NULL AND Claim.summary != '' THEN Claim.summary || char(10) || char(10) || Claim.content
+                        ELSE Claim.content
+                    END,
+                    CAST(Claim.topic_id AS TEXT)
+                FROM Claim
+                """
+            )
+        except sqlite3.OperationalError as exc:
+            logger.warning("claims_fts backfill failed; attempting FTS rebuild fallback: %s", exc)
+            try:
+                conn.execute("INSERT INTO claims_fts(claims_fts) VALUES ('rebuild')")
+            except sqlite3.OperationalError as rebuild_exc:
+                logger.warning("claims_fts rebuild fallback also failed; continuing without legacy backfill: %s", rebuild_exc)
 
     web_count = conn.execute("SELECT COUNT(*) FROM WebEvidence").fetchone()[0]
     if web_count:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO web_evidence_fts(rowid, content, origin_topic_id, source_domain)
-            SELECT
-                WebEvidence.id,
-                TRIM(
-                    COALESCE(WebEvidence.title, '') || ' ' ||
-                    COALESCE(WebEvidence.snippet, '') || ' ' ||
-                    COALESCE(WebEvidence.query_text, '') || ' ' ||
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO web_evidence_fts(rowid, content, origin_topic_id, source_domain)
+                SELECT
+                    WebEvidence.id,
+                    TRIM(
+                        COALESCE(WebEvidence.title, '') || char(10) || char(10) ||
+                        COALESCE(WebEvidence.summary, '') || char(10) || char(10) ||
+                        COALESCE(WebEvidence.snippet, '') || char(10) || char(10) ||
+                        COALESCE(WebEvidence.query_text, '') || char(10) || char(10) ||
+                        COALESCE(WebEvidence.source_domain, '')
+                    ),
+                    CAST(WebEvidence.origin_topic_id AS TEXT),
                     COALESCE(WebEvidence.source_domain, '')
-                ),
-                CAST(WebEvidence.origin_topic_id AS TEXT),
-                COALESCE(WebEvidence.source_domain, '')
-            FROM WebEvidence
-            """
-        )
+                FROM WebEvidence
+                """
+            )
+        except sqlite3.OperationalError as exc:
+            logger.warning("web_evidence_fts backfill failed; attempting FTS rebuild fallback: %s", exc)
+            try:
+                conn.execute("INSERT INTO web_evidence_fts(web_evidence_fts) VALUES ('rebuild')")
+            except sqlite3.OperationalError as rebuild_exc:
+                logger.warning("web_evidence_fts rebuild fallback also failed; continuing without legacy backfill: %s", rebuild_exc)
 
+
+_FTS5_RESERVED = frozenset({"AND", "OR", "NOT", "NEAR"})
 
 def _build_fts_query(query_text: str) -> Optional[str]:
     tokens = re.findall(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+", query_text or "")
     if not tokens:
         return None
-    return " OR ".join(f'"{token}"' for token in tokens)
+    safe_tokens = [
+        f'"{token.replace(chr(34), chr(34)+chr(34))}"'
+        for token in tokens
+        if token.upper() not in _FTS5_RESERVED
+    ]
+    if not safe_tokens:
+        return None
+    return " OR ".join(safe_tokens)
 
 def init_db():
     with get_db() as conn:
@@ -266,6 +338,7 @@ def init_db():
                 subtopic_id INTEGER,
                 clerk_msg_id INTEGER,
                 candidate_text TEXT NOT NULL,
+                summary TEXT,
                 support_fact_ids_json TEXT,
                 rationale_short TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -285,6 +358,7 @@ def init_db():
                 topic_id INTEGER NOT NULL,
                 subtopic_id INTEGER,
                 content TEXT NOT NULL,
+                summary TEXT,
                 support_fact_ids_json TEXT,
                 rationale_short TEXT,
                 claim_score REAL,
@@ -308,6 +382,7 @@ def init_db():
                 result_rank INTEGER,
                 search_provider TEXT,
                 search_role TEXT,
+                summary TEXT,
                 verified INTEGER NOT NULL DEFAULT 0,
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(origin_topic_id) REFERENCES Topic(id),
@@ -420,6 +495,8 @@ def _insert_fact_row(
     confidence_score: Optional[float] = None,
     summary: Optional[str] = None,
 ) -> int:
+    content = _truncate(content, MAX_CONTENT_LEN)
+    summary = _truncate(summary, MAX_SUMMARY_LEN)
     cursor = conn.execute(
         """
         INSERT INTO Fact (
@@ -460,7 +537,10 @@ def _insert_fact_row(
         ),
     )
     fact_id = cursor.lastrowid
-    _insert_fact_fts(conn, fact_id, topic_id, summary or content, source)
+    fts_content = content
+    if summary:
+        fts_content = f"{summary}\n\n{content}"
+    _insert_fact_fts(conn, fact_id, topic_id, fts_content, source)
     return fact_id
 
 
@@ -665,8 +745,10 @@ def get_claim_candidates(
                 f"SELECT * FROM ClaimCandidate WHERE {' AND '.join(clauses)} ORDER BY id ASC",
                 params,
             ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return []
+            raise
         return [dict(row) for row in rows]
 
 
@@ -712,8 +794,10 @@ def claim_candidate_exists(
         query += " LIMIT 1"
         try:
             row = conn.execute(query, params).fetchone()
-        except sqlite3.OperationalError:
-            return False
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return False
+            raise
         return row is not None
 
 
@@ -845,6 +929,8 @@ def insert_claim(
     status: str = "active",
     candidate_id: Optional[int] = None,
 ) -> int:
+    content = _truncate(content, MAX_CONTENT_LEN)
+    summary = _truncate(summary, MAX_SUMMARY_LEN)
     with get_db() as conn:
         cursor = conn.execute(
             """
@@ -874,7 +960,10 @@ def insert_claim(
             ),
         )
         claim_id = cursor.lastrowid
-        _insert_claim_fts(conn, claim_id, topic_id, summary or content)
+        fts_content = content
+        if summary:
+            fts_content = f"{summary}\n\n{content}"
+        _insert_claim_fts(conn, claim_id, topic_id, fts_content)
         return claim_id
 
 
@@ -889,6 +978,7 @@ def insert_web_evidence(
     result_rank: int,
     search_provider: str,
     search_role: str,
+    summary: Optional[str] = None,
 ) -> int:
     with get_db() as conn:
         cursor = conn.execute(
@@ -903,9 +993,10 @@ def insert_web_evidence(
                 source_domain,
                 result_rank,
                 search_provider,
-                search_role
+                search_role,
+                summary
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 origin_topic_id,
@@ -918,12 +1009,13 @@ def insert_web_evidence(
                 result_rank,
                 search_provider,
                 search_role,
+                summary,
             ),
         )
         web_id = cursor.lastrowid
-        content = " ".join(
+        content = "\n\n".join(
             part.strip()
-            for part in (title or "", snippet or "", query_text or "", source_domain or "")
+            for part in (title or "", summary or "", snippet or "", query_text or "", source_domain or "")
             if isinstance(part, str) and part.strip()
         )
         _insert_web_evidence_fts(conn, web_id, origin_topic_id, source_domain or "", content)
@@ -1157,7 +1249,12 @@ def insert_message_with_embedding(
             (topic_id, subtopic_id, sender, content, summary, msg_type, confidence_score, round_number, turn_kind)
         )
         msg_id = cursor.lastrowid
-        _insert_message_fts(conn, msg_id, topic_id, sender, summary or content, msg_type)
+        # For FTS, we combine content and summary
+        fts_content = content
+        if summary:
+            fts_content = f"{summary}\n\n{content}"
+            
+        _insert_message_fts(conn, msg_id, topic_id, sender, fts_content, msg_type)
         
         if embedding:
             conn.execute(
@@ -1265,6 +1362,7 @@ def update_subtopic_start_msg(subtopic_id: int, start_msg_id: int) -> None:
 
 
 def close_subtopic(subtopic_id: int, conclusion: str) -> None:
+    conclusion = _truncate(conclusion, MAX_CONTENT_LEN)
     with get_db() as conn:
         conn.execute(
             "UPDATE Subtopic SET status = 'Closed', conclusion = ? WHERE id = ?",
@@ -1309,5 +1407,6 @@ def supersede_facts(fact_ids: List[int]) -> None:
 
 
 def update_topic_conclusion(topic_id: int, conclusion: str) -> None:
+    conclusion = _truncate(conclusion, MAX_CONTENT_LEN)
     with get_db() as conn:
         conn.execute("UPDATE Topic SET conclusion = ? WHERE id = ?", (conclusion, topic_id))

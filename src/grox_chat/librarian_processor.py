@@ -1,33 +1,21 @@
 import json
 import logging
-import re
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from . import api
 from .embedding import aget_embedding
+from .json_utils import extract_json_object as _extract_json
 
 logger = logging.getLogger(__name__)
 
-VALID_DECISIONS = {"accept", "soften", "reject"}
 VALID_FACT_DECISIONS = {"accept", "correct", "soften", "reject"}
 VALID_CLAIM_DECISIONS = {"accept", "soften", "reject"}
 
 
 def _normalize_fact_text(text: str) -> str:
-    return " ".join((text or "").split())
-
-
-def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    match = re.search(r"\{.*\}", text or "", re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-    try:
-        return json.loads(text)
-    except (TypeError, json.JSONDecodeError):
-        return None
+    text = unicodedata.normalize("NFKC", text or "")
+    return " ".join(text.split())
 
 
 def _clamp_confidence(value: Any) -> Optional[float]:
@@ -77,6 +65,12 @@ def parse_librarian_review(raw_text: str, candidate_text: str) -> Dict[str, Any]
 
     reviewed_text = parsed.get("reviewed_text")
     summary = parsed.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        summary = None
+    else:
+        summary = summary.strip()
+        if len(summary) > 500:
+            summary = summary[:500]
     if decision in {"accept", "correct"}:
         if not isinstance(reviewed_text, str) or not reviewed_text.strip():
             reviewed_text = candidate_text
@@ -135,11 +129,15 @@ async def apply_librarian_review(
     if decision in {"accept", "correct", "soften"}:
         stored_text = _normalize_fact_text(reviewed_text or candidate["candidate_text"])
         existing_fact = api.get_fact_by_content(topic_id, stored_text)
+        
+        # Fallback to candidate summary if review summary is missing
+        final_summary = summary or candidate.get("summary")
+        
         if existing_fact:
             accepted_fact_id = existing_fact["id"]
             logger.info("[Librarian] Reusing existing fact %s for candidate %s", accepted_fact_id, candidate_id)
         else:
-            embedding = await aget_embedding(summary or stored_text)
+            embedding = await aget_embedding(final_summary or stored_text)
             insert_kwargs = {
                 "subtopic_id": candidate.get("subtopic_id"),
                 "fact_stage": candidate.get("fact_stage", "synthesized"),
@@ -161,15 +159,16 @@ async def apply_librarian_review(
                     stored_text,
                     source="Librarian",
                     embedding=embedding,
-                    summary=summary,
+                    summary=final_summary,
                     **insert_kwargs,
                 )
             else:
+                logger.warning("[Librarian] Embedding unavailable for candidate %s; fact will lack dense retrieval.", candidate_id)
                 accepted_fact_id = api.insert_fact(
                     topic_id,
                     stored_text,
                     source="Librarian",
-                    summary=summary,
+                    summary=final_summary,
                     **insert_kwargs,
                 )
 
@@ -209,6 +208,12 @@ def parse_claim_review(raw_text: str, candidate_text: str, fallback_support_ids:
 
     reviewed_text = parsed.get("reviewed_text")
     summary = parsed.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        summary = None
+    else:
+        summary = summary.strip()
+        if len(summary) > 500:
+            summary = summary[:500]
     if decision == "accept":
         if not isinstance(reviewed_text, str) or not reviewed_text.strip():
             reviewed_text = candidate_text
@@ -261,6 +266,7 @@ async def apply_claim_review(
     candidate_id = candidate["id"]
     decision = review["decision"]
     reviewed_text = review.get("reviewed_text")
+    summary = review.get("summary")
     review_note = review.get("review_note")
     claim_score = review.get("claim_score")
     supported_fact_ids = review.get("supported_fact_ids") or []
@@ -274,6 +280,7 @@ async def apply_claim_review(
             topic_id,
             candidate.get("subtopic_id"),
             stored_text,
+            summary=summary or candidate.get("summary"),
             support_fact_ids_json=json.dumps(supported_fact_ids, ensure_ascii=True),
             rationale_short=candidate.get("rationale_short"),
             claim_score=claim_score,

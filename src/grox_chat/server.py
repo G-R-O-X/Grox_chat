@@ -42,6 +42,7 @@ from .librarian_processor import (
     parse_librarian_review,
 )
 from .embedding import aget_embedding
+from .json_utils import extract_json_object as extract_json
 from .structured_retry import retry_structured_output, usable_text_output
 
 logger = logging.getLogger(__name__)
@@ -132,19 +133,6 @@ FINAL_CLAIM_LIMIT = 3
 NUMERIC_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z])(?:\$)?\d[\d,]*(?:\.\d+)?%?")
 CITATION_ID_PATTERN = re.compile(r"\[(F|C|W)(\d+)\]")
 
-def extract_json(text: str) -> dict:
-    import re
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
-
 
 def _parse_single_json_wrapper(text: str) -> Optional[dict]:
     stripped = (text or "").strip()
@@ -180,7 +168,7 @@ def _normalize_message_contract(
         if action in accepted_actions and isinstance(content, str) and content.strip():
             confidence = _clamp_confidence(parsed.get("confidence_score"))
             if fallback_confidence is not None:
-                confidence = min(confidence if confidence is not None else fallback_confidence, fallback_confidence)
+                confidence = confidence if confidence is not None else fallback_confidence
             raw_facts = parsed.get("facts")
             facts = None
             if isinstance(raw_facts, list):
@@ -197,7 +185,7 @@ def _normalize_message_contract(
     return {
         "parsed_ok": False,
         "action": accepted_actions[0] if accepted_actions else "post_message",
-        "content": raw_text.strip() or raw_text,
+        "content": (raw_text.strip() or raw_text)[:8000],
         "confidence_score": confidence,
         "facts": None,
     }
@@ -230,9 +218,8 @@ def _sanitize_citations_to_allowed_ids(
     cleaned = CITATION_ID_PATTERN.sub(_replace, content or "")
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
     cleaned = re.sub(r"[ ]+([,.;:!?])", r"\1", cleaned)
-    cleaned = re.sub(r"([,.;:!?])(?:\s*\1)+", r"\1", cleaned)
+    cleaned = re.sub(r"([,;:!?])(?:\s*\1)+", r"\1", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     deduped_removed = {
         prefix: tuple(dict.fromkeys(values))
@@ -473,18 +460,22 @@ async def _run_votes(
     yes_votes = 0
     successful_votes = 0
     failed_votes = 0
-    for voter in voters:
+
+    async def _vote_one(voter: str) -> tuple[str, Optional[bool]]:
         agent = get_agent(voter)
         try:
-            decision = await agent.vote(prompt, allow_web=allow_web)
+            return voter, await agent.vote(prompt, allow_web=allow_web)
         except Exception:
-            decision = None
+            return voter, None
+
+    results = await asyncio.gather(*[_vote_one(v) for v in voters])
+    for voter, decision in results:
         decisions[voter] = decision
         if decision is None:
             failed_votes += 1
-            continue
-        successful_votes += 1
-        yes_votes += int(decision)
+        else:
+            successful_votes += 1
+            yes_votes += int(decision)
     return yes_votes, successful_votes, failed_votes, decisions
 
 
@@ -680,7 +671,12 @@ async def _repair_summary_by_decomposition(flawed_content: str, provider: str = 
                     
                 # Strip any markdown fences just in case
                 resp = re.sub(r"^```[a-zA-Z]*\n|```$", "", resp.strip(), flags=re.MULTILINE).strip()
-                
+
+                ascii_ratio = sum(1 for c in resp if ord(c) < 128) / max(len(resp), 1)
+                if len(resp) > 50 and ascii_ratio < 0.6:
+                    logger.warning("[skynet] Section '%s' appears non-English (ascii_ratio=%.2f); discarding.", header, ascii_ratio)
+                    continue
+
                 # Check if it properly starts with the required header
                 if not resp.startswith(header):
                     # Force the prefix if it generated useful content but forgot the header
@@ -785,6 +781,7 @@ def _empty_termination_vote(reason: str) -> dict[str, Any]:
         "untested_novelty": "no",
         "vote": "continue",
         "reason": None,
+        "override_reason": None,
         "central_blocker": False,
         "volatility_blocker": True,
         "support_blocker": False,
@@ -897,16 +894,19 @@ async def _run_termination_votes(
                         temperature=0.1,
                         max_tokens=1024,
                     )
-                    repaired = _normalize_termination_vote_contract(repair_response)
-                    if repaired["parsed_ok"]:
-                        parsed = repaired
+                    if not usable_text_output(repair_response):
+                        logger.warning("[GovVote] agent=%s repair returned unusable text", voter)
                     else:
-                        logger.warning(
-                            "[GovVote] agent=%s repair failed invalid_reason=%s repair_response=%s",
-                            voter,
-                            repaired["invalid_reason"],
-                            repair_response,
-                        )
+                        repaired = _normalize_termination_vote_contract(repair_response)
+                        if repaired["parsed_ok"]:
+                            parsed = repaired
+                        else:
+                            logger.warning(
+                                "[GovVote] agent=%s repair failed invalid_reason=%s repair_response=%s",
+                                voter,
+                                repaired["invalid_reason"],
+                                repair_response,
+                            )
                 except Exception as exc:
                     logger.warning("[GovVote] agent=%s repair failed with exception: %s", voter, exc)
         except Exception as exc:
@@ -1642,7 +1642,7 @@ def build_claim_review_prompt(
         "Accept only if the cited facts genuinely support the claim. "
         "Soften if the direction is supportable but the wording is still too strong. "
         "Reject if the reasoning overreaches, skips steps, or is not actually supported by the cited facts. "
-        'Reply with STRICT JSON only: {"action":"review_claim","decision":"accept|soften|reject","reviewed_text":"...","review_note":"...","supported_fact_ids":[1,2],"claim_score":7}.'
+        'Reply with STRICT JSON only: {"action":"review_claim","decision":"accept|soften|reject","reviewed_text":"...","summary":"high-density claim summary for RAG (max 30 words)","review_note":"...","supported_fact_ids":[1,2],"claim_score":7}.'
     )
     return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
 
@@ -1899,8 +1899,8 @@ async def _run_writer_critique_pass(state: ChatState) -> dict:
         require_json=True,
         validator=_writer_compose_response_is_usable,
     )
-    if not resp_text.strip():
-        logger.warning("[writer] All writer critique model fallbacks failed.")
+    if not usable_text_output(resp_text):
+        logger.warning("[writer] Writer compose returned unusable text; skipping persistence.")
         return {"last_writer_round": current_round}
 
     parsed = _normalize_message_contract(resp_text)
@@ -2486,7 +2486,7 @@ async def expert_node(state: ChatState) -> dict:
             search_failed = response.search_failed
         except Exception as exc:
             logger.warning("[%s] Web-enhanced broker call failed: %s", actor, exc)
-            resp_text = str(exc)
+            resp_text = json.dumps({"action": "post_message", "content": f"[System] {actor} was unable to contribute this turn due to a transient service issue."})
             search_failed = True
     else:
         try:
@@ -2511,7 +2511,7 @@ async def expert_node(state: ChatState) -> dict:
                 raise RuntimeError("structured retry exhausted")
         except Exception as exc:
             logger.warning("[%s] Direct broker call failed: %s", actor, exc)
-            resp_text = str(exc)
+            resp_text = json.dumps({"action": "post_message", "content": f"[System] {actor} was unable to contribute this turn due to a transient service issue."})
 
     updates = {"current_actor": "", "current_turn_kind": ""}
 
@@ -2596,11 +2596,16 @@ async def expert_node(state: ChatState) -> dict:
     return updates
 
 async def audience_summary_node(state: ChatState) -> dict:
-    logger.info("[skynet] Summarizing round...")
+    current_round = state.get("round_number", 1)
+    if state.get("last_summary_round") == current_round:
+        logger.info("[skynet] Summary for round %s already exists. Skipping.", current_round)
+        return {}
+
     topic, _ = _load_context_entities(state)
     if not topic:
         return {}
-    current_round = state.get("round_number", 1)
+
+    logger.info("[skynet] Summarizing round %s...", current_round)
     messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=20)
 
     prompt = build_audience_summary_prompt(state, topic, messages)
@@ -2618,7 +2623,7 @@ async def audience_summary_node(state: ChatState) -> dict:
             require_json=True,
         ),
     )
-    if not resp_text:
+    if not resp_text or not resp_text.strip():
         resp_text = json.dumps({
             "action": "post_summary",
             "content": _build_degraded_audience_summary(state, messages),
@@ -2657,13 +2662,14 @@ async def audience_summary_node(state: ChatState) -> dict:
             round_number=current_round,
             turn_kind=AUDIENCE_SUMMARY_TURN,
         )
-        
-    return {"latest_summary_msg_id": msg_id}
+
+    return {"latest_summary_msg_id": msg_id, "last_summary_round": current_round}
+
 
 async def audience_termination_check_node(state: ChatState) -> dict:
     logger.info("[skynet] Checking termination and cyclicality...")
     current_round = state.get("round_number", 1)
-    if current_round >= 7:
+    if current_round >= 10:
         logger.info("[skynet] Forcing subtopic close at round %s.", current_round)
         return {"subtopic_exhausted": True}
 
@@ -2823,18 +2829,20 @@ async def final_librarian_node(state: ChatState) -> dict:
     await _run_librarian_pass(state)
     pending_candidates = api.get_pending_fact_candidates(state["topic_id"], state["subtopic_id"])
     pending_claims = api.get_pending_claim_candidates(state["topic_id"], state["subtopic_id"])
+    reentry_count = state.get("final_librarian_reentry_count", 0)
     if pending_candidates or pending_claims:
         logger.warning(
             "[librarian] %s fact candidates and %s claim candidates remain pending; delaying subtopic close for another round.",
             len(pending_candidates),
             len(pending_claims),
         )
-        return {"pending_fact_reviews_remaining": True, "subtopic_exhausted": False}
+        return {"pending_fact_reviews_remaining": True, "subtopic_exhausted": False, "final_librarian_reentry_count": reentry_count + 1}
     return {"pending_fact_reviews_remaining": False}
 
 
 def route_after_final_librarian(state: ChatState) -> str:
-    if state.get("pending_fact_reviews_remaining"):
+    reentry_count = state.get("final_librarian_reentry_count", 0)
+    if state.get("pending_fact_reviews_remaining") and reentry_count < 2:
         return "setup_next_round"
     return "close_subtopic"
 
@@ -2898,7 +2906,72 @@ def build_graph():
 
 async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
     graph = build_graph()
-    phase, pending_turns = build_turn_queue_for_round({"round_number": 1}, 1)
+    
+    # Attempt to recover last state from DB
+    messages = api.get_messages(topic_id, subtopic_id=subtopic_id, limit=100)
+    initial_round = 1
+    spoken_this_round = set()
+    last_writer_round = None
+    last_fact_proposer_round = None
+    last_final_fact_proposer_round = None
+    last_summary_round = None
+    
+    if messages:
+        # Filter for standard messages that have a round number
+        round_msgs = [m for m in messages if m.get("round_number") is not None and m.get("msg_type") == "standard"]
+        if round_msgs:
+            last_msg = round_msgs[-1]
+            try:
+                initial_round = int(last_msg["round_number"])
+            except (ValueError, TypeError):
+                initial_round = 1
+                
+            # Find all (sender, turn_kind) pairs in the current recovered round
+            # Fix: m.get("turn_kind") or BASE_TURN to correctly match "base" if NULL in DB
+            spoken_this_round = set()
+            for m in round_msgs:
+                try:
+                    r_num = int(m.get("round_number") or 0)
+                    if r_num == initial_round:
+                        spoken_this_round.add((m["sender"], m.get("turn_kind") or BASE_TURN))
+                except (ValueError, TypeError):
+                    continue
+            logger.info("[Server] Recovered subtopic state: Round %s, already spoken: %s", initial_round, spoken_this_round)
+        
+        # Recover last round markers for NPC nodes to avoid duplicates.
+        # Since messages are from api.get_messages (id ASC), reversed(messages) gives us the latest first.
+        for m in reversed(messages):
+            try:
+                r = int(m.get("round_number") or 0) if m.get("round_number") is not None else None
+            except (ValueError, TypeError):
+                r = None
+                
+            t = m.get("turn_kind")
+            if r is None:
+                continue
+            
+            if t == WRITER_CRITIQUE_TURN and last_writer_round is None:
+                last_writer_round = r
+            if m["sender"] == "fact_proposer" and last_fact_proposer_round is None:
+                last_fact_proposer_round = r
+            if t == AUDIENCE_SUMMARY_TURN and last_summary_round is None:
+                last_summary_round = r
+            
+            # Final fact proposer usually happens at the end of subtopic (Close)
+            # but we check for any messages from it
+            if m["sender"] == "fact_proposer" and m.get("msg_type") == "summary" and last_final_fact_proposer_round is None:
+                last_final_fact_proposer_round = r
+
+    phase, pending_turns = build_turn_queue_for_round({"round_number": initial_round}, initial_round)
+    
+    # Filter pending turns to exclude specific turns that already happened this round
+    if spoken_this_round:
+        pending_turns = [t for t in pending_turns if (t["actor"], t.get("turn_kind") or BASE_TURN) not in spoken_this_round]
+        # If everyone in the roster already spoke, we might need to advance to the next round's end-of-round nodes.
+        # However, the graph's dispatcher will handle "end_of_round" if pending_turns is empty.
+        if not pending_turns:
+            logger.info("[Server] All agents in Round %s have spoken. Proceeding to end-of-round.", initial_round)
+
     initial_state = {
         "topic_id": topic_id,
         "plan_id": plan_id,
@@ -2915,10 +2988,11 @@ async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
         "spectator_web_boost_target": None,
         "phase": phase,
         "subtopic_exhausted": False,
-        "round_number": 1,
-        "last_writer_round": None,
-        "last_fact_proposer_round": None,
-        "last_final_fact_proposer_round": None,
+        "round_number": initial_round,
+        "last_writer_round": last_writer_round,
+        "last_fact_proposer_round": last_fact_proposer_round,
+        "last_final_fact_proposer_round": last_final_fact_proposer_round,
+        "last_summary_round": last_summary_round,
         "pending_fact_reviews_remaining": False,
     }
     return await graph.ainvoke(initial_state)

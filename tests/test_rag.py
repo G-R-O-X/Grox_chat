@@ -56,9 +56,9 @@ async def test_assemble_rag_context():
                             assert "[F1]" in res
                             assert "[C7]" in res
                             assert "Fact 1" in res
-                            assert "[Summary: 3]" in res
+                            assert "[M3]" in res
                             assert "Summary 1" in res
-                            assert "[Message: 5]" in res
+                            assert "[M5]" in res
                             assert "Historical message 1" in res
                             # Fact 2 is dropped because score 0.1 < 0.3
                             assert "[F2]" not in res

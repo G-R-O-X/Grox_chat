@@ -37,6 +37,10 @@ from grox_chat.server import (
     build_base_turns_for_phase,
     build_extra_turns,
     build_turn_queue_for_round,
+    build_stages_for_round,
+    _build_intervention_turns,
+    parallel_group_node,
+    sequential_group_node,
     bootstrap_fact_intake_node,
     expert_node,
     fact_proposer_node,
@@ -178,7 +182,7 @@ async def test_writer_node_retries_empty_outputs_for_all_three_stages():
     assert result["last_writer_round"] == 2
 
 
-def test_build_graph_routes_close_path_directly_to_final_fact_harvest():
+def test_build_graph_routes_close_path_through_drain_daemon():
     graph = build_graph().get_graph()
     close_targets = [
         edge.target
@@ -186,7 +190,7 @@ def test_build_graph_routes_close_path_directly_to_final_fact_harvest():
         if edge.source == "audience_termination_check_node" and edge.data == "close_subtopic"
     ]
 
-    assert close_targets == ["final_fact_proposer_node"]
+    assert close_targets == ["drain_daemon_node"]
     assert "final_writer_node" not in graph.nodes
 
 
@@ -1595,3 +1599,288 @@ async def test_fact_proposer_node_marks_synthesized_stage():
     process_writer_output.assert_awaited_once()
     assert process_writer_output.await_args.kwargs["fact_stage"] == "synthesized"
     assert process_writer_output.await_args.kwargs["structured_facts"][0]["candidate_type"] == "number"
+
+
+# ---- Stage-based parallel execution tests ----
+
+
+def test_build_stages_for_round_opening():
+    stages = build_stages_for_round(1)
+    assert len(stages) == 2
+    assert stages[0]["parallel"] is True
+    assert stages[1]["parallel"] is True
+    stage1_actors = [t["actor"] for t in stages[0]["agents"]]
+    stage2_actors = [t["actor"] for t in stages[1]["agents"]]
+    assert "dreamer" in stage1_actors
+    assert "scientist" in stage1_actors
+    assert "engineer" in stage1_actors
+    assert "analyst" in stage1_actors
+    assert "tron" in stage1_actors
+    assert stage2_actors == ["critic"]
+
+
+def test_build_stages_for_round_evidence():
+    stages = build_stages_for_round(2)
+    assert len(stages) == 2
+    assert stages[0]["parallel"] is True
+    assert stages[1]["parallel"] is True
+    stage1_actors = [t["actor"] for t in stages[0]["agents"]]
+    stage2_actors = [t["actor"] for t in stages[1]["agents"]]
+    assert "dreamer" in stage1_actors
+    assert "cat" in stage1_actors
+    assert "tron" in stage1_actors
+    assert SPECTATOR in stage1_actors
+    assert "critic" in stage2_actors
+    assert "contrarian" in stage2_actors
+    assert "dog" in stage2_actors
+
+
+def test_build_stages_for_round_debate():
+    stages = build_stages_for_round(3)
+    assert len(stages) == 1
+    assert stages[0]["parallel"] is False
+    actors = [t["actor"] for t in stages[0]["agents"]]
+    assert "dreamer" in actors
+    assert "contrarian" in actors
+    assert "dog" in actors
+
+
+def test_build_intervention_turns_creates_turns_for_valid_targets():
+    targets = {"dog_target": "dreamer", "cat_target": "scientist", "tron_target": "engineer"}
+    turns = _build_intervention_turns(targets)
+    actors = [(t["actor"], t["turn_kind"]) for t in turns]
+    assert ("dreamer", DOG_CORRECTION_TURN) in actors
+    assert ("scientist", CAT_EXPANSION_TURN) in actors
+    assert ("engineer", TRON_REMEDIATION_TURN) in actors
+
+
+def test_build_intervention_turns_ignores_invalid_targets():
+    targets = {"dog_target": "skynet", "cat_target": None}
+    turns = _build_intervention_turns(targets)
+    assert turns == []
+
+
+@pytest.mark.asyncio
+async def test_parallel_group_node_runs_agents_concurrently():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "pending_stages": [],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "current_stage": {
+            "agents": [
+                {"actor": "dreamer", "turn_kind": "base"},
+                {"actor": "scientist", "turn_kind": "base"},
+            ],
+            "parallel": True,
+        },
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "spectator_target": None,
+        "spectator_web_boost_target": None,
+        "phase": OPENING_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 1,
+    }
+
+    fake_result = {
+        "actor": "dreamer",
+        "turn_kind": "base",
+        "content": "test content",
+        "confidence_score": 7.0,
+        "search_evidence": [],
+        "targets": {},
+        "spectator_data": None,
+        "no_topic": False,
+        "topic": {"id": 1, "summary": "topic"},
+        "subtopic": {"id": 1, "summary": "subtopic"},
+        "rag_context": "",
+    }
+
+    with patch(
+        "grox_chat.server._run_single_agent_turn",
+        new=AsyncMock(return_value=fake_result),
+    ) as run_turn:
+        with patch("grox_chat.server._persist_agent_result", new=AsyncMock()) as persist:
+            result = await parallel_group_node(state)
+
+    assert run_turn.await_count == 2
+    assert persist.await_count == 2
+    assert result["current_stage"] is None
+
+
+@pytest.mark.asyncio
+async def test_parallel_group_node_handles_spectator():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "pending_stages": [],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "current_stage": {
+            "agents": [{"actor": SPECTATOR, "turn_kind": "base"}],
+            "parallel": True,
+        },
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "spectator_target": None,
+        "spectator_web_boost_target": None,
+        "phase": EVIDENCE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 2,
+    }
+
+    spectator_result = {
+        "actor": SPECTATOR,
+        "turn_kind": "base",
+        "spectator_data": {"parsed_ok": True, "target": "scientist", "grant_web_search": True},
+        "targets": {},
+        "no_topic": False,
+        "search_evidence": [],
+    }
+
+    with patch(
+        "grox_chat.server._run_single_agent_turn",
+        new=AsyncMock(return_value=spectator_result),
+    ):
+        with patch("grox_chat.server._persist_agent_result", new=AsyncMock()) as persist:
+            result = await parallel_group_node(state)
+
+    persist.assert_not_awaited()
+    assert result.get("spectator_target") == "scientist"
+    assert result.get("spectator_web_boost_target") == "scientist"
+
+
+@pytest.mark.asyncio
+async def test_parallel_group_node_inserts_intervention_stage():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "pending_stages": [{"agents": [{"actor": "critic", "turn_kind": "base"}], "parallel": True}],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "current_stage": {
+            "agents": [{"actor": "dog", "turn_kind": "base"}],
+            "parallel": True,
+        },
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "spectator_target": None,
+        "spectator_web_boost_target": None,
+        "phase": EVIDENCE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 2,
+    }
+
+    dog_result = {
+        "actor": "dog",
+        "turn_kind": "base",
+        "content": "*growls at [dreamer]*",
+        "confidence_score": 7.0,
+        "search_evidence": [],
+        "targets": {"dog_target": "dreamer"},
+        "spectator_data": None,
+        "no_topic": False,
+        "topic": {"id": 1},
+        "subtopic": {"id": 1},
+        "rag_context": "",
+    }
+
+    with patch(
+        "grox_chat.server._run_single_agent_turn",
+        new=AsyncMock(return_value=dog_result),
+    ):
+        with patch("grox_chat.server._persist_agent_result", new=AsyncMock()):
+            result = await parallel_group_node(state)
+
+    assert result.get("dog_target") == "dreamer"
+    # Intervention stage should be inserted before the remaining critic stage
+    assert "pending_stages" in result
+    assert len(result["pending_stages"]) == 2
+    assert result["pending_stages"][0]["parallel"] is True
+    intervention_actors = [t["actor"] for t in result["pending_stages"][0]["agents"]]
+    assert "dreamer" in intervention_actors
+
+
+@pytest.mark.asyncio
+async def test_sequential_group_node_runs_agents_in_order():
+    state = {
+        "topic_id": 1,
+        "plan_id": 1,
+        "subtopic_id": 1,
+        "pending_subtopics": [],
+        "pending_turns": [],
+        "pending_stages": [],
+        "current_actor": "",
+        "current_turn_kind": "",
+        "current_stage": {
+            "agents": [
+                {"actor": "dreamer", "turn_kind": "base"},
+                {"actor": "scientist", "turn_kind": "base"},
+            ],
+            "parallel": False,
+        },
+        "search_retry_count": 0,
+        "dog_target": None,
+        "cat_target": None,
+        "tron_target": None,
+        "spectator_target": None,
+        "spectator_web_boost_target": None,
+        "phase": DEBATE_PHASE,
+        "subtopic_exhausted": False,
+        "round_number": 3,
+    }
+
+    fake_result = {
+        "actor": "dreamer",
+        "turn_kind": "base",
+        "content": "test content",
+        "confidence_score": 7.0,
+        "search_evidence": [],
+        "targets": {},
+        "spectator_data": None,
+        "no_topic": False,
+        "topic": {"id": 1},
+        "subtopic": {"id": 1},
+        "rag_context": "",
+    }
+
+    call_order = []
+
+    async def mock_run_turn(state, actor, turn_kind):
+        call_order.append(actor)
+        return {**fake_result, "actor": actor}
+
+    with patch(
+        "grox_chat.server._run_single_agent_turn",
+        new=AsyncMock(side_effect=mock_run_turn),
+    ):
+        with patch("grox_chat.server._persist_agent_result", new=AsyncMock()):
+            result = await sequential_group_node(state)
+
+    assert call_order == ["dreamer", "scientist"]
+    assert result["current_stage"] is None
+
+
+def test_build_graph_has_stage_dispatcher():
+    graph = build_graph().get_graph()
+    assert "stage_dispatcher" in graph.nodes
+    assert "parallel_group" in graph.nodes
+    assert "sequential_group" in graph.nodes
+    assert "drain_daemon_node" in graph.nodes

@@ -54,7 +54,8 @@ def _render_knowledge_guide(include_web: bool) -> str:
         "GUIDE:",
         "- [F...] are verified or librarian-reviewed facts. Prefer them as evidence.",
         "- [C...] are derived claims supported by facts. They are weaker than [F...].",
-        "- Summaries and Messages provide context only. They are not evidence and must not be cited as evidence.",
+        "- [M...] are prior debate messages. Use `[M{id}]` to reference a specific argument instead of restating it. Messages are attribution only — not evidence.",
+        "- Summaries provide context only. They are not evidence and must not be cited as evidence.",
     ]
     if include_web:
         lines.append(
@@ -77,7 +78,7 @@ def _render_section(title: str, records: Iterable[Dict[str, Any]], label: str) -
         elif label == "Web":
             section.append(f"- [W{record['id']}] {record['content']}")
         else:
-            section.append(f"- [{label}: {record['id']}] {record['content']}")
+            section.append(f"- [M{record['id']}] ({record.get('sender', label)}) {record['content']}")
     return "\n".join(section) + "\n"
 
 

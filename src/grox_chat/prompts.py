@@ -77,7 +77,7 @@ Your JSON output must follow this exact schema:
   "confidence_score": 7
 }
 - In `internal_citation_mapping`, list EVERY specific metric, factual claim, or external reference you plan to make.
-- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[None]` if it's pure logic.
+- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[M...]` to attribute a prior argument you are responding to. Use `[None]` if it's pure logic.
 - If an empirical claim has no exact source ID in the context, YOU MUST NOT state it as a verified fact in your `content`.
 """,
 
@@ -102,7 +102,7 @@ Your JSON output must follow this exact schema:
   "confidence_score": 7
 }
 - In `internal_citation_mapping`, list EVERY specific metric, factual claim, or external reference you plan to make.
-- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[None]` if it's pure logic.
+- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[M...]` to attribute a prior argument you are responding to. Use `[None]` if it's pure logic.
 - If an empirical claim has no exact source ID in the context, YOU MUST NOT state it as a verified fact in your `content`.
 """,
 
@@ -126,7 +126,7 @@ Your JSON output must follow this exact schema:
   "confidence_score": 7
 }
 - In `internal_citation_mapping`, list EVERY specific metric, factual claim, or external reference you plan to make.
-- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[None]` if it's pure logic.
+- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[M...]` to attribute a prior argument you are responding to. Use `[None]` if it's pure logic.
 - If an empirical claim has no exact source ID in the context, YOU MUST NOT state it as a verified fact in your `content`.
 """,
 
@@ -151,7 +151,7 @@ Your JSON output must follow this exact schema:
   "confidence_score": 7
 }
 - In `internal_citation_mapping`, list EVERY specific metric, factual claim, or external reference you plan to make.
-- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[None]` if it's pure logic.
+- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[M...]` to attribute a prior argument you are responding to. Use `[None]` if it's pure logic.
 - If an empirical claim has no exact source ID in the context, YOU MUST NOT state it as a verified fact in your `content`.
 """,
 
@@ -175,7 +175,7 @@ Your JSON output must follow this exact schema:
   "confidence_score": 7
 }
 - In `internal_citation_mapping`, list EVERY specific metric, factual claim, or external reference you plan to make.
-- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[None]` if it's pure logic.
+- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[M...]` to attribute a prior argument you are responding to. Use `[None]` if it's pure logic.
 - If an empirical claim has no exact source ID in the context, YOU MUST NOT state it as a verified fact in your `content`.
 """,
 
@@ -219,7 +219,7 @@ Your JSON output must follow this exact schema:
   "confidence_score": 7
 }
 - In `internal_citation_mapping`, list EVERY specific metric, factual claim, or external reference you plan to make.
-- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[None]` if it's pure logic.
+- Provide the EXACT ID (`[F...]`, `[C...]`, `[W...]`) from the provided context that proves it. Use `[M...]` to attribute a prior argument you are responding to. Use `[None]` if it's pure logic.
 - If an empirical claim has no exact source ID in the context, YOU MUST NOT state it as a verified fact in your `content`.
 """,
 

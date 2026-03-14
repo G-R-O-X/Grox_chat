@@ -4,6 +4,7 @@ from .db import (
     update_claim_summary as db_update_claim_summary,
 
     get_web_evidence_for_topic as db_get_web_evidence,
+    get_messages_since as db_get_messages_since,
 
     claim_candidate_exists as db_claim_candidate_exists,
     close_subtopic as db_close_subtopic,
@@ -52,7 +53,7 @@ __all__ = [
     'fact_candidate_exists', 'update_fact_candidate_review', 'create_claim_candidate', 'get_pending_claim_candidates',
     'get_claim_candidates', 'claim_candidate_exists', 'update_claim_candidate_review', 'insert_claim', 'get_facts_by_ids',
     'search_claims_hybrid', 'insert_web_evidence', 'search_web_evidence_same_topic', 'search_web_evidence_cross_topic',
-    'insert_vote_record', 'get_vote_records'
+    'insert_vote_record', 'get_vote_records', 'get_messages_since'
 ]
 
 def _dict(row):
@@ -144,6 +145,12 @@ def get_messages(topic_id, subtopic_id=None, limit=50, msg_type=None):
         ).fetchall()
         # Return in chronological order
         return [_dict(r) for r in reversed(rows)]
+
+
+def get_messages_since(topic_id: int, subtopic_id: int, since_id: int, msg_type: str = "standard"):
+    """Return messages newer than *since_id* in chronological order."""
+    return db_get_messages_since(topic_id, subtopic_id, since_id, msg_type)
+
 
 def create_topic(summary, detail):
     with get_db() as conn:

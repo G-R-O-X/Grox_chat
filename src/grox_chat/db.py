@@ -1299,6 +1299,18 @@ def insert_message_with_embedding(
             )
         return msg_id
 
+def get_messages_since(topic_id: int, subtopic_id: int, since_id: int, msg_type: str = "standard") -> list[dict]:
+    """Return messages newer than *since_id* in chronological order."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, topic_id, subtopic_id, sender, content, msg_type, "
+            "round_number, turn_kind, confidence_score "
+            "FROM Message WHERE topic_id = ? AND subtopic_id = ? AND id > ? AND msg_type = ? ORDER BY id ASC",
+            (topic_id, subtopic_id, since_id, msg_type),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def _exclude_clause(column_name: str, values: Optional[Iterable[int]]) -> tuple[str, list[int]]:
     items = [int(v) for v in values or []]
     if not items:

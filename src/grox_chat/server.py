@@ -6,7 +6,7 @@ from typing import Any, Optional, Sequence
 
 from langgraph.graph import END, START, StateGraph
 
-from .graph import ChatState, TurnSpec, dispatcher_node, route_from_dispatcher
+from .graph import ChatState, TurnSpec, stage_dispatcher_node, route_from_stage_dispatcher
 from . import api
 from . import db
 from .agents import (
@@ -105,6 +105,7 @@ DELIBERATION_DISCIPLINE_LINES = (
     "DEBATE DISCIPLINE:",
     "- Prefer net-new argument, explicit correction, or narrowed disagreement over praise, empty agreement, or broad recap.",
     "- If you challenge a claim, identify the specific sentence, assumption, metric, or causal link you are attacking.",
+    "- Reference prior arguments by citation `[M{id}]` instead of summarizing or paraphrasing them. Your output must be net-new analysis.",
 )
 WRITER_ANALYSIS_SYSTEM_PROMPT = """You are the Writer and a meta-Critic observing a multi-agent debate.
 Your job in this pass is to analyze the round, not to produce final JSON output.
@@ -122,6 +123,7 @@ FACT_CITATION_PROTOCOL = (
     "- Cite web evidence as `[W{id}]`, but describe it as unverified web evidence.\n"
     "- `[W...]` items may guide verification, but they are not permanent facts unless later admitted as `[F...]`.\n"
     "- Do not invent IDs.\n"
+    "- Reference prior messages as `[M{id}]` instead of restating them. Messages are context/attribution only, not evidence.\n"
     "- Summaries and historical messages are context only. Do not cite them as evidence."
 )
 NUMBER_FACT_LIMIT = 3
@@ -480,7 +482,11 @@ async def _run_votes(
 
 
 def _format_message_for_prompt(message: dict) -> str:
-    parts = [message["sender"]]
+    parts = []
+    msg_id = message.get("id")
+    if msg_id is not None:
+        parts.append(f"M{msg_id}")
+    parts.append(message["sender"])
     if message.get("msg_type") and message.get("msg_type") != "standard":
         parts.append(message["msg_type"])
     label = "|".join(parts)
@@ -530,6 +536,54 @@ def build_turn_queue_for_round(state: ChatState, round_number: int) -> tuple[str
     phase = get_phase_for_round(round_number)
     turns = build_base_turns_for_phase(phase)
     return phase, turns
+
+
+# Agent grouping constants for stage-based parallel execution
+BUILDERS = ["dreamer", "scientist", "engineer", "analyst"]
+CRITICS = ["critic", "contrarian"]
+
+
+def build_stages_for_round(round_number: int) -> list[dict]:
+    """Build stage-based execution plan for a round.
+
+    R1 (OPENING): builders + tron parallel → critic alone
+    R2 (EVIDENCE): builders + cat/tron/spectator parallel → critics + dog parallel
+    R3+ (DEBATE): all agents sequential
+    """
+    phase = get_phase_for_round(round_number)
+    if phase == OPENING_PHASE:
+        # R1: builders + tron parallel, then critic alone
+        stage1 = [_make_turn(a) for a in BUILDERS + ["tron"]]
+        stage2 = [_make_turn("critic")]
+        return [
+            {"agents": stage1, "parallel": True},
+            {"agents": stage2, "parallel": True},
+        ]
+    elif phase == EVIDENCE_PHASE:
+        # R2: builders + cat/tron/spectator parallel, then critics + dog parallel
+        stage1 = [_make_turn(a) for a in BUILDERS + ["cat", "tron", SPECTATOR]]
+        stage2 = [_make_turn(a) for a in CRITICS + ["dog"]]
+        return [
+            {"agents": stage1, "parallel": True},
+            {"agents": stage2, "parallel": True},
+        ]
+    else:
+        # R3+ DEBATE: sequential (single stage)
+        all_turns = [_make_turn(a) for a in FULL_ROSTER]
+        return [{"agents": all_turns, "parallel": False}]
+
+
+def _build_intervention_turns(targets: dict) -> list[TurnSpec]:
+    """Build intervention turn specs from extracted targets."""
+    valid_targets = set(ordinary_deliberators())
+    interventions: list[TurnSpec] = []
+    if targets.get("dog_target") in valid_targets:
+        interventions.append(_make_turn(targets["dog_target"], DOG_CORRECTION_TURN))
+    if targets.get("cat_target") in valid_targets:
+        interventions.append(_make_turn(targets["cat_target"], CAT_EXPANSION_TURN))
+    if targets.get("tron_target") in valid_targets:
+        interventions.append(_make_turn(targets["tron_target"], TRON_REMEDIATION_TURN))
+    return interventions
 
 
 def _replace_extra_turns(pending_turns: list[TurnSpec], extra_turns: list[TurnSpec]) -> list[TurnSpec]:
@@ -865,8 +919,9 @@ async def _run_termination_votes(
     round_number: int,
     subject: str,
 ) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for voter in voters:
+
+    async def _vote_one(voter: str) -> dict[str, Any]:
+        """Run a single voter's LLM call (+ optional repair). No DB writes."""
         agent = get_agent(voter)
         raw_response = ""
         repair_response = ""
@@ -912,16 +967,43 @@ async def _run_termination_votes(
         except Exception as exc:
             parsed = _empty_termination_vote(f"exception:{type(exc).__name__}")
             logger.warning("[GovVote] agent=%s execution failed: %s", voter, exc)
-        record = {
+        return {
             "voter": voter,
             "raw_response": raw_response,
             "repair_used": repair_used,
             "repair_response": repair_response,
             "parsed": parsed,
         }
+
+    # Run all voter LLM calls concurrently
+    results = await asyncio.gather(
+        *[_vote_one(v) for v in voters], return_exceptions=True
+    )
+
+    # Serialize DB writes and logging
+    records: list[dict[str, Any]] = []
+    for voter, result in zip(voters, results):
+        if isinstance(result, Exception):
+            logger.warning("[GovVote] agent=%s _vote_one raised: %s", voter, result)
+            parsed = _empty_termination_vote(f"exception:{type(result).__name__}")
+            record: dict[str, Any] = {
+                "voter": voter,
+                "raw_response": "",
+                "repair_used": False,
+                "repair_response": "",
+                "parsed": parsed,
+            }
+        else:
+            record = result
+            parsed = record["parsed"]
+
+        raw_response = record["raw_response"]
+        repair_used = record["repair_used"]
+        repair_response = record["repair_response"]
+
         # Extract reason safely, defaulting to empty string if missing or None
         vote_reason = parsed.get("reason") or parsed.get("override_reason") or ""
-        
+
         api.insert_vote_record(
             topic_id,
             subtopic_id,
@@ -2434,14 +2516,25 @@ async def _run_inline_fact_intake(
             emit_audit_message=False,
         )
 
-async def expert_node(state: ChatState) -> dict:
-    actor = state["current_actor"]
-    turn_kind = state.get("current_turn_kind", BASE_TURN)
-    logger.info(f"[{actor}] Speaking (Round {state.get('round_number', 1)})...")
+async def _run_single_agent_turn(
+    state: ChatState, actor: str, turn_kind: str
+) -> dict:
+    """Execute one agent turn: context loading, prompt building, LLM call,
+    citation sanitization.  Pure computation -- no persistence side-effects.
 
+    Returns a dict with keys:
+        actor, turn_kind, content, confidence_score, search_evidence,
+        spectator_data (dict if actor is SPECTATOR, else None),
+        targets (dict of dog_target/cat_target/tron_target extracted),
+        rag_degraded, search_failed,
+        topic, subtopic, rag_context (carried for persistence).
+
+    If the topic cannot be loaded, returns a minimal dict with ``no_topic=True``.
+    """
     topic, subtopic = _load_context_entities(state)
     if not topic:
-        return {"current_actor": ""}
+        return {"actor": actor, "turn_kind": turn_kind, "no_topic": True}
+
     messages = api.get_messages(state["topic_id"], subtopic_id=state["subtopic_id"], limit=6)
     summary_messages = api.get_messages(
         state["topic_id"],
@@ -2543,17 +2636,22 @@ async def expert_node(state: ChatState) -> dict:
             logger.warning("[%s] Direct broker call failed: %s", actor, exc)
             resp_text = json.dumps({"action": "post_message", "content": f"[System] {actor} was unable to contribute this turn due to a transient service issue."})
 
-    updates = {"current_actor": "", "current_turn_kind": ""}
-
+    # Spectator: return parsed focus data, no persistence needed
     if actor == SPECTATOR:
         parsed_focus = _normalize_focus_contract(resp_text)
-        if parsed_focus["parsed_ok"]:
-            updates["spectator_target"] = parsed_focus["target"]
-            updates["spectator_web_boost_target"] = (
-                parsed_focus["target"] if parsed_focus["grant_web_search"] else None
-            )
-        return updates
+        return {
+            "actor": actor,
+            "turn_kind": turn_kind,
+            "spectator_data": parsed_focus,
+            "content": "",
+            "confidence_score": None,
+            "search_evidence": search_evidence,
+            "targets": {},
+            "rag_degraded": rag_degraded,
+            "search_failed": search_failed,
+        }
 
+    # Non-spectator: parse message contract and sanitize citations
     fallback_confidence = DEGRADED_OPERATION_CONFIDENCE if (rag_degraded or search_failed) else None
     parsed = _normalize_message_contract(resp_text, fallback_confidence=fallback_confidence)
     citation_knowledge_blocks = [rag_context] + [
@@ -2581,25 +2679,84 @@ async def expert_node(state: ChatState) -> dict:
     if not parsed["parsed_ok"]:
         confidence_score = min(confidence_score if confidence_score is not None else PARSER_FAILURE_CONFIDENCE, PARSER_FAILURE_CONFIDENCE)
 
+    # Extract targets from content
+    targets: dict[str, str] = {}
+    if turn_kind == BASE_TURN and actor in ('dog', 'cat', 'tron'):
+        target = _extract_target_from_content(content, actor)
+        if target:
+            targets[f'{actor}_target'] = target
+
+    return {
+        "actor": actor,
+        "turn_kind": turn_kind,
+        "content": content,
+        "confidence_score": confidence_score,
+        "search_evidence": search_evidence,
+        "spectator_data": None,
+        "targets": targets,
+        "rag_degraded": rag_degraded,
+        "search_failed": search_failed,
+        # Carried for persistence
+        "topic": topic,
+        "subtopic": subtopic,
+        "rag_context": rag_context,
+    }
+
+
+async def _persist_agent_result(state: ChatState, result: dict) -> None:
+    """Persist one agent result to the database: message + inline fact intake.
+
+    Args:
+        state: Current chat state.
+        result: Dict returned by ``_run_single_agent_turn``.
+    """
+    actor = result["actor"]
+    turn_kind = result["turn_kind"]
+
     await api.persist_message(
         state["topic_id"],
         state["subtopic_id"],
         actor,
-        content,
-        confidence_score=confidence_score,
+        result["content"],
+        confidence_score=result["confidence_score"],
         round_number=state.get("round_number", 1),
         turn_kind=turn_kind,
     )
 
-    if search_evidence:
+    if result["search_evidence"]:
         await _run_inline_fact_intake(
             state,
             actor=actor,
-            topic=topic,
-            subtopic=subtopic,
-            rag_context=rag_context,
-            search_evidence=search_evidence,
+            topic=result["topic"],
+            subtopic=result["subtopic"],
+            rag_context=result["rag_context"],
+            search_evidence=result["search_evidence"],
         )
+
+
+async def expert_node(state: ChatState) -> dict:
+    actor = state["current_actor"]
+    turn_kind = state.get("current_turn_kind", BASE_TURN)
+    logger.info(f"[{actor}] Speaking (Round {state.get('round_number', 1)})...")
+
+    result = await _run_single_agent_turn(state, actor, turn_kind)
+
+    if result.get("no_topic"):
+        return {"current_actor": ""}
+
+    updates: dict = {"current_actor": "", "current_turn_kind": ""}
+
+    # Handle spectator (no persistence needed)
+    if result.get("spectator_data"):
+        parsed_focus = result["spectator_data"]
+        if parsed_focus["parsed_ok"]:
+            updates["spectator_target"] = parsed_focus["target"]
+            updates["spectator_web_boost_target"] = (
+                parsed_focus["target"] if parsed_focus["grant_web_search"] else None
+            )
+        return updates
+
+    await _persist_agent_result(state, result)
 
     # Peanut gallery targeting logic
     _clear_consumed_extra_target(turn_kind, updates)
@@ -2607,18 +2764,8 @@ async def expert_node(state: ChatState) -> dict:
         updates["spectator_target"] = None
         updates["spectator_web_boost_target"] = None
 
-    if turn_kind == BASE_TURN and actor == 'dog':
-        target = _extract_target_from_content(content, actor)
-        if target:
-            updates['dog_target'] = target
-    elif turn_kind == BASE_TURN and actor == 'cat':
-        target = _extract_target_from_content(content, actor)
-        if target:
-            updates['cat_target'] = target
-    elif turn_kind == BASE_TURN and actor == 'tron':
-        target = _extract_target_from_content(content, actor)
-        if target:
-            updates['tron_target'] = target
+    if result.get("targets"):
+        updates.update(result["targets"])
 
     if any(key in updates for key in {"dog_target", "cat_target", "tron_target"}):
         _refresh_pending_turns_with_extras(state, updates)
@@ -2815,11 +2962,15 @@ def route_after_round(state: ChatState) -> str:
     return "setup_next_round"
 
 def setup_next_round_node(state: ChatState) -> dict:
-    """Prepares the next round queue using phase-specific rosters and extra turns."""
+    """Prepares the next round using stage-based execution plan."""
     next_round = state.get("round_number", 1) + 1
-    phase, pending_turns = build_turn_queue_for_round(state, next_round)
+    phase = get_phase_for_round(next_round)
+    pending_stages = build_stages_for_round(next_round)
+    # Also keep pending_turns for backward compatibility with recovery logic
+    _, pending_turns = build_turn_queue_for_round(state, next_round)
     return {
         "pending_turns": pending_turns,
+        "pending_stages": pending_stages,
         "phase": phase,
         "round_number": next_round,
         "dog_target": None,
@@ -2876,62 +3027,171 @@ def route_after_final_librarian(state: ChatState) -> str:
         return "setup_next_round"
     return "close_subtopic"
 
+
+async def parallel_group_node(state: ChatState) -> dict:
+    """Run all agents in the current stage concurrently, persist results in roster order."""
+    stage = state.get("current_stage")
+    if not stage:
+        logger.error("[parallel] parallel_group_node called with no current_stage")
+        return {"current_stage": None}
+    agents = stage["agents"]
+    logger.info("[parallel] Running %d agents concurrently: %s",
+                len(agents), [t["actor"] for t in agents])
+
+    results = await asyncio.gather(
+        *[_run_single_agent_turn(state, t["actor"], t.get("turn_kind", BASE_TURN))
+          for t in agents],
+        return_exceptions=True,
+    )
+
+    collected_targets: dict = {}
+    for turn, result in zip(agents, results):
+        if isinstance(result, BaseException):
+            logger.warning("[parallel] %s failed: %s", turn["actor"], result)
+            continue
+        if result.get("no_topic"):
+            continue
+        # Handle spectator (no persistence)
+        if result.get("spectator_data"):
+            parsed_focus = result["spectator_data"]
+            if parsed_focus["parsed_ok"]:
+                collected_targets["spectator_target"] = parsed_focus["target"]
+                collected_targets["spectator_web_boost_target"] = (
+                    parsed_focus["target"] if parsed_focus["grant_web_search"] else None
+                )
+            continue
+
+        try:
+            await _persist_agent_result(state, result)
+        except Exception as exc:
+            logger.error("[parallel] Failed to persist %s result: %s", turn["actor"], exc)
+            continue
+
+        if result.get("targets"):
+            collected_targets.update(result["targets"])
+
+    updates: dict = {"current_stage": None}
+    # Apply target state
+    for key in ("dog_target", "cat_target", "tron_target", "spectator_target", "spectator_web_boost_target"):
+        if key in collected_targets:
+            updates[key] = collected_targets[key]
+
+    # Build intervention stages from extracted targets
+    intervention_turns = _build_intervention_turns(collected_targets)
+    if intervention_turns:
+        remaining = list(state.get("pending_stages", []))
+        remaining.insert(0, {"agents": intervention_turns, "parallel": True})
+        updates["pending_stages"] = remaining
+
+    return updates
+
+
+async def sequential_group_node(state: ChatState) -> dict:
+    """Run agents sequentially (R3+ debate). Interventions fire immediately after each base turn."""
+    stage = state.get("current_stage")
+    if not stage:
+        logger.error("[sequential] sequential_group_node called with no current_stage")
+        return {"current_stage": None}
+    agents = stage["agents"]
+    logger.info("[sequential] Running %d agents sequentially: %s",
+                len(agents), [t["actor"] for t in agents])
+
+    updates: dict = {"current_stage": None}
+    working_state = dict(state)
+    for turn in agents:
+        actor = turn["actor"]
+        turn_kind = turn.get("turn_kind", BASE_TURN)
+        try:
+            result = await _run_single_agent_turn(working_state, actor, turn_kind)
+        except Exception as exc:
+            logger.warning("[sequential] %s failed: %s", actor, exc)
+            continue
+        if result.get("no_topic"):
+            continue
+        if result.get("spectator_data"):
+            parsed_focus = result["spectator_data"]
+            if parsed_focus["parsed_ok"]:
+                working_state["spectator_target"] = parsed_focus["target"]
+                working_state["spectator_web_boost_target"] = (
+                    parsed_focus["target"] if parsed_focus["grant_web_search"] else None
+                )
+                updates["spectator_target"] = working_state["spectator_target"]
+                updates["spectator_web_boost_target"] = working_state["spectator_web_boost_target"]
+            continue
+
+        try:
+            await _persist_agent_result(working_state, result)
+        except Exception as exc:
+            logger.error("[sequential] Failed to persist %s result: %s", actor, exc)
+            continue
+
+        # Schedule interventions immediately (before next base turn)
+        if result.get("targets"):
+            intervention_turns = _build_intervention_turns(result["targets"])
+            for iturn in intervention_turns:
+                try:
+                    iresult = await _run_single_agent_turn(working_state, iturn["actor"], iturn["turn_kind"])
+                    if not iresult.get("no_topic") and not iresult.get("spectator_data"):
+                        await _persist_agent_result(working_state, iresult)
+                except Exception as exc:
+                    logger.warning("[sequential] Intervention %s/%s failed: %s", iturn["actor"], iturn["turn_kind"], exc)
+
+    return updates
+
+
+async def drain_daemon_node(state: ChatState) -> dict:
+    """Drain the fact daemon before closing a subtopic."""
+    from .fact_daemon import drain_daemon
+    await drain_daemon(state["topic_id"], state["subtopic_id"], timeout=90.0)
+    return {}
+
+
 def build_graph():
     builder = StateGraph(ChatState)
-    
-    # 1. Main Expert Loop
+
+    # 1. Stage-based Expert Loop
     builder.add_node("bootstrap_fact_intake_node", bootstrap_fact_intake_node)
-    builder.add_node("dispatcher", dispatcher_node)
-    
-    for agent in AGENTS:
-        builder.add_node(agent, expert_node)
-        
-    # Routing from dispatcher -> experts or end of round
-    route_map = {agent: agent for agent in AGENTS}
-    route_map["end_of_round"] = "writer_node"
-    builder.add_conditional_edges("dispatcher", route_from_dispatcher, route_map)
-    
-    for agent in AGENTS:
-        builder.add_edge(agent, "dispatcher")
-        
+    builder.add_node("stage_dispatcher", stage_dispatcher_node)
+    builder.add_node("parallel_group", parallel_group_node)
+    builder.add_node("sequential_group", sequential_group_node)
+
+    builder.add_conditional_edges(
+        "stage_dispatcher",
+        route_from_stage_dispatcher,
+        {
+            "parallel_group": "parallel_group",
+            "sequential_group": "sequential_group",
+            "end_of_round": "writer_node",
+        },
+    )
+    builder.add_edge("parallel_group", "stage_dispatcher")
+    builder.add_edge("sequential_group", "stage_dispatcher")
+
     # 2. End of Round Logic
     builder.add_node("writer_node", writer_node)
-    builder.add_node("fact_proposer_node", fact_proposer_node)
-    builder.add_node("librarian_node", librarian_node)
     builder.add_node("audience_summary_node", audience_summary_node)
     builder.add_node("audience_termination_check_node", audience_termination_check_node)
     builder.add_node("setup_next_round_node", setup_next_round_node)
-    builder.add_node("final_fact_proposer_node", final_fact_proposer_node)
-    builder.add_node("final_librarian_node", final_librarian_node)
+    builder.add_node("drain_daemon_node", drain_daemon_node)
     builder.add_node("close_subtopic_node", close_subtopic_node)
-    
-    builder.add_edge("writer_node", "fact_proposer_node")
-    builder.add_edge("fact_proposer_node", "librarian_node")
-    builder.add_edge("librarian_node", "audience_summary_node")
+
+    builder.add_edge("writer_node", "audience_summary_node")
     builder.add_edge("audience_summary_node", "audience_termination_check_node")
-    
+
     builder.add_conditional_edges(
-        "audience_termination_check_node", 
-        route_after_round, 
-        {"close_subtopic": "final_fact_proposer_node", "setup_next_round": "setup_next_round_node"}
+        "audience_termination_check_node",
+        route_after_round,
+        {"close_subtopic": "drain_daemon_node", "setup_next_round": "setup_next_round_node"},
     )
-    
-    builder.add_edge("setup_next_round_node", "dispatcher")
-    builder.add_edge("final_fact_proposer_node", "final_librarian_node")
-    builder.add_conditional_edges(
-        "final_librarian_node",
-        route_after_final_librarian,
-        {
-            "setup_next_round": "setup_next_round_node",
-            "close_subtopic": "close_subtopic_node",
-        },
-    )
+
+    builder.add_edge("setup_next_round_node", "stage_dispatcher")
+    builder.add_edge("drain_daemon_node", "close_subtopic_node")
     builder.add_edge("close_subtopic_node", END)
-    
+
     # Entry point
     builder.add_edge(START, "bootstrap_fact_intake_node")
-    builder.add_edge("bootstrap_fact_intake_node", "dispatcher")
-    
+    builder.add_edge("bootstrap_fact_intake_node", "stage_dispatcher")
+
     return builder.compile()
 
 async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
@@ -2992,15 +3252,26 @@ async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
             if m["sender"] == "fact_proposer" and m.get("msg_type") == "summary" and last_final_fact_proposer_round is None:
                 last_final_fact_proposer_round = r
 
-    phase, pending_turns = build_turn_queue_for_round({"round_number": initial_round}, initial_round)
-    
-    # Filter pending turns to exclude specific turns that already happened this round
+    phase = get_phase_for_round(initial_round)
+    _, pending_turns = build_turn_queue_for_round({"round_number": initial_round}, initial_round)
+    pending_stages = build_stages_for_round(initial_round)
+
+    # Filter pending stages/turns to exclude agents who already spoke this round
     if spoken_this_round:
         pending_turns = [t for t in pending_turns if (t["actor"], t.get("turn_kind") or BASE_TURN) not in spoken_this_round]
-        # If everyone in the roster already spoke, we might need to advance to the next round's end-of-round nodes.
-        # However, the graph's dispatcher will handle "end_of_round" if pending_turns is empty.
-        if not pending_turns:
+        filtered_stages = []
+        for stage in pending_stages:
+            filtered_agents = [
+                t for t in stage["agents"]
+                if (t["actor"], t.get("turn_kind") or BASE_TURN) not in spoken_this_round
+            ]
+            if filtered_agents:
+                filtered_stages.append({"agents": filtered_agents, "parallel": stage["parallel"]})
+        pending_stages = filtered_stages
+        if not pending_turns and not pending_stages:
             logger.info("[Server] All agents in Round %s have spoken. Proceeding to end-of-round.", initial_round)
+
+    from .fact_daemon import start_daemon, stop_daemon, drain_daemon
 
     initial_state = {
         "topic_id": topic_id,
@@ -3008,6 +3279,7 @@ async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
         "subtopic_id": subtopic_id,
         "pending_subtopics": [],
         "pending_turns": pending_turns,
+        "pending_stages": pending_stages,
         "current_actor": "",
         "current_turn_kind": "",
         "search_retry_count": 0,
@@ -3025,7 +3297,14 @@ async def run_subtopic_graph(topic_id: int, subtopic_id: int, plan_id: int = 0):
         "last_summary_round": last_summary_round,
         "pending_fact_reviews_remaining": False,
     }
-    return await graph.ainvoke(initial_state)
+    try:
+        await start_daemon(topic_id, subtopic_id)
+        return await graph.ainvoke(initial_state)
+    finally:
+        try:
+            await drain_daemon(topic_id, subtopic_id, timeout=30.0)
+        except Exception:
+            await stop_daemon(topic_id, subtopic_id)
 
 
 async def run_server_loop():

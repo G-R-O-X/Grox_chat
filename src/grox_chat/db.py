@@ -385,7 +385,13 @@ def init_db():
         _ensure_column(conn, "Fact", "source_refs_json", "TEXT")
         _ensure_column(conn, "Fact", "source_excerpt", "TEXT")
         _ensure_column(conn, "Fact", "review_status", "TEXT")
-        _ensure_column(conn, "Fact", "evidence_note", "TEXT")
+        _ensure_column(conn, "Fact", "summary", "TEXT")
+        _ensure_column(conn, "Claim", "summary", "TEXT")
+        _ensure_column(conn, "Message", "summary", "TEXT")
+        _ensure_column(conn, "FactCandidate", "summary", "TEXT")
+        _ensure_column(conn, "ClaimCandidate", "summary", "TEXT")
+        _ensure_column(conn, "WebEvidence", "summary", "TEXT")
+        _ensure_column(conn, "FactCandidate", "evidence_note", "TEXT")
         _ensure_column(conn, "Fact", "confidence_score", "REAL")
         _ensure_column(conn, "FactCandidate", "fact_stage", "TEXT NOT NULL DEFAULT 'synthesized'")
         _ensure_column(conn, "FactCandidate", "candidate_type", "TEXT NOT NULL DEFAULT 'sourced_claim'")
@@ -411,6 +417,7 @@ def _insert_fact_row(
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
     confidence_score: Optional[float] = None,
+    summary: Optional[str] = None,
 ) -> int:
     cursor = conn.execute(
         """
@@ -418,6 +425,7 @@ def _insert_fact_row(
             topic_id,
             subtopic_id,
             content,
+            summary,
             source,
             fact_stage,
             fact_type,
@@ -430,12 +438,13 @@ def _insert_fact_row(
             evidence_note,
             confidence_score
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             topic_id,
             subtopic_id,
             content,
+            summary,
             source,
             fact_stage,
             fact_type,
@@ -450,7 +459,7 @@ def _insert_fact_row(
         ),
     )
     fact_id = cursor.lastrowid
-    _insert_fact_fts(conn, fact_id, topic_id, content, source)
+    _insert_fact_fts(conn, fact_id, topic_id, summary or content, source)
     return fact_id
 
 
@@ -469,6 +478,7 @@ def insert_fact(
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
     confidence_score: Optional[float] = None,
+    summary: Optional[str] = None,
 ) -> int:
     with get_db() as conn:
         return _insert_fact_row(
@@ -487,6 +497,7 @@ def insert_fact(
             review_status=review_status,
             evidence_note=evidence_note,
             confidence_score=confidence_score,
+            summary=summary,
         )
 
 
@@ -506,6 +517,7 @@ def insert_fact_with_embedding(
     review_status: Optional[str] = None,
     evidence_note: Optional[str] = None,
     confidence_score: Optional[float] = None,
+    summary: Optional[str] = None,
 ) -> int:
     """Insert a fact and its corresponding embedding into the database."""
     with get_db() as conn:
@@ -525,6 +537,7 @@ def insert_fact_with_embedding(
             review_status=review_status,
             evidence_note=evidence_note,
             confidence_score=confidence_score,
+            summary=summary,
         )
         conn.execute(
             "INSERT INTO vec_facts(fact_id, embedding) VALUES (?, ?)",
@@ -537,6 +550,7 @@ def create_fact_candidate(
     subtopic_id: int,
     writer_msg_id: Optional[int],
     candidate_text: str,
+    summary: Optional[str] = None,
     fact_stage: str = "synthesized",
     candidate_type: str = "sourced_claim",
     evidence_note: Optional[str] = None,
@@ -553,6 +567,7 @@ def create_fact_candidate(
                 subtopic_id,
                 writer_msg_id,
                 candidate_text,
+                summary,
                 fact_stage,
                 candidate_type,
                 evidence_note,
@@ -561,13 +576,14 @@ def create_fact_candidate(
                 verification_status,
                 round_number
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 topic_id,
                 subtopic_id,
                 writer_msg_id,
                 candidate_text,
+                summary,
                 fact_stage,
                 candidate_type,
                 evidence_note,
@@ -585,6 +601,7 @@ def create_claim_candidate(
     subtopic_id: int,
     clerk_msg_id: Optional[int],
     candidate_text: str,
+    summary: Optional[str] = None,
     support_fact_ids_json: Optional[str] = None,
     rationale_short: Optional[str] = None,
 ) -> int:
@@ -596,12 +613,13 @@ def create_claim_candidate(
                 subtopic_id,
                 clerk_msg_id,
                 candidate_text,
+                summary,
                 support_fact_ids_json,
                 rationale_short
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (topic_id, subtopic_id, clerk_msg_id, candidate_text, support_fact_ids_json, rationale_short),
+            (topic_id, subtopic_id, clerk_msg_id, candidate_text, summary, support_fact_ids_json, rationale_short),
         )
         return cursor.lastrowid
 
@@ -819,6 +837,7 @@ def insert_claim(
     topic_id: int,
     subtopic_id: Optional[int],
     content: str,
+    summary: Optional[str] = None,
     support_fact_ids_json: Optional[str] = None,
     rationale_short: Optional[str] = None,
     claim_score: Optional[float] = None,
@@ -832,18 +851,20 @@ def insert_claim(
                 topic_id,
                 subtopic_id,
                 content,
+                summary,
                 support_fact_ids_json,
                 rationale_short,
                 claim_score,
                 status,
                 candidate_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 topic_id,
                 subtopic_id,
                 content,
+                summary,
                 support_fact_ids_json,
                 rationale_short,
                 claim_score,
@@ -852,7 +873,7 @@ def insert_claim(
             ),
         )
         claim_id = cursor.lastrowid
-        _insert_claim_fts(conn, claim_id, topic_id, content)
+        _insert_claim_fts(conn, claim_id, topic_id, summary or content)
         return claim_id
 
 
@@ -1123,18 +1144,19 @@ def insert_message_with_embedding(
     confidence_score: Optional[float] = None,
     round_number: Optional[int] = None,
     turn_kind: Optional[str] = None,
+    summary: Optional[str] = None,
 ) -> int:
     """Insert a message and its embedding."""
     with get_db() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO Message (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO Message (topic_id, subtopic_id, sender, content, summary, msg_type, confidence_score, round_number, turn_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (topic_id, subtopic_id, sender, content, msg_type, confidence_score, round_number, turn_kind)
+            (topic_id, subtopic_id, sender, content, summary, msg_type, confidence_score, round_number, turn_kind)
         )
         msg_id = cursor.lastrowid
-        _insert_message_fts(conn, msg_id, topic_id, sender, content, msg_type)
+        _insert_message_fts(conn, msg_id, topic_id, sender, summary or content, msg_type)
         
         if embedding:
             conn.execute(

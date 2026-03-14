@@ -415,6 +415,7 @@ def insert_web_evidence(
     result_rank: int,
     search_provider: str,
     search_role: str,
+    summary: str | None = None,
 ) -> int:
     return db_insert_web_evidence(
         origin_topic_id,
@@ -427,6 +428,7 @@ def insert_web_evidence(
         result_rank,
         search_provider,
         search_role,
+        summary=summary,
     )
 
 

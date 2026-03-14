@@ -1603,7 +1603,7 @@ def build_librarian_prompt(
         "Use `correct` when the candidate points at a real fact but the value or wording must be repaired before storage. "
         "Absolute formulations such as `no evidence`, `always`, `never`, `proves`, or `definitively` must be softened or rejected unless the evidence explicitly supports them. "
         "Reply with STRICT JSON using this schema: "
-        "{\"action\": \"review_fact\", \"decision\": \"accept|correct|soften|reject\", \"verification_status\": \"accepted|corrected|unsupported|refuted\", \"reviewed_text\": \"...\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"source_refs_json\": [\"...\"], \"source_excerpt\": \"...\", \"confidence_score\": 8}."
+        "{\"action\": \"review_fact\", \"decision\": \"accept|correct|soften|reject\", \"verification_status\": \"accepted|corrected|unsupported|refuted\", \"reviewed_text\": \"...\", \"summary\": \"high-density technical summary (max 40 words) for RAG embedding\", \"review_note\": \"...\", \"evidence_note\": \"...\", \"source_refs_json\": [\"...\"], \"source_excerpt\": \"...\", \"confidence_score\": 8}."
     )
     return f"{PROMPTS['librarian']}\n\nContext:\n{prompt}"
 

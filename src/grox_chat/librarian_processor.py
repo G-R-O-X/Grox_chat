@@ -76,6 +76,7 @@ def parse_librarian_review(raw_text: str, candidate_text: str) -> Dict[str, Any]
         }[decision]
 
     reviewed_text = parsed.get("reviewed_text")
+    summary = parsed.get("summary")
     if decision in {"accept", "correct"}:
         if not isinstance(reviewed_text, str) or not reviewed_text.strip():
             reviewed_text = candidate_text
@@ -103,6 +104,7 @@ def parse_librarian_review(raw_text: str, candidate_text: str) -> Dict[str, Any]
         "decision": decision,
         "verification_status": verification_status,
         "reviewed_text": reviewed_text,
+        "summary": summary,
         "review_note": review_note.strip(),
         "evidence_note": evidence_note.strip(),
         "source_refs": _normalize_string_list(parsed.get("source_refs_json") or parsed.get("source_refs")),
@@ -120,6 +122,7 @@ async def apply_librarian_review(
     decision = review["decision"]
     verification_status = review.get("verification_status")
     reviewed_text = review.get("reviewed_text")
+    summary = review.get("summary")
     review_note = review.get("review_note")
     evidence_note = review.get("evidence_note")
     source_refs = review.get("source_refs") or []
@@ -136,7 +139,7 @@ async def apply_librarian_review(
             accepted_fact_id = existing_fact["id"]
             logger.info("[Librarian] Reusing existing fact %s for candidate %s", accepted_fact_id, candidate_id)
         else:
-            embedding = await aget_embedding(stored_text)
+            embedding = await aget_embedding(summary or stored_text)
             insert_kwargs = {
                 "subtopic_id": candidate.get("subtopic_id"),
                 "fact_stage": candidate.get("fact_stage", "synthesized"),
@@ -158,6 +161,7 @@ async def apply_librarian_review(
                     stored_text,
                     source="Librarian",
                     embedding=embedding,
+                    summary=summary,
                     **insert_kwargs,
                 )
             else:
@@ -165,6 +169,7 @@ async def apply_librarian_review(
                     topic_id,
                     stored_text,
                     source="Librarian",
+                    summary=summary,
                     **insert_kwargs,
                 )
 
@@ -203,6 +208,7 @@ def parse_claim_review(raw_text: str, candidate_text: str, fallback_support_ids:
         raise ValueError(f"Invalid claim review decision: {decision}")
 
     reviewed_text = parsed.get("reviewed_text")
+    summary = parsed.get("summary")
     if decision == "accept":
         if not isinstance(reviewed_text, str) or not reviewed_text.strip():
             reviewed_text = candidate_text
@@ -225,6 +231,7 @@ def parse_claim_review(raw_text: str, candidate_text: str, fallback_support_ids:
     return {
         "decision": decision,
         "reviewed_text": reviewed_text,
+        "summary": summary,
         "review_note": review_note.strip(),
         "supported_fact_ids": supported_fact_ids,
         "claim_score": _clamp_confidence(parsed.get("claim_score")),

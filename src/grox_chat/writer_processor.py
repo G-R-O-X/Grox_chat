@@ -133,11 +133,13 @@ async def process_clerk_claim_output(
         if not isinstance(support_fact_ids, list) or not support_fact_ids:
             continue
         rationale_short = claim.get("rationale_short")
+        summary = claim.get("summary", "").strip()
         created_id = api.create_claim_candidate(
             topic_id,
             subtopic_id,
             clerk_msg_id,
             normalized,
+            summary=summary,
             support_fact_ids_json=json.dumps(support_fact_ids, ensure_ascii=True),
             rationale_short=rationale_short if isinstance(rationale_short, str) else None,
         )

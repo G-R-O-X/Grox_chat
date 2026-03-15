@@ -59,6 +59,8 @@ class FactDaemon:
 
     async def _clerk_loop(self):
         """Poll for new standard messages, extract FactCandidates + ClaimCandidates."""
+        from .minimax_client import is_daemon_channel
+        is_daemon_channel.set(True)
         last_processed_id = 0
         while not self._shutdown.is_set():
             try:
@@ -84,6 +86,8 @@ class FactDaemon:
 
     async def _librarian_loop(self):
         """Poll for pending candidates, review them."""
+        from .minimax_client import is_daemon_channel
+        is_daemon_channel.set(True)
         while not self._shutdown.is_set():
             try:
                 pending = api.get_pending_fact_candidates(

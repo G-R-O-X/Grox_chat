@@ -59,11 +59,10 @@ def build_dashboard_snapshot(subtopic_id=None):
     claims = api.get_claims(topic_id, limit=2000)
     fact_candidates = []
     claim_candidates = []
-    votes = []
     if current_subtopic:
         fact_candidates = api.get_fact_candidates(topic_id, subtopic_id=current_subtopic["id"], limit=10000)
         claim_candidates = api.get_claim_candidates(topic_id, subtopic_id=current_subtopic["id"], limit=10000)
-        votes = api.get_vote_records(topic_id, subtopic_id=current_subtopic["id"], limit=1000)
+    votes = api.get_vote_records(topic_id, limit=1000)
 
     last_round = None
     for message in reversed(messages):
@@ -85,6 +84,7 @@ def build_dashboard_snapshot(subtopic_id=None):
         "claims": claims,
         "fact_candidates": fact_candidates,
         "claim_candidates": claim_candidates,
+        "votes": votes,
         "web_evidence": api.get_web_evidence_for_topic(topic_id),
         "status": {
             "db_path": api.get_db_path(),
@@ -737,7 +737,7 @@ def render_dashboard_html():
       
       if (snapshot.votes) {
           const admissionVotes = snapshot.votes.filter(v => v.vote_kind === 'candidate_admission');
-          if (admissionVotes.length > 0 && currentRound === null) {
+          if (admissionVotes.length > 0) {
               let vHtml = '<div class="chat-bubble system" style="border-color:#bda2f7;">';
               vHtml += '<div class="chat-header"><span class="chat-sender" style="color:#bda2f7">ADMISSION VOTES</span><span class="chat-meta">Pre-debate</span></div>';
               vHtml += '<details id="vote-det-admin"><summary>View ' + admissionVotes.length + ' Admission Votes</summary><div class="chat-content" style="font-family: var(--mono); font-size:12px;">';

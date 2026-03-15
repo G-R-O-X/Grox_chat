@@ -2,6 +2,7 @@ import os
 import httpx
 import logging
 import re
+import contextvars
 from typing import Optional, List, Dict, Any, Tuple
 from dotenv import load_dotenv
 import asyncio
@@ -15,7 +16,11 @@ logger = logging.getLogger(__name__)
 
 # Reusable httpx client for connection pooling
 _http_client: Optional[httpx.AsyncClient] = None
-_request_semaphore: Optional[asyncio.Semaphore] = None
+_main_semaphore: Optional[asyncio.Semaphore] = None
+_daemon_semaphore: Optional[asyncio.Semaphore] = None
+
+# ContextVar: set to True inside daemon tasks so they use the dedicated daemon semaphore
+is_daemon_channel: contextvars.ContextVar[bool] = contextvars.ContextVar("minimax_daemon_channel", default=False)
 MINIMAX_TOOL_BLOCK_RE = re.compile(r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL)
 MINIMAX_INVOKE_RE = re.compile(r'<invoke name="([^"]+)">(.*?)</invoke>', re.DOTALL)
 MINIMAX_PARAM_RE = re.compile(r'<parameter name="([^"]+)">(.*?)</parameter>', re.DOTALL)
@@ -49,10 +54,18 @@ def _get_http_client() -> httpx.AsyncClient:
 
 
 def _get_request_semaphore() -> asyncio.Semaphore:
-    global _request_semaphore
-    if _request_semaphore is None:
-        _request_semaphore = asyncio.Semaphore(1)
-    return _request_semaphore
+    global _main_semaphore, _daemon_semaphore
+    max_concurrent = int(os.getenv("MINIMAX_MAX_CONCURRENT", "4"))
+    if is_daemon_channel.get():
+        if _daemon_semaphore is None:
+            _daemon_semaphore = asyncio.Semaphore(1)
+            logger.info("[MiniMax] Daemon semaphore initialized: max_concurrent=1")
+        return _daemon_semaphore
+    if _main_semaphore is None:
+        main_slots = max(1, max_concurrent - 1)
+        _main_semaphore = asyncio.Semaphore(main_slots)
+        logger.info("[MiniMax] Main semaphore initialized: max_concurrent=%d", main_slots)
+    return _main_semaphore
 
 
 async def close_minimax_client() -> None:

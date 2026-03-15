@@ -893,6 +893,9 @@ def _normalize_termination_vote_contract(raw_text: str) -> dict[str, Any]:
         )
         return result
 
+    raw_reason = parsed.get("reason")
+    reason = raw_reason.strip() if isinstance(raw_reason, str) and raw_reason.strip() else None
+
     return {
         "parsed_ok": True,
         "main_branch": main_branch,
@@ -901,6 +904,7 @@ def _normalize_termination_vote_contract(raw_text: str) -> dict[str, Any]:
         "conditional_support": conditional_support,
         "untested_novelty": untested_novelty,
         "vote": vote,
+        "reason": reason,
         "override_reason": override_reason,
         "central_blocker": central_blocker,
         "volatility_blocker": volatility_blocker,

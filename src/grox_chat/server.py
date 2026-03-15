@@ -625,17 +625,17 @@ def _termination_policy_for_round(round_number: int) -> tuple[str, str]:
             "weak",
             "EARLY STAGE. The burden of proof is on continuing. If any central blocker remains, or if the recommendation is still shifting, you should continue.",
         )
-    if round_number <= 6:
+    if round_number <= 5:
         return (
             "medium",
             "MID STAGE. Close only when the remaining disagreement is peripheral or repetitive. Continue if the recommendation is still unstable or a central branch remains.",
         )
-    if round_number <= 9:
+    if round_number <= 6:
         return (
             "strong",
             "LATE STAGE. The burden of proof is on closing, but you must continue if a severe central blocker still makes the current recommendation unstable or unsafe.",
         )
-    return ("forced", "Round 10 is a forced close.")
+    return ("forced", "Round 7 is a forced close.")
 
 
 def _should_run_termination_vote(round_number: int) -> bool:
@@ -689,7 +689,7 @@ def _build_termination_vote_repair_prompt(*, original_prompt: str, invalid_text:
         f"{invalid_text}\n\n"
         f"Validation failure: {invalid_reason}\n\n"
         "Rewrite the response into valid JSON using exactly this schema:\n"
-        '{"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","reason":"... (Mandatory)"}\n'
+        '{"main_branch":"...","centrality":"central|mixed|peripheral|none","recent_shift":"yes|no|unclear","conditional_support":"yes|no","untested_novelty":"yes|no","vote":"continue|close","reason":"... (Mandatory)","override_reason":"... (Required if vote is close and any blocker is true)"}\n'
         "Preserve the original intent when possible.\n"
         "Output JSON only. Do not add markdown fences, commentary, or extra keys."
     )
@@ -866,7 +866,7 @@ def _normalize_termination_vote_contract(raw_text: str) -> dict[str, Any]:
     else:
         main_branch = "unspecified"
 
-    raw_override = parsed.get("override_reason")
+    raw_override = parsed.get("override_reason") or parsed.get("reason")
     override_reason = raw_override.strip() if isinstance(raw_override, str) and raw_override.strip() else None
 
     central_blocker = centrality in {"central", "mixed"}
@@ -2895,6 +2895,11 @@ async def audience_termination_check_node(state: ChatState) -> dict:
                         loop_detected = True
 
     stage, stage_guidance = _termination_policy_for_round(current_round)
+
+    if stage == "forced":
+        logger.info("[skynet] Forced close at round %s.", current_round)
+        return {"subtopic_exhausted": True}
+
     decision_prompt = _build_termination_vote_prompt(
         topic_summary=topic["summary"],
         topic_detail=ctx + historical_context,

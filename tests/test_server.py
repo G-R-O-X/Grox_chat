@@ -900,8 +900,8 @@ def test_refresh_pending_turns_with_extras_does_not_resurrect_consumed_target():
 def test_termination_policy_is_graduated_by_round():
     assert _termination_policy_for_round(3)[0] == "weak"
     assert _termination_policy_for_round(5)[0] == "medium"
-    assert _termination_policy_for_round(8)[0] == "strong"
-    assert _termination_policy_for_round(10)[0] == "forced"
+    assert _termination_policy_for_round(6)[0] == "strong"
+    assert _termination_policy_for_round(7)[0] == "forced"
 
 
 def test_termination_votes_begin_at_round_three():

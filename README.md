@@ -4,19 +4,20 @@ Gemini Research Orchestration with minimaX -- Chat Only
 
 [中文说明](README_CN.md)
 
-GROX Chat is the stable, database-first multi-agent chatroom. It runs one topic at a time, proposes and votes on candidate subtopics, debates each admitted subtopic in a round-based arena, and writes summaries plus reviewed facts back into SQLite memory.
+GROX Chat is a database-first multi-agent chatroom for structured deliberation. It runs one topic at a time, proposes and votes on candidate subtopics, debates each admitted subtopic in a round-based arena with parallel agent execution, and writes summaries plus reviewed facts back into SQLite memory via a background fact daemon.
 
 This repository is intentionally the **base chatroom**, not the conference-mode branch.
 
 ## What It Does
 
 - lets `Skynet` propose candidate subtopics and admit them through room voting
-- runs a structured multi-agent debate loop
+- runs a structured multi-agent debate loop with **stage-based parallel execution** (R1/R2 concurrent, R3+ sequential)
 - keeps local RAG on every speaking turn
 - uses `Dog / Cat / Tron / Spectator` as non-debate intervention roles
-- separates critique, fact proposal, and fact admission
-- routes Gemini, MiniMax, and web-search calls through one in-process broker surface
-- documents every RAG section so `[F...]` (verified facts), `[C...]` (derived claims), `Summary`, `Message`, and `[W...]` (web evidence) carry their intended meaning, enforces citation IDs only when provided in the injected prompt, and caches `[W...]` rows for 30 days under a higher rerank threshold before they reach the clerk.
+- runs a **background Fact Daemon** for continuous fact extraction and librarian review
+- supports `[M{id}]` message citations so agents reference prior arguments by ID instead of paraphrasing
+- routes Gemini, MiniMax, and web-search calls through one in-process broker with **split semaphore** (main pipeline / daemon)
+- documents every RAG section so `[F...]` (verified facts), `[C...]` (derived claims), `[M...]` (message attribution), `[W...]` (web evidence) carry their intended meaning, enforces citation IDs only when provided in the injected prompt, and caches `[W...]` rows for 30 days under a higher rerank threshold before they reach the clerk
 
 ## Runtime Shape
 
@@ -30,10 +31,12 @@ The system has three layers:
    - replan or close when selected work is exhausted
 2. `Subtopic arena`
    - run `opening -> evidence -> debate`
-   - apply special-role actions
-   - write critique, fact proposals, fact reviews, and summaries
+   - R1/R2: agents execute in parallel stages
+   - R3+: agents execute sequentially with immediate interventions
+   - background Fact Daemon extracts and reviews facts continuously
+   - hard close at Round 7 if voting doesn't converge
 3. `Shared memory`
-   - persist `Topic`, `Plan`, `Subtopic`, `Message`, `FactCandidate`, and `Fact`
+   - persist `Topic`, `Plan`, `Subtopic`, `Message`, `FactCandidate`, `Fact`, `ClaimCandidate`, `Claim`, `WebEvidence`, `VoteRecord`
    - keep retrieval scoped to the current topic
 
 ```mermaid
@@ -42,9 +45,9 @@ flowchart TD
     TopicGraph --> Vote[Skynet proposes 4<br/>Room votes]
     Vote --> Arena[Subtopic Arena]
     Arena --> Summary[Skynet summaries]
-    Arena --> Facts[Writer -> Fact Proposer -> Librarian]
+    Arena --> Daemon[Fact Daemon<br/>Writer → Proposer → Librarian]
     Summary --> TopicGraph
-    Facts --> TopicGraph
+    Daemon --> TopicGraph
     TopicGraph --> Close[Replan or Close]
 ```
 
@@ -96,51 +99,79 @@ Initial subtopic admission is no longer a unilateral orchestrator decision.
 
 Round continuation and replanning use the same voting principle instead of a single-role close decision.
 
+### Termination Policy
+
+| Round | Stage | Behavior |
+|-------|-------|----------|
+| 1-2 | — | No termination vote |
+| 3 | Weak | Burden of proof is on continuing |
+| 4-5 | Medium | Close only when disagreement is peripheral |
+| 6 | Strong | Burden of proof shifts to closing |
+| 7+ | **Forced** | Hard close, no vote needed |
+
 ## Round Flow
 
-- `Round 1`
-  - deliberators speak
-  - local RAG is always on
-  - no web search
-  - `tron` may still inspect
-- `Round 2`
-  - deliberators may use web search
-  - `dog / cat / tron / spectator` act
-  - `dog / cat / tron` extra turns are redeemed in the same round
-  - `spectator` chooses one deliberator for a next-round focus boost
-- `Round 3+`
-  - debate continues with local RAG always on
-  - web-search permissions narrow again
-  - `spectator` may grant a next-round focus and web-search boost
+### Parallel Execution (R1/R2)
+
+- `Round 1 (OPENING)`: builders (dreamer, scientist, engineer, analyst) + tron run **in parallel** → then critic alone
+- `Round 2 (EVIDENCE)`: builders + cat/tron/spectator **in parallel** → then critics + dog **in parallel**
+- Interventions (dog correction, cat expansion, tron remediation) are injected as a parallel stage between the existing stages
+
+### Sequential Execution (R3+)
+
+- `Round 3+ (DEBATE)`: all agents run sequentially; interventions fire immediately after the triggering agent's turn
+
+### End-of-Round Pipeline
+
+After each round completes:
+
+1. `writer` — visible critique of the round
+2. `skynet` — round summary
+3. termination vote (R3+)
+
+The **Fact Daemon** runs continuously in the background (not in the round pipeline):
+- Clerk loop polls for new messages, extracts number facts and sourced fact candidates
+- Librarian loop reviews pending candidates, accepts/softens/rejects them
 
 ```mermaid
 flowchart TD
-    R1[Round 1<br/>opening] --> W1[Writer critique]
-    W1 --> FP1[Fact proposer]
-    FP1 --> L1[Librarian review]
-    L1 --> S1[Skynet summary]
-    S1 --> R2[Round 2<br/>evidence]
-    R2 --> NPC2[Dog / Cat / Tron / Spectator]
-    NPC2 --> Extra2[Same-round extra turns<br/>Dog/Cat/Tron only]
-    Extra2 --> W2[Writer -> Fact proposer -> Librarian -> Summary]
-    W2 --> R3[Round 3+<br/>debate]
+    R1[Round 1 OPENING<br/>Parallel: builders + tron<br/>Then: critic] --> W1[Writer critique → Summary]
+    W1 --> R2[Round 2 EVIDENCE<br/>Parallel: builders + specials<br/>Then: critics + dog]
+    R2 --> W2[Writer critique → Summary → Vote]
+    W2 --> R3[Round 3+ DEBATE<br/>Sequential: all agents]
+    R3 --> W3[Writer critique → Summary → Vote]
+    W3 -->|continue| R3
+    W3 -->|close or R7| Drain[Drain Fact Daemon]
+    Drain --> Close[Close Subtopic]
+    Daemon[Fact Daemon<br/>background] -.->|continuous| DB[(SQLite)]
 ```
+
+## Citation Protocol
+
+| Marker | Meaning | Evidence Grade |
+|--------|---------|---------------|
+| `[F{id}]` | Verified fact | Yes |
+| `[C{id}]` | Derived claim supported by facts | Yes (weaker) |
+| `[W{id}]` | Unverified web search result | Cite with caveat |
+| `[M{id}]` | Prior message attribution | No (context only) |
+
+Agents use `[M{id}]` to reference prior arguments instead of paraphrasing them. The citation sanitizer strips hallucinated `[F/C/W]` IDs but does not strip `[M]` citations.
 
 ## Memory Model
 
 The SQLite blackboard stores:
 
-- `Topic`
-- `Plan`
-- `Subtopic`
-- `Message`
-- `FactCandidate`
-- `Fact`
+- `Topic`, `Plan`, `Subtopic`
+- `Message` (with dense embeddings and FTS5)
+- `FactCandidate`, `Fact` (with dense embeddings and FTS5)
+- `ClaimCandidate`, `Claim`
+- `WebEvidence`
+- `VoteRecord`
 
 Important rules:
 
-- normal RAG reads only reviewed `Fact`
-- pending `FactCandidate` rows are hidden from ordinary debate turns
+- normal RAG reads only reviewed `Fact` and `Claim`
+- pending `FactCandidate` / `ClaimCandidate` rows are hidden from ordinary debate turns
 - topic-scoped retrieval prevents cross-topic contamination
 
 ## Model Routing
@@ -149,13 +180,14 @@ Important rules:
 - MiniMax is used mainly for debate and web-search loops
 - all provider and search calls are routed through a shared in-process broker
 - the broker handles warmup, project discovery retry, request coalescing, bounded concurrency, and provider fallback
+- MiniMax concurrency is split into **main** (N-1 slots) and **daemon** (1 slot) channels via `contextvars`, preventing the background daemon from starving the debate pipeline
 
 ## Project Layout
 
-- `src/grox_chat/`: orchestration, agents, clients, retrieval, persistence, prompts, web monitor
+- `src/grox_chat/`: orchestration, agents, clients, retrieval, persistence, prompts, web monitor, fact daemon
 - `tests/`: unit and integration tests
 - `DESIGN.md`: base chatroom design
-- `PLAN.md`: staged implementation plan for the baseline rewrite
+- `.claude/commands/`: custom Claude Code skills (e.g., `grox-code-review`)
 
 ## Quick Start
 
@@ -186,11 +218,12 @@ Run tests:
 uv run pytest -q
 ```
 
-## MiniMax Endpoint Selection
+## Environment Variables
 
-- Default host: mainland `https://api.minimaxi.com`
-- Set `MINIMAX_EN=1` in `.env` to use international `https://api.minimax.io`
-- Set `ENABLE_GEMINI=1` in `.env` to enable Gemini; otherwise Gemini requests degrade to MiniMax fallbacks
-- This applies to both:
-  - Anthropic-compatible Messages API
-  - Coding Plan search API
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MINIMAX_API_KEY` | — | MiniMax API key (required) |
+| `MINIMAX_EN` | `0` | `1` = international endpoint `api.minimax.io` |
+| `ENABLE_GEMINI` | `0` | `1` = enable Gemini orchestration calls |
+| `FAST_MODE` | `0` | `1` = enable fast mode |
+| `MINIMAX_MAX_CONCURRENT` | `4` | Max concurrent MiniMax API requests (main gets N-1, daemon gets 1) |
